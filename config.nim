@@ -1,0 +1,40 @@
+## Your "init.el". Compiled to a fresh .so and hot-swapped in whenever you
+## hit Ctrl+Shift+R (or the "Reload Config" button) -- the running app never
+## restarts and the buffer's text is untouched. Edit a command below, save,
+## reload, and try its keybinding again.
+##
+## Deliberately imports nothing but nimacs/config_api (which pulls in
+## nimacs/kernel) -- never owlkettle -- so this recompiles fast and never
+## crosses owlkettle's own types across the .so boundary. See DESIGN.md.
+
+import std/strutils
+import nimacs/config_api
+
+proc insertTimestamp(k: ptr EditorKernel) {.cdecl.} =
+  let stamp = "[HOT-RELOADED] "
+  k.text.insert(stamp, k.cursorPos)
+  k.cursorPos += stamp.len
+  k.status = "inserted tag"
+
+proc uppercaseLine(k: ptr EditorKernel) {.cdecl.} =
+  var lineStart = k.cursorPos
+  while lineStart > 0 and k.text[lineStart - 1] != '\n':
+    dec lineStart
+  var lineEnd = k.cursorPos
+  while lineEnd < k.text.len and k.text[lineEnd] != '\n':
+    inc lineEnd
+  let upper = k.text[lineStart ..< lineEnd].toUpperAscii()
+  k.text = k.text[0 ..< lineStart] & upper & k.text[lineEnd .. ^1]
+  k.status = "uppercased current line"
+
+proc sayHello(k: ptr EditorKernel) {.cdecl.} =
+  k.status = "Hello"
+
+proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc) {.exportc, dynlib.} =
+  register(ctx, "insert-timestamp", insertTimestamp)
+  register(ctx, "uppercase-line", uppercaseLine)
+  register(ctx, "say-hello", sayHello)
+  bindP(ctx, "C-t", "insert-timestamp")
+  bindP(ctx, "C-u", "uppercase-line")
+  bindP(ctx, "C-h", "say-hello")
+

@@ -1,0 +1,6 @@
+nimacs
+*.so
+nimcache/
+*~
+.#*
+\#*\#
