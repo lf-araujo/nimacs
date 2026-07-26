@@ -3,7 +3,36 @@
 Status as of this session: **working end-to-end**. Editor window opens,
 typing works natively, `Ctrl+T`/`Ctrl+U` run hot-reloadable commands,
 "Reload Config" swaps in edited `config.nim` behavior live without
-restarting or losing buffer text. Verified interactively by the user.
+restarting or losing buffer text, native Open/Save file dialogs, an
+"org babel mode" toggle (proportional prose font vs. monospace
+`#+begin_src`/`#+end_src` blocks, re-tagged live via the buffer's own
+`"changed"` signal). All verified interactively by the user. Committed
+and pushed: `github.com/lf-araujo/nimacs`.
+
+## GTK4 varargs C calls appear broken on this GTK version (4.22.4) -- avoid them
+
+Two independent confirmations now: owlkettle's `FileChooserDialog` (via
+`gtk_file_chooser_dialog_new`, a varargs constructor) SIGSEGV'd, fixed by
+switching to the modern non-varargs-adjacent `GtkFileDialog` API. Then
+`gtk_text_buffer_create_tag` (also varargs -- owlkettle's own
+`TextBuffer.registerTag` uses it internally, `widgets.nim:2358`) SIGSEGV'd
+too, on the *simplest possible* varargs call (name + a single immediate
+NULL, zero properties) -- called from `setupOrgTags` while building the
+org-babel-mode feature. Fixed by switching to `gtk_text_tag_new` (a plain
+fixed-arity constructor) + explicit `gtk_text_tag_table_add` instead,
+avoiding the buffer's create_tag helper entirely.
+
+**Working theory, not confirmed root cause:** something about how Nim's
+`{.varargs.}` FFI pragma generates the call site is incompatible with
+this specific GTK build's ABI expectations on arm64 macOS (could be a
+clang/Nim codegen mismatch for variadic calls specifically, unrelated to
+argument *count* -- the crashing call had the minimum possible one extra
+arg). **Rule of thumb for any further owlkettle/GTK work in this
+project: if a call is declared `{.varargs.}` in `owlkettle/bindings/gtk.nim`,
+assume it may crash here and look for (or write) a fixed-arity
+alternative first, rather than trusting that "owlkettle already uses this
+successfully elsewhere" — the elsewhere may never have been exercised on
+this GTK version until it crashed here.**
 
 ## How to run it
 
@@ -141,13 +170,27 @@ no manual `--passL` flag needed for normal builds.
 - Both **Open** and **Edit config.nim** load into the single buffer this
   editor has (replacing whatever was there, unsaved) — no multi-buffer
   support yet, same caveat as before.
+- **Org babel mode** — rightmost header-bar `ToggleButton`
+  (`format-text-rich-symbolic`). Off by default. On: prose renders in a
+  proportional font (`"Sans"`, a generic Pango alias) while
+  `#+begin_src ... #+end_src` blocks (including the delimiter lines
+  themselves, matching real org-mode) stay monospace (`"Monospace"`).
+  Re-tags automatically on every edit via the `GtkTextBuffer`'s own
+  `"changed"` signal — covers native typing (which bypasses all of
+  nimacs's Nim code) as well as command/Open/Save/Edit-config-triggered
+  changes, all uniformly. No org parser: a plain line scanner
+  (`isBeginSrc`/`isEndSrc`/`retagOrgBlocks` in `nimacs.nim`) — deliberately
+  narrow scope (prose vs. code only, no headings/tables/emphasis).
+  Looked at `~/Downloads/BabelHub` (a prior related project) first to see
+  what was reusable: it's a browser app (TypeScript/CodeMirror +
+  `uniorg`'s full org-AST parser, split source/rendered-HTML-preview
+  panes) — none of its code ports to Nim or this single-buffer-GTK
+  paradigm, but it confirmed a full parser is overkill for just this
+  narrower prose/code split (its own src-block detection is a one-line
+  regex, no AST) and its font choices (proportional prose / mono code)
+  matched the intended aesthetic.
 
 ## Not yet done
 
-- **Nothing committed to git yet** — repo is initialized
-  (`Coding/Nim/Programs/nimacs/.git`) with everything staged, but no commit
-  made. Do that first thing next session.
-- `Ctrl+S` (save) confirmed working via the Edit-config round-trip; the
-  **Open** button (via `GtkFileDialog`) is also confirmed working
-  end-to-end (no crash, file loads correctly).
-- No PR / nothing pushed anywhere (no remote configured either).
+- No further features requested as of this session's end. Everything
+  above is committed and pushed.

@@ -78,6 +78,82 @@ proc liveCursorOffset(buf: GtkTextBuffer): int =
   gtk_text_buffer_get_iter_at_mark(buf, iter.addr, gtk_text_buffer_get_insert(buf))
   result = int(gtk_text_iter_get_offset(iter.addr))
 
+# -- Org-babel mode: proportional prose, monospace code blocks ------------
+# No org parser here -- BabelHub (~/Downloads/BabelHub, a prior related
+# project) confirmed a plain line scanner is enough for "which regions are
+# code" (its src/exports.ts and src/srcedit.ts both just regex-match
+# #+begin_src line by line, no AST). Font-family is set on plain GTK text
+# tags via the exact pattern owlkettle's own TextBuffer.registerTag uses
+# internally (widgets.nim:2358): gtk_text_buffer_create_tag with zero
+# properties (name + immediate NULL -- the simplest possible varargs call),
+# then g_object_set_property (fixed 3-arg signature, no varargs at all) to
+# set "family". Deliberately not reusing owlkettle's TextBuffer wrapper
+# itself, same reason as EditorTextView above.
+
+var
+  gProseTag, gCodeTag: GtkTextTag
+  gOrgMode = false
+    ## Mirrors app.orgMode. bufferChangedCallback (a raw "changed" signal
+    ## callback, connected in main() before the live AppState even exists)
+    ## has no way to reach `app`, so it reads this instead. Both are only
+    ## ever written together, in toggleOrgMode, so they can't drift.
+
+proc gtk_text_tag_new(name: cstring): GtkTextTag {.importc, cdecl.}
+proc gtk_text_tag_table_add(table: GtkTextTagTable; tag: GtkTextTag): cbool {.importc, cdecl.}
+
+proc setFontFamily(tag: GtkTextTag; family: string) =
+  var value: GValue
+  discard g_value_init(value.addr, G_TYPE_STRING)
+  g_value_set_string(value.addr, family.cstring)
+  g_object_set_property(pointer(tag), "family".cstring, value.addr)
+
+proc setupOrgTags(buf: GtkTextBuffer) =
+  # Deliberately not gtk_text_buffer_create_tag -- that's a varargs C call
+  # (like the file-chooser constructor that crashed earlier), and this GTK
+  # version appears to mishandle at least some varargs FFI calls. This
+  # path is fully fixed-arity: construct the tag directly, add it to the
+  # buffer's tag table explicitly, no variadic call anywhere.
+  let table = gtk_text_buffer_get_tag_table(buf)
+  gProseTag = gtk_text_tag_new("nimacs-prose".cstring)
+  gCodeTag = gtk_text_tag_new("nimacs-code".cstring)
+  discard gtk_text_tag_table_add(table, gProseTag)
+  discard gtk_text_tag_table_add(table, gCodeTag)
+  gProseTag.setFontFamily("Sans")       # generic Pango alias -> system proportional font
+  gCodeTag.setFontFamily("Monospace")   # generic Pango alias -> system monospace font
+
+proc isBeginSrc(line: string): bool = line.strip().toLowerAscii().startsWith("#+begin_src")
+proc isEndSrc(line: string): bool = line.strip().toLowerAscii() == "#+end_src"
+
+proc retagOrgBlocks(buf: GtkTextBuffer) =
+  var bufStart, bufEnd: GtkTextIter
+  gtk_text_buffer_get_start_iter(buf, bufStart.addr)
+  gtk_text_buffer_get_end_iter(buf, bufEnd.addr)
+  gtk_text_buffer_remove_tag(buf, gProseTag, bufStart.addr, bufEnd.addr)
+  gtk_text_buffer_remove_tag(buf, gCodeTag, bufStart.addr, bufEnd.addr)
+  if not gOrgMode:
+    return  # toggled off -- tags cleared above, plain view, nothing more to do
+
+  let lineCount = int(gtk_text_buffer_get_line_count(buf))
+  var inSrc = false
+  for lineNum in 0 ..< lineCount:
+    var lineStart, lineEnd: GtkTextIter
+    gtk_text_buffer_get_iter_at_line(buf, lineStart.addr, cint(lineNum))
+    if lineNum + 1 < lineCount:
+      gtk_text_buffer_get_iter_at_line(buf, lineEnd.addr, cint(lineNum + 1))
+    else:
+      gtk_text_buffer_get_end_iter(buf, lineEnd.addr)
+    let lineText = $gtk_text_buffer_get_text(buf, lineStart.addr, lineEnd.addr, cbool(0))
+    # Delimiter lines are tagged as code too, matching org-mode's own
+    # behavior of fixed-pitching the whole block including its markers.
+    let isCodeLine = inSrc or isBeginSrc(lineText)
+    gtk_text_buffer_apply_tag(buf, (if isCodeLine: gCodeTag else: gProseTag), lineStart.addr, lineEnd.addr)
+    if isBeginSrc(lineText): inSrc = true
+    elif isEndSrc(lineText): inSrc = false
+
+proc bufferChangedCallback(buf: GtkTextBuffer; userData: pointer) {.cdecl.} =
+  if gOrgMode:
+    retagOrgBlocks(buf)
+
 # -- EditorTextView: a GtkTextView we build ourselves, with a key-press ----
 # interceptor. A ref-object holds the live closure; its address is handed
 # to g_signal_connect as the callback's `data`, mirroring owlkettle's own
@@ -170,6 +246,13 @@ viewable App:
   configPath: string
   configSearchPaths: seq[string]
   dispatch: Dispatch
+  orgMode: bool
+
+proc toggleOrgMode(app: AppState, state: bool) =
+  app.orgMode = state
+  gOrgMode = state
+  retagOrgBlocks(app.gtkBuffer)  # apply/clear immediately, don't wait for the next edit
+  app.status = if state: "Org babel mode on" else: "Org babel mode off"
 
 proc saveFile(app: AppState) =
   if app.filePath == "":
@@ -280,6 +363,12 @@ method view(app: AppState): Widget =
           Icon(name = "view-refresh-symbolic")
           proc clicked() = app.doReload()
 
+        ToggleButton {.addLeft.}:
+          tooltip = "Org babel mode (proportional prose, monospace code blocks)"
+          state = app.orgMode
+          Icon(name = "format-text-rich-symbolic")
+          proc changed(state: bool) = app.toggleOrgMode(state)
+
       Box(orient = OrientY):
         ScrolledWindow {.expand: true.}:
           EditorTextView:
@@ -314,6 +403,10 @@ proc main() =
   let gtkBuffer = newGtkTextBuffer()
   if filePath != "" and fileExists(filePath):
     gtkBuffer.bufferText = readFile(filePath)
+
+  setupOrgTags(gtkBuffer)
+  discard g_signal_connect_data(pointer(gtkBuffer), "changed".cstring,
+    cast[pointer](bufferChangedCallback), nil, nil, G_CONNECT_AFTER)
 
   let projectRoot = getAppDir()
   let configPath = projectRoot / "config.nim"
