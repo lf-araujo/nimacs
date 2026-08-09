@@ -25,6 +25,11 @@ import owlkettle/adw
 import owlkettle/bindings/gtk
 import nimacs/[kernel, dispatch, hotcompile]
 
+# Built-in example document shown when nimacs is launched without a file.
+# Embedded at compile time (rather than read from disk at runtime) so it is
+# always available regardless of where the binary ends up after `nimble install`.
+const welcomeOrg = staticRead("../examples/welcome.org")
+
 # -- Extra raw GTK bindings owlkettle doesn't expose itself --------------
 proc gtk_text_view_get_buffer(textView: GtkWidget): GtkTextBuffer {.importc, cdecl.}
 proc gtk_text_buffer_get_insert(buffer: GtkTextBuffer): pointer {.importc, cdecl.}
@@ -91,7 +96,7 @@ proc liveCursorOffset(buf: GtkTextBuffer): int =
 # itself, same reason as EditorTextView above.
 
 var
-  gProseTag, gCodeTag: GtkTextTag
+  gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag: GtkTextTag
   gOrgMode = false
     ## Mirrors app.orgMode. bufferChangedCallback (a raw "changed" signal
     ## callback, connected in main() before the live AppState even exists)
@@ -100,36 +105,119 @@ var
 
 proc gtk_text_tag_new(name: cstring): GtkTextTag {.importc, cdecl.}
 proc gtk_text_tag_table_add(table: GtkTextTagTable; tag: GtkTextTag): cbool {.importc, cdecl.}
+proc gtk_text_buffer_get_iter_at_line_offset(buffer: GtkTextBuffer; iter: ptr GtkTextIter;
+                                              lineNum: cint; charOffset: cint) {.importc, cdecl.}
 
-proc setFontFamily(tag: GtkTextTag; family: string) =
-  var value: GValue
-  discard g_value_init(value.addr, G_TYPE_STRING)
-  g_value_set_string(value.addr, family.cstring)
-  g_object_set_property(pointer(tag), "family".cstring, value.addr)
+proc setStringProp(tag: GtkTextTag; prop, val: string) =
+  var v: GValue
+  discard g_value_init(v.addr, G_TYPE_STRING)
+  g_value_set_string(v.addr, val.cstring)
+  g_object_set_property(pointer(tag), prop.cstring, v.addr)
+
+proc setIntProp(tag: GtkTextTag; prop: string; val: int) =
+  var v: GValue
+  discard g_value_init(v.addr, G_TYPE_INT)
+  g_value_set_int(v.addr, cint(val))
+  g_object_set_property(pointer(tag), prop.cstring, v.addr)
+
+proc setBoolProp(tag: GtkTextTag; prop: string; val: bool) =
+  var v: GValue
+  discard g_value_init(v.addr, G_TYPE_BOOLEAN)
+  g_value_set_boolean(v.addr, cbool(ord(val)))
+  g_object_set_property(pointer(tag), prop.cstring, v.addr)
 
 proc setupOrgTags(buf: GtkTextBuffer) =
   # Deliberately not gtk_text_buffer_create_tag -- that's a varargs C call
   # (like the file-chooser constructor that crashed earlier), and this GTK
   # version appears to mishandle at least some varargs FFI calls. This
-  # path is fully fixed-arity: construct the tag directly, add it to the
+  # path is fully fixed-arity: construct each tag directly, add it to the
   # buffer's tag table explicitly, no variadic call anywhere.
   let table = gtk_text_buffer_get_tag_table(buf)
   gProseTag = gtk_text_tag_new("nimacs-prose".cstring)
   gCodeTag = gtk_text_tag_new("nimacs-code".cstring)
-  discard gtk_text_tag_table_add(table, gProseTag)
-  discard gtk_text_tag_table_add(table, gCodeTag)
-  gProseTag.setFontFamily("Sans")       # generic Pango alias -> system proportional font
-  gCodeTag.setFontFamily("Monospace")   # generic Pango alias -> system monospace font
+  gHeadingTag = gtk_text_tag_new("nimacs-heading".cstring)
+  gLinkTag = gtk_text_tag_new("nimacs-link".cstring)
+  gHiddenTag = gtk_text_tag_new("nimacs-hidden".cstring)
+  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag]:
+    discard gtk_text_tag_table_add(table, tag)
+  gProseTag.setStringProp("family", "Sans")        # generic Pango alias -> system proportional font
+  gCodeTag.setStringProp("family", "Monospace")     # generic Pango alias -> system monospace font
+  gHeadingTag.setStringProp("family", "Sans")
+  gHeadingTag.setIntProp("weight", 700)             # PANGO_WEIGHT_BOLD
+  gHeadingTag.setIntProp("size", 14 * 1024)         # Pango units (1/1024 pt) -- "size" confirmed working
+                                                     # via isolated test; "scale" (double prop) was not
+  gLinkTag.setStringProp("foreground", "#2563eb")
+  gLinkTag.setIntProp("underline", 1)               # PANGO_UNDERLINE_SINGLE
+  gHiddenTag.setBoolProp("invisible", true)
 
-proc isBeginSrc(line: string): bool = line.strip().toLowerAscii().startsWith("#+begin_src")
-proc isEndSrc(line: string): bool = line.strip().toLowerAscii() == "#+end_src"
+proc isBeginSrc(line: string): bool = strutils.strip(line).toLowerAscii().startsWith("#+begin_src")
+proc isEndSrc(line: string): bool = strutils.strip(line).toLowerAscii() == "#+end_src"
+
+proc isHeading(line: string): bool =
+  ## Org headlines start at column 0 (unlike src blocks, which may be
+  ## indented) with one or more literal `*` immediately followed by a
+  ## space -- `* Title`, `** Subtitle`, etc.
+  if line.len == 0 or line[0] != '*': return false
+  var i = 0
+  while i < line.len and line[i] == '*': inc i
+  i < line.len and line[i] == ' '
+
+type LinkMatch = tuple[matchStart, matchEnd, visStart, visEnd: int]
+  ## [matchStart, matchEnd) is the whole `[[...]]` span; [visStart, visEnd)
+  ## is the portion that stays visible (the description if present, else
+  ## the URL) -- everything else in the match gets hidden.
+
+proc findLinks(line: string): seq[LinkMatch] =
+  ## Hand-rolled scanner for org's `[[url]]` / `[[url][description]]` link
+  ## syntax -- no regex engine needed (and no new dependency to debug in
+  ## this environment) for a syntax this simple to bracket-match.
+  var i = 0
+  while i < line.len - 1:
+    if line[i] == '[' and line[i + 1] == '[':
+      let matchStart = i
+      var j = i + 2
+      var urlEnd = -1
+      while j < line.len:
+        if line[j] == ']': urlEnd = j; break
+        inc j
+      if urlEnd == -1: break  # unterminated -- stop scanning this line
+      if urlEnd + 1 < line.len and line[urlEnd + 1] == ']':
+        result.add((matchStart, urlEnd + 2, matchStart + 2, urlEnd))  # [[url]] -- url itself stays visible
+        i = urlEnd + 2
+      elif urlEnd + 1 < line.len and line[urlEnd + 1] == '[':
+        var k = urlEnd + 2
+        var descEnd = -1
+        while k < line.len:
+          if line[k] == ']': descEnd = k; break
+          inc k
+        if descEnd == -1: break
+        if descEnd + 1 < line.len and line[descEnd + 1] == ']':
+          result.add((matchStart, descEnd + 2, urlEnd + 2, descEnd))  # [[url][desc]] -- only desc stays visible
+          i = descEnd + 2
+        else:
+          inc i
+      else:
+        inc i
+    else:
+      inc i
+
+proc retagLinks(buf: GtkTextBuffer; lineNum: int; lineText: string) =
+  for m in findLinks(lineText):
+    var prefixStart, visStart, visEnd, suffixEnd: GtkTextIter
+    gtk_text_buffer_get_iter_at_line_offset(buf, prefixStart.addr, cint(lineNum), cint(m.matchStart))
+    gtk_text_buffer_get_iter_at_line_offset(buf, visStart.addr, cint(lineNum), cint(m.visStart))
+    gtk_text_buffer_get_iter_at_line_offset(buf, visEnd.addr, cint(lineNum), cint(m.visEnd))
+    gtk_text_buffer_get_iter_at_line_offset(buf, suffixEnd.addr, cint(lineNum), cint(m.matchEnd))
+    gtk_text_buffer_apply_tag(buf, gHiddenTag, prefixStart.addr, visStart.addr)
+    gtk_text_buffer_apply_tag(buf, gLinkTag, visStart.addr, visEnd.addr)
+    gtk_text_buffer_apply_tag(buf, gHiddenTag, visEnd.addr, suffixEnd.addr)
 
 proc retagOrgBlocks(buf: GtkTextBuffer) =
   var bufStart, bufEnd: GtkTextIter
   gtk_text_buffer_get_start_iter(buf, bufStart.addr)
   gtk_text_buffer_get_end_iter(buf, bufEnd.addr)
-  gtk_text_buffer_remove_tag(buf, gProseTag, bufStart.addr, bufEnd.addr)
-  gtk_text_buffer_remove_tag(buf, gCodeTag, bufStart.addr, bufEnd.addr)
+  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag]:
+    gtk_text_buffer_remove_tag(buf, tag, bufStart.addr, bufEnd.addr)
   if not gOrgMode:
     return  # toggled off -- tags cleared above, plain view, nothing more to do
 
@@ -145,10 +233,22 @@ proc retagOrgBlocks(buf: GtkTextBuffer) =
     let lineText = $gtk_text_buffer_get_text(buf, lineStart.addr, lineEnd.addr, cbool(0))
     # Delimiter lines are tagged as code too, matching org-mode's own
     # behavior of fixed-pitching the whole block including its markers.
-    let isCodeLine = inSrc or isBeginSrc(lineText)
-    gtk_text_buffer_apply_tag(buf, (if isCodeLine: gCodeTag else: gProseTag), lineStart.addr, lineEnd.addr)
-    if isBeginSrc(lineText): inSrc = true
-    elif isEndSrc(lineText): inSrc = false
+    # isEndSrc must be checked before `inSrc` itself -- the end marker line
+    # is still *inside* the block (inSrc is still true when we reach it),
+    # so checking `inSrc or ...` first would always match and this branch,
+    # where inSrc actually gets reset, would never run -- inSrc would get
+    # stuck true forever after the first code block in the document.
+    if isEndSrc(lineText):
+      gtk_text_buffer_apply_tag(buf, gCodeTag, lineStart.addr, lineEnd.addr)
+      inSrc = false
+    elif inSrc or isBeginSrc(lineText):
+      gtk_text_buffer_apply_tag(buf, gCodeTag, lineStart.addr, lineEnd.addr)
+      if isBeginSrc(lineText): inSrc = true
+    elif isHeading(lineText):
+      gtk_text_buffer_apply_tag(buf, gHeadingTag, lineStart.addr, lineEnd.addr)
+    else:
+      gtk_text_buffer_apply_tag(buf, gProseTag, lineStart.addr, lineEnd.addr)
+      retagLinks(buf, lineNum, lineText)
 
 proc bufferChangedCallback(buf: GtkTextBuffer; userData: pointer) {.cdecl.} =
   if gOrgMode:
@@ -381,7 +481,7 @@ method view(app: AppState): Widget =
             proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool =
               app.handleKey(keyval, ctrl, shift, cursorPos)
 
-        Label(text = app.status):
+        Label(text = app.status) {.expand: false.}:
           margin = 6
           xalign = 0.0
 
@@ -401,10 +501,18 @@ proc main() =
   let args = commandLineParams()
   let filePath = if args.len > 0: args[0] else: ""
   let gtkBuffer = newGtkTextBuffer()
+  var startInOrgMode = false
   if filePath != "" and fileExists(filePath):
     gtkBuffer.bufferText = readFile(filePath)
+  elif filePath == "":
+    # No file given -- load the built-in example so the editor isn't blank,
+    # with Org babel mode on so its R src block renders monospace.
+    gtkBuffer.bufferText = welcomeOrg
+    startInOrgMode = true
 
   setupOrgTags(gtkBuffer)
+  gOrgMode = startInOrgMode
+  retagOrgBlocks(gtkBuffer)  # apply org tags to the initial text before first draw
   discard g_signal_connect_data(pointer(gtkBuffer), "changed".cstring,
     cast[pointer](bufferChangedCallback), nil, nil, G_CONNECT_AFTER)
 
@@ -426,6 +534,7 @@ proc main() =
     configPath = configPath,
     configSearchPaths = searchPaths,
     dispatch = dispatch,
+    orgMode = startInOrgMode,
   )))
 
 when isMainModule:

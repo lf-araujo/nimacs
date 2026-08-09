@@ -1,0 +1,28 @@
+#+TITLE: Welcome to nimacs
+#+AUTHOR: nimacs
+
+* Getting started
+
+This is an example [[https://orgmode.org][Org]] document, opened by default when
+you start nimacs without a file. *Org babel mode* is already on, so this prose is
+set in a proportional font while the source block below switches to monospace.
+
+* An R source block
+
+The block below is a literate =src= block. In a full Org/Babel setup you would
+evaluate it in place with =C-c C-c=; here it demonstrates how nimacs renders a
+fixed-pitch code block inside proportional prose.
+
+#+begin_src R :results output
+  # Fit a simple model on a built-in dataset
+  data(mtcars)
+  fit <- lm(mpg ~ wt + hp, data = mtcars)
+  summary(fit)
+#+end_src
+
+* Next steps
+
+- Press =C-s= to save. This is a scratch buffer, so pass a path on the command
+  line (=nimacs file.org=) to enable saving to a real file.
+- Edit =config.nim= from the header bar, then Reload Config (=C-S-r=) to
+  hot-swap your keybindings while the app keeps running.
