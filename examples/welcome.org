@@ -54,6 +54,16 @@ can poke at live in the terminal:
   print("max:", max(xs))
 #+end_src
 
+* Ask Claude, inline
+
+The stock config also wires Claude as a babel language: write a prompt in a
+=claude= block and =C-c C-c= sends it to =claude -p=, writing the reply to
+=#+RESULTS= (needs the =claude= CLI on your PATH).
+
+#+begin_src claude
+In one sentence, what is a mixed-effects model?
+#+end_src
+
 * Next steps
 
 - Run any =#+begin_src= block with =C-c C-c=. Add =:session name= for a

@@ -62,4 +62,24 @@ proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc;
   #   "println(\"NIMACSx\" * \"READY\")\n",
   #   "_nrun(\"{file}\")\n",
   #   "exit()\n")
+  #
+  # Example for Stata (uncomment; set the console binary -- stata / -se / -mp,
+  # NOT the xstata GUI). `set more off` is essential or Stata hangs at --more--;
+  # `capture noisily do` runs the block, shows output, and survives errors.
+  # bindRepl(ctx, "stata", "stata-mp -q",
+  #   "set more off\nset rmsg off\ncapture program drop _nrun\n" &
+  #     "program _nrun\n" &
+  #     "  display \"__NIMACS\" + \"_BOR__\"\n" &
+  #     "  capture noisily do \"`1'\"\n" &
+  #     "  display \"__NIMACS\" + \"_END__\"\n" &
+  #     "end\n",
+  #   "display \"NIMACSx\" + \"READY\"\n",
+  #   "_nrun \"{file}\"\n",
+  #   "exit, clear\n")
+
+  # Claude, as a babel language. Put a prompt in a `#+begin_src claude` block and
+  # C-c C-c sends it to `claude -p` (headless Claude Code), writing the reply to
+  # #+RESULTS. Needs the `claude` CLI on PATH. Blocks the UI until Claude answers
+  # (LLM latency) -- fine for short prompts; a proper async assistant is future work.
+  bindLang(ctx, "claude", "cat {file} | claude -p", "", "")
 
