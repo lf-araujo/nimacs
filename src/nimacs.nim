@@ -123,9 +123,6 @@ proc vte_terminal_feed(term: GtkWidget; data: pointer; length: int) {.importc, c
 proc g_unix_fd_add(fd: cint; condition: cint; function: pointer; userData: pointer): cuint {.importc, cdecl.}
 proc g_source_remove(tag: cuint): cbool {.importc, cdecl.}
 
-# argv for the embedded R session; allocated once and kept alive for the app's
-# lifetime (used by execvp in the child after fork).
-var gTerminalArgv = allocCStringArray(["R", "--no-save", "--no-restore", "--quiet"])
 # The terminal displays one session at a time (latest); these track it.
 var gTerminalVte = GtkWidget(nil)   ## the live VTE widget, or nil when closed
 var gTerminalMaster: cint = -1      ## displayed session's PTY master fd
@@ -741,40 +738,70 @@ proc runRscript(code: string): tuple[ok: bool, output: string] =
   except OSError:
     result = (false, "Rscript not found on PATH -- install R to run src blocks")
 
-# -- Persistent R sessions on a PTY (shared with the terminal pane) ---------
-# Each `:session name` is an interactive R spawned on a pseudo-terminal we own.
-# Owning the master fd lets C-c C-c drive it (send code, capture output between
-# markers into #+RESULTS) while the terminal pane displays the *same* R -- one
-# process, both worlds. Markers are built with paste0 so their literals never
-# appear in the driver's echoed source (which would desync the reader).
-# Validated in a standalone PTY harness before wiring in.
+# -- Persistent REPL sessions on a PTY (shared with the terminal pane) -------
+# Each `:session name` is an interactive interpreter spawned on a pseudo-terminal
+# we own. Owning the master fd lets C-c C-c drive it (send code, capture output
+# between markers into #+RESULTS) while the terminal pane displays the *same*
+# process. A ReplSpec makes this generic across languages (R/Python/bash built
+# in; all validated in a standalone PTY harness):
+#   prime  -- one line defining a run-helper that prints the markers. The marker
+#             literals are split (e.g. paste0("__NIMACS","_BOR__")) so they never
+#             appear contiguously in the helper's *echo*, which would desync us.
+#   ready  -- prints a distinct token so we can read past the banner + prime echo.
+#   run    -- a marker-free call to the helper ({file} -> the block's temp file).
+#   quit   -- graceful shutdown command.
 
 const rMarkerBegin = "__NIMACS_BOR__"
 const rMarkerEnd = "__NIMACS_END__"
-const rSessionDriver =
+
+const rDriver =
   ".nimacs_run <- function(path) { cat(paste0(\"__NIMACS\",\"_BOR__\"),\"\\n\"); " &
   "con <- textConnection(\"._nimacs_buf\",\"w\"); sink(con); sink(con,type=\"message\"); options(warn=1); " &
   "tryCatch(source(path,echo=FALSE,print.eval=TRUE,spaced=FALSE,max.deparse.length=Inf), " &
   "error=function(e) cat(\"Error:\",conditionMessage(e),\"\\n\")); sink(type=\"message\"); sink(); close(con); " &
   "cat(._nimacs_buf,sep=\"\\n\"); cat(paste0(\"\\n__NIMACS\",\"_END__\"),\"\\n\"); flush(stdout()) }\n"
-
-let gRExe = findExe("R")  ## resolved once so the forked child execs without a PATH-search malloc
+const pyDriver =
+  "exec(\"def _nrun(p):\\n import traceback\\n print('__NIMACS''_BOR__')\\n try:\\n" &
+  "  exec(open(p).read(), globals())\\n except BaseException:\\n  traceback.print_exc()\\n" &
+  " print('__NIMACS''_END__')\")\n"
+const bashDriver =
+  "_nrun() { printf '%s\\n' \"__NIMACS\"\"_BOR__\"; source \"$1\"; printf '%s\\n' \"__NIMACS\"\"_END__\"; }\n"
 
 type
+  ReplSpec = object
+    exe: string          ## resolved interpreter path (findExe of argv[0])
+    argv: cstringArray   ## full command for execv
+    prime, ready, run, quit: string
   RSession = ref object
     master: cint     ## PTY master fd we read/write
-    pid: Pid         ## the R child process
+    pid: Pid         ## the interpreter child
     watchId: cuint   ## GLib source id of the terminal display watch (0 = none)
     log: string      ## rolling transcript, replayed when the terminal reopens
+    spec: ReplSpec   ## how to run/quit this session
 
 const sessionLogCap = 200_000  ## keep the last ~200 KB of transcript
 
-var gRSessions: Table[string, RSession]
-var gLatestSession = ""
+var gReplSpecs: Table[string, ReplSpec]  ## langId -> how to run an interactive session
+var gRSessions: Table[string, RSession]  ## sessionKey -> live session
+var gLatestSession = ""                  ## key of the most recently used session
 
-proc appendSessionLog(name, data: string) =
-  if name.len == 0 or not gRSessions.hasKey(name): return
-  let s = gRSessions[name]
+proc mkSpec(argv: seq[string]; prime, ready, run, quit: string): ReplSpec =
+  ReplSpec(exe: findExe(argv[0]), argv: allocCStringArray(argv),
+           prime: prime, ready: ready, run: run, quit: quit)
+
+proc registerBuiltinRepls() =
+  gReplSpecs["r"] = mkSpec(@["R", "--no-save", "--no-restore", "--quiet"],
+    rDriver, "cat(paste0(\"NIMACSx\",\"READY\"),\"\\n\")\n", ".nimacs_run(\"{file}\")\n", "q('no')\n")
+  gReplSpecs["python"] = mkSpec(@["env", "PYTHON_BASIC_REPL=1", "python3", "-q"],
+    pyDriver, "print('NIMACSx''READY')\n", "_nrun(\"{file}\")\n", "exit()\n")
+  gReplSpecs["bash"] = mkSpec(@["bash"],
+    bashDriver, "printf '%s\\n' \"NIMACSx\"\"READY\"\n", "_nrun \"{file}\"\n", "exit\n")
+
+proc sessionKey(lang, name: string): string = lang & "\x1f" & name
+
+proc appendSessionLog(key, data: string) =
+  if key.len == 0 or not gRSessions.hasKey(key): return
+  let s = gRSessions[key]
   s.log.add(data)
   if s.log.len > sessionLogCap:
     s.log = s.log[s.log.len - sessionLogCap .. ^1]
@@ -796,34 +823,36 @@ proc ptyReadUntil(fd: cint; token: string): string =
 
 proc sessionAlive(s: RSession): bool = kill(s.pid, cint(0)) == 0
 
-proc spawnRSession(): RSession =
-  ## fork/exec an interactive R on a fresh PTY, then prime the driver.
-  if gRExe.len == 0: raise newException(OSError, "R not found on PATH")
+proc spawnSession(spec: ReplSpec): RSession =
+  ## fork/exec the interpreter on a fresh PTY, then prime the driver.
+  if spec.exe.len == 0: raise newException(OSError, "interpreter not found on PATH")
   let master = posix_openpt(O_RDWR or O_NOCTTY)
   if master < 0: raise newException(OSError, "posix_openpt failed")
   discard grantpt(master); discard unlockpt(master)
   let sname = $ptsname(master)
   let pid = fork()
-  if pid == 0:  # child: attach stdio to the slave, exec R
+  if pid == 0:  # child: attach stdio to the slave, exec the interpreter
     discard setsid()
     let slave = posix.open(sname.cstring, O_RDWR)
     discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
     if slave > 2: discard close(slave)
     discard close(master)
-    discard execv(gRExe.cstring, gTerminalArgv)
+    discard execv(spec.exe.cstring, spec.argv)
     quit(127)  # exec failed
-  result = RSession(master: master, pid: pid, watchId: 0)
-  ptyWrite(master, rSessionDriver)
-  # Sync past the banner + driver echo using a token absent from the driver.
-  ptyWrite(master, "cat(paste0(\"NIMACSx\",\"READY\"),\"\\n\")\n")
+  result = RSession(master: master, pid: pid, watchId: 0, spec: spec)
+  ptyWrite(master, spec.prime)
+  ptyWrite(master, spec.ready)  # sync past the banner + prime echo
   discard ptyReadUntil(master, "NIMACSxREADY")
 
-proc getRSession(name: string): RSession =
-  if gRSessions.hasKey(name) and sessionAlive(gRSessions[name]):
-    return gRSessions[name]
-  result = spawnRSession()
-  gRSessions[name] = result
-  gLatestSession = name
+proc getSession(lang, name: string): RSession =
+  let key = sessionKey(lang, name)
+  if gRSessions.hasKey(key) and sessionAlive(gRSessions[key]):
+    return gRSessions[key]
+  if not gReplSpecs.hasKey(lang):
+    raise newException(OSError, "no REPL spec for '" & lang & "'")
+  result = spawnSession(gReplSpecs[lang])
+  gRSessions[key] = result
+  gLatestSession = key
 
 proc terminalReadCallback(fd: cint; condition: cint; data: pointer): cbool {.cdecl.} =
   ## GLib watch: pump the session PTY into the terminal display.
@@ -842,20 +871,21 @@ proc terminalCommitCallback(term: GtkWidget; text: cstring; size: cuint; data: p
   if gTerminalMaster >= 0 and size > 0'u32:
     discard write(gTerminalMaster, cast[pointer](text), size.int)
 
-proc runInSession(name, code: string): tuple[ok: bool, output: string] =
+proc runInSession(lang, name, code: string): tuple[ok: bool, output: string] =
+  let key = sessionKey(lang, name)
   var s: RSession
   try:
-    s = getRSession(name)
+    s = getSession(lang, name)
   except OSError:
-    return (false, "could not start R -- is it on PATH?")
+    return (false, "could not start " & lang & " -- is it on PATH?")
   # If the terminal is showing this session, pause its watch so our blocking
   # read gets the bytes; resume after.
   let hadWatch = s.watchId != 0
   if hadWatch:
     discard g_source_remove(s.watchId); s.watchId = 0
-  let path = genTempPath("nimacs-babel-", ".R")
+  let path = genTempPath("nimacs-babel-", ".src")
   writeFile(path, code)
-  ptyWrite(s.master, ".nimacs_run(\"" & path & "\")\n")
+  ptyWrite(s.master, s.spec.run.replace("{file}", path))
   let acc = ptyReadUntil(s.master, rMarkerEnd)
   removeFile(path)
   var lines: seq[string]
@@ -871,7 +901,7 @@ proc runInSession(name, code: string): tuple[ok: bool, output: string] =
   # if the terminal was closed when the block ran).
   if output.len > 0:
     var shown = output.replace("\n", "\r\n") & "\r\n"
-    appendSessionLog(name, shown)
+    appendSessionLog(key, shown)
     if pointer(gTerminalVte) != nil and gTerminalMaster == s.master:
       vte_terminal_feed(gTerminalVte, addr shown[0], shown.len)
   if hadWatch:
@@ -879,10 +909,10 @@ proc runInSession(name, code: string): tuple[ok: bool, output: string] =
   (true, output)
 
 proc shutdownRSessions() =
-  ## Quit each session's R and reap it, so nothing is left running.
-  for name, s in gRSessions:
+  ## Quit each session's interpreter and reap it, so nothing is left running.
+  for key, s in gRSessions:
     if s.watchId != 0: discard g_source_remove(s.watchId)
-    ptyWrite(s.master, "q('no')\n")
+    ptyWrite(s.master, s.spec.quit)
     discard close(s.master)
     discard kill(s.pid, SIGTERM)
     var status: cint
@@ -890,17 +920,22 @@ proc shutdownRSessions() =
   gRSessions.clear()
 
 proc bindTerminalToSession(vte: GtkWidget) =
-  ## Attach the terminal to the latest session (creating "default" if none),
+  ## Attach the terminal to the latest session, or spawn an R "default" if none,
   ## watch its PTY, and forward typed input to it.
-  let name = if gLatestSession != "": gLatestSession else: "default"
   var s: RSession
-  try:
-    s = getRSession(name)
-  except OSError:
-    return
+  var key: string
+  if gLatestSession != "" and gRSessions.hasKey(gLatestSession):
+    key = gLatestSession
+    s = gRSessions[key]
+  else:
+    try:
+      s = getSession("r", "default")
+    except OSError:
+      return
+    key = gLatestSession  # getSession set it
   gTerminalVte = vte
   gTerminalMaster = s.master
-  gTerminalSession = name
+  gTerminalSession = key
   # Replay the transcript so reopening the terminal doesn't look wiped.
   if s.log.len > 0:
     vte_terminal_feed(vte, addr s.log[0], s.log.len)
@@ -1007,25 +1042,30 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
     inc t
 
   let code = dedent(lines[beginIdx + 1 ..< endIdx].join("\n"))
-  # R is built in (with :session support); any other language runs through a
-  # runner registered in config.nim via bindLang. Sessions are R-only for now.
+  # `:session` -> a persistent interactive interpreter (any language with a
+  # ReplSpec: R/Python/bash built in, shared with the terminal pane). No
+  # `:session` -> a one-shot run (built-in R, or a config bindLang command).
   var ok: bool
   var rawOut, where: string
-  if lang == "r":
-    if sessionName != "":
-      (ok, rawOut) = runInSession(sessionName, code)
-      where = "R session :" & sessionName
+  if sessionName != "":
+    if gReplSpecs.hasKey(lang):
+      (ok, rawOut) = runInSession(lang, sessionName, code)
+      where = lang & " :session " & sessionName
     else:
-      (ok, rawOut) = runRscript(code)
-      where = "R (one-shot)"
+      app.status = "C-c C-c: no interactive session for '" &
+        (if lang == "": "none" else: lang) & "'"
+      return
+  elif lang == "r":
+    (ok, rawOut) = runRscript(code)
+    where = "R (one-shot)"
   else:
     let cmd = app.dispatch.babelCommand(lang)
     if cmd == "":
       app.status = "C-c C-c: no runner for language '" &
-        (if lang == "": "none" else: lang) & "' -- register it with bindLang in config.nim"
+        (if lang == "": "none" else: lang) & "' -- add :session, or bindLang in config.nim"
       return
     (ok, rawOut) = runCommandTemplate(cmd, code)
-    where = lang & " (one-shot)" & (if sessionName != "": "  [:session is R-only]" else: "")
+    where = lang & " (one-shot)"
   if not ok:
     app.status = rawOut
     return
@@ -1333,6 +1373,7 @@ proc setupIconTheme() =
 
 proc main() =
   setupIconTheme()
+  registerBuiltinRepls()  # R / Python / bash interactive :session support
   let args = commandLineParams()
   let filePath = if args.len > 0: args[0] else: ""
   let gtkBuffer = newGtkTextBuffer()

@@ -37,25 +37,32 @@ session name. Run the two blocks below in order (=C-c C-c= in each):
   round(summary(fit)$r.squared, 3)
 #+end_src
 
-* Other languages, straight from your config
+* Other languages and shared sessions
 
-R is built in, but other babel languages are registered in =config.nim= (edit
-it from the header bar, then Reload Config) -- no host rebuild. The stock config
-registers Python and bash, so this runs with =C-c C-c= too:
+R, Python, and bash all support persistent =:session= interpreters -- the same
+process the terminal pane (⌨ in the header) displays. Run these Python blocks in
+order; the second sees =xs= from the first, and it's the very R/Python/bash you
+can poke at live in the terminal:
 
-#+begin_src python
+#+begin_src python :session py
   xs = [1, 2, 3, 4]
   print("mean:", sum(xs) / len(xs))
 #+end_src
 
+#+begin_src python :session py
+  # xs persists from the previous block
+  print("max:", max(xs))
+#+end_src
+
 * Next steps
 
-- Run any =#+begin_src R= block with =C-c C-c= (needs R on your PATH).
-- Add =:session name= to share state across blocks; omit it for a fresh,
-  isolated one-shot run each time (R only).
-- Register more languages in =config.nim= with =bindLang(ctx, "lang",
-  "cmd {file}", ".ext", specXml)= -- =C-c C-c= then runs them, and code files
-  with that extension get syntax highlighting.
+- Run any =#+begin_src= block with =C-c C-c=. Add =:session name= for a
+  persistent interpreter shared with the terminal pane; omit it for a fresh
+  one-shot run.
+- Open the ⌨ terminal to interact with the latest =:session= directly -- set a
+  variable in a block, then inspect it live (same process).
+- Register one-shot runners / highlighting for more languages in =config.nim=
+  with =bindLang=.
 - Press =C-s= to save. This is a scratch buffer, so pass a path on the command
   line (=nimacs file.org=) to enable saving to a real file.
 - Edit =config.nim= from the header bar, then Reload Config (=C-S-r=) to
