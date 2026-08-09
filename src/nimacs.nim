@@ -587,6 +587,9 @@ viewable App:
   searchQuery: string
   replaceText: string
   terminalActive: bool   ## bottom R terminal pane shown
+  paletteActive: bool    ## command palette overlay shown
+  paletteQuery: string
+  paletteSelected: int
 
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
@@ -1284,7 +1287,75 @@ proc closeSearch(app: AppState) =
   gtk_source_search_settings_set_search_text(gSearchSettings, "".cstring)  # clear highlights
   app.status = "Find closed"
 
+# -- Command palette (Ctrl+Shift+P) ----------------------------------------
+# Reuses the editor's key controller: while open, every keystroke routes here
+# (type to filter, Up/Down to move, Enter to run, Esc to close), so no separate
+# focused entry or popover is needed. Items span menu actions, running
+# terminals, and (later) LSP servers.
+
+type PaletteItem = object
+  label: string
+  run: proc() {.closure.}
+
+proc paletteItems(app: AppState): seq[PaletteItem] =
+  result.add PaletteItem(label: "Open file", run: proc() = app.openFile())
+  result.add PaletteItem(label: "Save", run: proc() = app.saveFile())
+  result.add PaletteItem(label: "Reload config", run: proc() = app.doReload())
+  result.add PaletteItem(label: "Edit config.nim", run: proc() = app.editConfig())
+  result.add PaletteItem(label: "Toggle Org babel mode", run: proc() = app.toggleOrgMode(not app.orgMode))
+  result.add PaletteItem(label: "Find and replace", run: proc() = app.searchActive = true)
+  result.add PaletteItem(label: "Comment: toggle line", run: proc() = app.toggleComment(app.gtkBuffer.liveCursorOffset()))
+  result.add PaletteItem(label: "Terminal: Claude Code", run: proc() = app.openTerminalRaw(@["claude"]))
+  result.add PaletteItem(label: "Terminal: new shell", run: proc() = app.openTerminalRaw(@["bash"]))
+  for key in runningTargets():
+    let k = key
+    result.add PaletteItem(label: "Terminal: switch to " & keyLabel(k),
+      run: proc() = app.switchTerminalTo(k))
+  # LSP servers will add palette items here in the future.
+
+proc paletteFiltered(app: AppState): seq[PaletteItem] =
+  let q = app.paletteQuery.toLowerAscii
+  for it in app.paletteItems():
+    if q.len == 0 or q in it.label.toLowerAscii:
+      result.add it
+
+proc handlePaletteKey(app: AppState; keyval: int): bool =
+  const
+    kEsc = 0xff1b
+    kRet = 0xff0d
+    kKpEnter = 0xff8d
+    kUp = 0xff52
+    kDown = 0xff54
+    kBackspace = 0xff08
+  let items = app.paletteFiltered()
+  case keyval
+  of kEsc:
+    app.paletteActive = false
+  of kRet, kKpEnter:
+    let sel = app.paletteSelected
+    app.paletteActive = false
+    if sel >= 0 and sel < items.len: items[sel].run()
+  of kUp:
+    app.paletteSelected = max(0, app.paletteSelected - 1)
+  of kDown:
+    app.paletteSelected = min(max(0, items.len - 1), app.paletteSelected + 1)
+  of kBackspace:
+    if app.paletteQuery.len > 0:
+      app.paletteQuery.setLen(app.paletteQuery.len - 1)
+      app.paletteSelected = 0
+  else:
+    let cp = gdk_keyval_to_unicode(keyval.cuint)
+    if int(cp) >= 32 and int(cp) != 127:  # printable -> extend the query
+      app.paletteQuery.add($Rune(cp))
+      app.paletteSelected = 0
+  discard app.redraw()
+  true
+
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
+  # The command palette, when open, swallows every key (filter/navigate/run).
+  if app.paletteActive:
+    return app.handlePaletteKey(keyval)
+
   # Built-in bindings are host-level and always active, regardless of
   # whatever config.nim currently has bound -- rebinding them away would be
   # a footgun (e.g. losing the only way to trigger a reload).
@@ -1329,6 +1400,9 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
   elif chord == "C-f":
     app.searchActive = not app.searchActive
     if not app.searchActive: app.closeSearch() else: app.status = "Find"
+  elif chord == "C-S-p":
+    app.paletteActive = true; app.paletteQuery = ""; app.paletteSelected = 0
+    app.status = "Command palette -- type to filter, Enter to run, Esc to close"
   else:
     let cmd = app.dispatch.lookup(chord)
     if cmd == nil:
@@ -1405,6 +1479,16 @@ method view(app: AppState): Widget =
             app.status = "Claude in terminal"
 
       Box(orient = OrientY):
+        if app.paletteActive:
+          Box(orient = OrientY) {.expand: false.}:
+            margin = 8
+            Label(text = "⌘  " & app.paletteQuery & "▏") {.expand: false.}:
+              xalign = 0.0
+            for i, it in app.paletteFiltered():
+              if i < 9:  # cap the visible matches
+                Label(text = (if i == app.paletteSelected: "▶  " else: "      ") & it.label) {.expand: false.}:
+                  xalign = 0.0
+
         if app.searchActive:
           Box(orient = OrientX) {.expand: false.}:
             margin = 4
