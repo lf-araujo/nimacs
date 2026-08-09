@@ -109,6 +109,18 @@ proc gtk_css_provider_load_from_string(provider: pointer; css: cstring) {.import
 proc gdk_display_get_default(): pointer {.importc, cdecl.}
 proc gtk_style_context_add_provider_for_display(display: pointer; provider: pointer; priority: cuint) {.importc, cdecl.}
 
+# -- Unsaved-changes confirmation (AdwAlertDialog) --------------------------
+# libadwaita's modern alert dialog is fixed-arity (unlike the varargs
+# GtkAlertDialog this codebase avoids). Linked via libadwaita (owlkettle/adw).
+proc adw_alert_dialog_new(heading, body: cstring): pointer {.importc, cdecl.}
+proc adw_alert_dialog_add_response(dialog: pointer; id, label: cstring) {.importc, cdecl.}
+proc adw_alert_dialog_set_response_appearance(dialog: pointer; id: cstring; appearance: cint) {.importc, cdecl.}
+proc adw_alert_dialog_set_default_response(dialog: pointer; id: cstring) {.importc, cdecl.}
+proc adw_alert_dialog_set_close_response(dialog: pointer; id: cstring) {.importc, cdecl.}
+proc adw_dialog_present(dialog: pointer; parent: GtkWidget) {.importc, cdecl.}
+# owlkettle exposes get_modified but not set_modified; bind it ourselves.
+proc gtk_text_buffer_set_modified(buffer: GtkTextBuffer; setting: cbool) {.importc, cdecl.}
+
 const nimacsCss = """
 /* Slim, compact header bar. min-height on the headerbar alone isn't enough --
    the buttons' own min-height drives the final height, so shrink both. Keep
@@ -382,6 +394,57 @@ proc bufferChangedCallback(buf: GtkTextBuffer; userData: pointer) {.cdecl.} =
 # CustomWidget pattern for exactly the same reason (a cdecl callback can't
 # capture a Nim closure directly).
 
+# -- Unsaved-changes guard on window close ---------------------------------
+# Decoupled from AppState (it runs before those types are defined): the buffer
+# and window are reached through the single editor view, and the current file
+# path is mirrored into a global at each load. GtkTextBuffer tracks its own
+# modified flag; we clear it after every load/save.
+var gMainWindow = GtkWidget(nil)
+var gFilePath = ""
+var gCloseHandlerInstalled = false
+
+proc currentBuffer(): GtkTextBuffer = gtk_text_view_get_buffer(gEditorView)
+
+proc onDialogResponse(dialog: pointer; responseId: cstring; data: pointer) {.cdecl.} =
+  case $responseId
+  of "discard":
+    gtk_text_buffer_set_modified(currentBuffer(), cbool(0))  # let the re-close through
+    gtk_window_close(gMainWindow)
+  of "save":
+    if gFilePath.len > 0:
+      writeFile(gFilePath, currentBuffer().bufferText)
+      gtk_text_buffer_set_modified(currentBuffer(), cbool(0))
+      gtk_window_close(gMainWindow)
+    # else: scratch buffer with no path -- can't save; leave the window open
+  else: discard  # cancel -- stay open
+
+proc showUnsavedDialog() =
+  let dialog = adw_alert_dialog_new("Discard unsaved changes?".cstring,
+    "This buffer has unsaved changes.".cstring)
+  adw_alert_dialog_add_response(dialog, "cancel".cstring, "Cancel".cstring)
+  adw_alert_dialog_add_response(dialog, "discard".cstring, "Discard".cstring)
+  adw_alert_dialog_add_response(dialog, "save".cstring, "Save".cstring)
+  adw_alert_dialog_set_response_appearance(dialog, "discard".cstring, cint(2))  # ADW_RESPONSE_DESTRUCTIVE
+  adw_alert_dialog_set_response_appearance(dialog, "save".cstring, cint(1))     # ADW_RESPONSE_SUGGESTED
+  adw_alert_dialog_set_default_response(dialog, "save".cstring)
+  adw_alert_dialog_set_close_response(dialog, "cancel".cstring)                 # Esc / click-away = cancel
+  discard g_signal_connect(dialog, "response", onDialogResponse, nil)
+  adw_dialog_present(dialog, gMainWindow)
+
+proc onCloseRequest(window: GtkWidget; data: pointer): cbool {.cdecl.} =
+  ## Return TRUE to block the close and ask, if the buffer has unsaved edits.
+  if pointer(gEditorView) == nil: return cbool(0)
+  if gtk_text_buffer_get_modified(currentBuffer()) == cbool(0): return cbool(0)
+  showUnsavedDialog()
+  cbool(1)
+
+proc onEditorRealize(widget: GtkWidget; data: pointer) {.cdecl.} =
+  ## Once the editor is in the widget tree, hook the toplevel's close-request.
+  if gCloseHandlerInstalled: return
+  gMainWindow = gtk_widget_get_root(widget)
+  discard g_signal_connect(gMainWindow, "close-request", onCloseRequest, nil)
+  gCloseHandlerInstalled = true
+
 type
   KeyHandlerObj = object
     onKeyPress: proc (keyval: int, ctrl, shift: bool, cursorPos: int): bool
@@ -430,6 +493,8 @@ renderable EditorTextView of BaseWidget:
       gtk_event_controller_set_propagation_phase(controller, GtkPhaseCapture)
       discard g_signal_connect(controller, "key-pressed", keyPressedCallback, state.handler[].addr)
       gtk_widget_add_controller(state.internalWidget, controller)
+      # Install the unsaved-changes guard once the view joins the window.
+      discard g_signal_connect(state.internalWidget, "realize", onEditorRealize, nil)
     connectEvents:
       state.handler.onKeyPress =
         if state.onKeyPress.isNil: nil else: state.onKeyPress.callback
@@ -564,6 +629,7 @@ proc saveFile(app: AppState) =
     app.status = "No file -- pass a path on the command line to enable saving"
     return
   writeFile(app.filePath, app.gtkBuffer.bufferText)
+  gtk_text_buffer_set_modified(app.gtkBuffer, cbool(0))  # clean again -> no close prompt
   app.status = "Saved " & app.filePath
 
 proc doReload(app: AppState) =
@@ -578,6 +644,8 @@ proc editConfig(app: AppState) =
   # first (matches this project's current no-multiple-buffers scope).
   app.gtkBuffer.bufferText = readFile(app.configPath)
   app.filePath = app.configPath
+  gFilePath = app.configPath
+  gtk_text_buffer_set_modified(app.gtkBuffer, cbool(0))  # freshly loaded -> clean
   setupSourceHighlighting(app.gtkBuffer, app.configPath, app.dispatch)  # config.nim -> Nim highlighting
   app.status = "Editing " & app.configPath & " -- C-s to save, then Reload Config"
 
@@ -592,6 +660,8 @@ proc fileOpenCallback(sourceObject: pointer; res: pointer; userData: pointer) {.
     if fileExists(path):
       app.gtkBuffer.bufferText = readFile(path)
       app.filePath = path
+      gFilePath = path
+      gtk_text_buffer_set_modified(app.gtkBuffer, cbool(0))  # freshly loaded -> clean
       setupSourceHighlighting(app.gtkBuffer, path, app.dispatch)  # re-detect language for the new file
       app.status = "Opened " & path
   # else: user cancelled -- err is set to "Dismissed by user", not a real
@@ -724,6 +794,23 @@ proc shutdownRSessions() =
     p.close()
   gRSessions.clear()
 
+proc dedent(code: string): string =
+  ## Strip the common leading whitespace from every line -- org src blocks are
+  ## usually indented, and passing that through breaks indentation-sensitive
+  ## languages (Python sees a leading indent on line 1 as an error). Harmless
+  ## for R/bash. Mirrors org-babel's own de-indentation.
+  var minIndent = high(int)
+  for line in code.splitLines():
+    if strutils.strip(line).len == 0: continue  # ignore blank lines
+    var i = 0
+    while i < line.len and line[i] in {' ', '\t'}: inc i
+    minIndent = min(minIndent, i)
+  if minIndent == high(int) or minIndent == 0: return code
+  var res: seq[string]
+  for line in code.splitLines():
+    res.add(if line.len >= minIndent: line[minIndent .. ^1] else: line)
+  res.join("\n")
+
 proc runCommandTemplate(cmdTemplate, code: string): tuple[ok: bool, output: string] =
   ## Run a config-registered one-shot babel command: write the block body to a
   ## temp file, substitute `{file}`, run it through the shell, and capture
@@ -784,7 +871,7 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
           "default"
     inc t
 
-  let code = lines[beginIdx + 1 ..< endIdx].join("\n")
+  let code = dedent(lines[beginIdx + 1 ..< endIdx].join("\n"))
   # R is built in (with :session support); any other language runs through a
   # runner registered in config.nim via bindLang. Sessions are R-only for now.
   var ok: bool
@@ -1122,6 +1209,8 @@ proc main() =
   let initialStatus = if ok: msg else: "config load failed: " & msg
 
   setupSourceHighlighting(gtkBuffer, filePath, dispatch)  # highlighting (incl. config langs)
+  gFilePath = filePath
+  gtk_text_buffer_set_modified(gtkBuffer, cbool(0))  # initial content isn't a user edit
   gOrgMode = startInOrgMode
   retagOrgBlocks(gtkBuffer)  # apply org tags to the initial text before first draw
   discard g_signal_connect_data(pointer(gtkBuffer), "changed".cstring,
