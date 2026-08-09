@@ -1381,23 +1381,14 @@ proc identPrefix(text: string; pos: int): string =
   while start > 0 and text[start - 1] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}: dec start
   text[start ..< pos]
 
-proc lspComplete(app: AppState; cursorPos: int) =
-  ## Ctrl+Space: ask the language server for completions at the cursor.
-  let langId = langIdForFile(app.dispatch, app.filePath)
-  if langId.len == 0 or not gLspServers.hasKey(langId):
-    app.status = "No LSP server for this file type"; return
-  if app.filePath.len == 0:
-    app.status = "Save the file to use LSP completion"; return
-  let client = getLspClient(langId, parentDir(app.filePath))
+proc lspShow(app: AppState; langId, docText, uri, rootDir, prefix: string; line, character: int) =
+  ## Run completion against `docText` (already synced under `uri`) and populate
+  ## the overlay, filtered by `prefix`.
+  let client = getLspClient(langId, rootDir)
   if client == nil or not client.initialized:
     app.status = "LSP server unavailable for " & langId; return
-  let text = app.gtkBuffer.bufferText
-  client.syncDoc(uriOf(app.filePath), langId, text)   # keep the server's copy current
-  let line = lineOfOffset(text, cursorPos)
-  var lineStart = cursorPos
-  while lineStart > 0 and text[lineStart - 1] != '\n': dec lineStart
-  let prefix = identPrefix(text, cursorPos)
-  var items = client.completion(uriOf(app.filePath), line, cursorPos - lineStart)
+  client.syncDoc(uri, langId, docText)
+  var items = client.completion(uri, line, character)
   if prefix.len > 0:
     let lp = prefix.toLowerAscii
     var filtered: seq[string]
@@ -1412,6 +1403,76 @@ proc lspComplete(app: AppState; cursorPos: int) =
   app.completionPrefix = prefix
   app.completionActive = true
   app.status = $items.len & " completions (Enter to insert, Esc to cancel)"
+
+proc lspBlockTmp(langId: string): string =
+  ## A stable per-language temp file that mirrors the current org src block, so
+  ## the server sees a real file of the right type.
+  let ext = case langId
+    of "nim": ".nim"
+    of "python": ".py"
+    of "r": ".r"
+    of "bash": ".sh"
+    else: ".txt"
+  result = getCacheDir() / "nimacs" / "lsp"
+  createDir(result)
+  result = result / ("block" & ext)
+
+proc lspComplete(app: AppState; cursorPos: int) =
+  ## Ctrl+Space: LSP completion for a code file, or for the org src block at the
+  ## cursor (extracted + de-indented into a virtual document).
+  let text = app.gtkBuffer.bufferText
+  var lineStart = cursorPos
+  while lineStart > 0 and text[lineStart - 1] != '\n': dec lineStart
+  let prefix = identPrefix(text, cursorPos)
+
+  # Case 1: a standalone code file (whole buffer is one language).
+  let fileLang = langIdForFile(app.dispatch, app.filePath)
+  if fileLang.len > 0 and gLspServers.hasKey(fileLang) and app.filePath.len > 0:
+    app.lspShow(fileLang, text, uriOf(app.filePath), parentDir(app.filePath), prefix,
+                lineOfOffset(text, cursorPos), cursorPos - lineStart)
+    return
+
+  # Case 2: inside an org #+begin_src block -> a per-block virtual document.
+  let lines = text.split('\n')
+  let cursorLine = lineOfOffset(text, cursorPos)
+  var beginIdx = -1
+  var i = cursorLine
+  while i >= 0:
+    if i < cursorLine and isEndSrc(lines[i]): break
+    if isBeginSrc(lines[i]): beginIdx = i; break
+    dec i
+  var endIdx = -1
+  if beginIdx != -1:
+    var j = beginIdx + 1
+    while j < lines.len:
+      if isEndSrc(lines[j]): endIdx = j; break
+      if isBeginSrc(lines[j]): break
+      inc j
+  if beginIdx == -1 or endIdx == -1 or cursorLine <= beginIdx or cursorLine > endIdx:
+    app.status = "No LSP here -- open a code file, or put the cursor in a src block"
+    return
+  let toks = strutils.splitWhitespace(strutils.strip(lines[beginIdx]))
+  let blockLang = if toks.len >= 2: toks[1].toLowerAscii() else: ""
+  if blockLang.len == 0 or not gLspServers.hasKey(blockLang):
+    app.status = "No LSP server for '" & blockLang & "'"
+    return
+  # De-indent the block body (like babel run) and track the shift for the column.
+  let body = lines[beginIdx + 1 .. endIdx - 1]
+  var minIndent = high(int)
+  for bl in body:
+    if strutils.strip(bl).len == 0: continue
+    var k = 0
+    while k < bl.len and bl[k] in {' ', '\t'}: inc k
+    minIndent = min(minIndent, k)
+  if minIndent == high(int): minIndent = 0
+  var dedented: seq[string]
+  for bl in body:
+    dedented.add(if bl.len >= minIndent: bl[minIndent .. ^1] else: bl)
+  let blockText = dedented.join("\n")
+  let tmp = lspBlockTmp(blockLang)
+  writeFile(tmp, blockText)
+  app.lspShow(blockLang, blockText, uriOf(tmp), parentDir(tmp), prefix,
+              cursorLine - (beginIdx + 1), max(0, (cursorPos - lineStart) - minIndent))
 
 proc acceptCompletion(app: AppState) =
   app.completionActive = false
