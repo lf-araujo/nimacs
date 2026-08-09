@@ -120,25 +120,9 @@ proc adw_alert_dialog_set_close_response(dialog: pointer; id: cstring) {.importc
 proc adw_dialog_present(dialog: pointer; parent: GtkWidget) {.importc, cdecl.}
 # owlkettle exposes get_modified but not set_modified; bind it ourselves.
 proc gtk_text_buffer_set_modified(buffer: GtkTextBuffer; setting: cbool) {.importc, cdecl.}
-
-const nimacsCss = """
-/* Slim, compact header bar. min-height on the headerbar alone isn't enough --
-   the buttons' own min-height drives the final height, so shrink both. Keep
-   button sizes non-zero, or the icons get requested at size 0 and fail. */
-headerbar {
-  min-height: 26px;
-  padding-top: 0;
-  padding-bottom: 0;
-}
-headerbar button,
-headerbar .toggle {
-  min-height: 22px;
-  min-width: 22px;
-  padding: 1px 8px;
-  margin-top: 2px;
-  margin-bottom: 2px;
-}
-"""
+# Light/dark detection, to pick a header icon colour with real contrast.
+proc adw_style_manager_get_default(): pointer {.importc, cdecl.}
+proc adw_style_manager_get_dark(manager: pointer): cbool {.importc, cdecl.}
 
 var gCssLoaded = false
 proc loadAppCss() =
@@ -148,8 +132,22 @@ proc loadAppCss() =
   if gCssLoaded: return
   let display = gdk_display_get_default()
   if display == nil: return
+  # Force a header foreground with contrast: dark icons on a light header,
+  # light icons on a dark one -- fixes symbolic icons rendering near-invisible.
+  let dark = adw_style_manager_get_dark(adw_style_manager_get_default()) != cbool(0)
+  let fg = if dark: "#f0f0f0" else: "#2e2e2e"
+  # Slim, compact header bar. min-height on the headerbar alone isn't enough --
+  # the buttons' own min-height drives the height -- and button sizes must stay
+  # non-zero or the icons get requested at size 0 and fail.
+  let css =
+    "headerbar { min-height: 26px; padding-top: 0; padding-bottom: 0; }\n" &
+    "headerbar button, headerbar .toggle {\n" &
+    "  min-height: 22px; min-width: 22px; padding: 1px 8px;\n" &
+    "  margin-top: 2px; margin-bottom: 2px; color: " & fg & ";\n" &
+    "}\n" &
+    "headerbar button image { color: " & fg & "; }\n"
   let provider = gtk_css_provider_new()
-  gtk_css_provider_load_from_string(provider, nimacsCss.cstring)
+  gtk_css_provider_load_from_string(provider, css.cstring)
   gtk_style_context_add_provider_for_display(display, provider, 600)
   gCssLoaded = true
 
@@ -921,15 +919,15 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
   if afterIdx <= lines.high:
     newLines.add(lines[afterIdx .. ^1])
 
-  # Cursor to the start of the #+RESULTS: line (index endIdx+2 in newLines:
-  # lines[0..endIdx], then the blank, then the results header) so it scrolls
-  # into view after running.
-  var resultsOffset = 0
-  for k in 0 ..< endIdx + 2:
-    resultsOffset += newLines[k].len + 1
-
   app.gtkBuffer.bufferText = newLines.join("\n")
-  app.gtkBuffer.placeCursorAt(resultsOffset)
+  # Keep the cursor where it was -- results are inserted *after* the block, so
+  # the original offset still points at the same character -- and scroll it back
+  # into view (set_text otherwise snaps the view to the top of the file).
+  app.gtkBuffer.placeCursorAt(cursorPos)
+  if pointer(gEditorView) != nil:
+    var it: GtkTextIter
+    gtk_text_buffer_get_iter_at_offset(app.gtkBuffer, it.addr, cursorPos.cint)
+    discard gtk_text_view_scroll_to_iter(gEditorView, it.addr, 0.1, cbool(0), 0.0, 0.0)
   app.status = "Executed " & where & " -- " & $(resultLines.len - 1) & " result line(s)"
 
 proc toggleComment(app: AppState; cursorPos: int) =
