@@ -101,6 +101,23 @@ proc gtk_source_search_context_replace_all(context: pointer; replace: cstring; r
 # get_selection_bounds, get_iter_at_offset, place_cursor).
 proc gtk_text_view_scroll_to_iter(view: GtkWidget; iter: ptr GtkTextIter; withinMargin: cdouble; useAlign: cbool; xalign, yalign: cdouble): cbool {.importc, cdecl.}
 
+# -- VTE terminal FFI ------------------------------------------------------
+# Runtime-bound like GtkSourceView (no dev/pkg-config files). VteTerminal is-a
+# GtkWidget, so it drops straight into the owlkettle widget tree.
+const vteLib = "libvte-2.91-gtk4.so.0"
+proc vte_terminal_new(): GtkWidget {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_set_scrollback_lines(term: GtkWidget; lines: clong) {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_set_size(term: GtkWidget; columns, rows: clong) {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_feed_child(term: GtkWidget; text: cstring; length: int) {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_spawn_async(term: GtkWidget; ptyFlags: cint; workingDirectory: cstring;
+  argv: cstringArray; envv: cstringArray; spawnFlags: cint;
+  childSetup: pointer; childSetupData: pointer; childSetupDataDestroy: pointer;
+  timeout: cint; cancellable: pointer; callback: pointer; userData: pointer) {.importc, cdecl, dynlib: vteLib.}
+
+# argv for the embedded session; allocated once and kept alive for the app's
+# lifetime (GSpawn copies it, but a stable pointer avoids any free-timing risk).
+var gTerminalArgv = allocCStringArray(["R", "--no-save", "--no-restore", "--quiet"])
+
 # -- App CSS (header-bar height, and a hook for future theming) -------------
 # Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
 proc gtk_css_provider_new(): pointer {.importc, cdecl.}
@@ -526,6 +543,20 @@ renderable EditorTextView of BaseWidget:
     property:
       gtk_text_view_set_accepts_tab(state.internalWidget, cbool(ord(state.acceptsTab)))
 
+renderable TerminalPane of BaseWidget:
+  ## A VTE terminal that spawns an interactive R session on build. Toggled in
+  ## and out of the layout by App.terminalActive; each show is a fresh session.
+  hooks:
+    beforeBuild:
+      state.internalWidget = vte_terminal_new()
+    build:
+      vte_terminal_set_scrollback_lines(state.internalWidget, clong(5000))
+      vte_terminal_set_size(state.internalWidget, clong(80), clong(10))
+      # ptyFlags=VTE_PTY_DEFAULT(0), spawnFlags=G_SPAWN_SEARCH_PATH(4) so "R" is
+      # found on PATH; no working dir / env override, no child setup or callback.
+      vte_terminal_spawn_async(state.internalWidget, cint(0), nil, gTerminalArgv, nil,
+        cint(4), nil, nil, nil, cint(-1), nil, nil, nil)
+
 # -- Keychord translation --------------------------------------------------
 # Only chords with an explicit modifier are ever routed to the reloadable
 # command table (see keychord below); a bare unmodified keypress always
@@ -558,6 +589,7 @@ viewable App:
   searchActive: bool     ## find/replace bar shown
   searchQuery: string
   replaceText: string
+  terminalActive: bool   ## bottom R terminal pane shown
 
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
@@ -1115,6 +1147,14 @@ method view(app: AppState): Widget =
             app.searchActive = not app.searchActive
             if not app.searchActive: app.closeSearch() else: app.status = "Find"
 
+        ToggleButton {.addRight.}:
+          tooltip = "R terminal (bottom pane)"
+          state = app.terminalActive
+          Icon(name = "utilities-terminal-symbolic")
+          proc changed(state: bool) =
+            app.terminalActive = state
+            app.status = if state: "R terminal started" else: "R terminal closed"
+
       Box(orient = OrientY):
         if app.searchActive:
           Box(orient = OrientX) {.expand: false.}:
@@ -1165,6 +1205,10 @@ method view(app: AppState): Widget =
             acceptsTab = true
             proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool =
               app.handleKey(keyval, ctrl, shift, cursorPos)
+
+        if app.terminalActive:
+          Separator() {.expand: false.}
+          TerminalPane {.expand: false.}
 
         Label(text = app.status) {.expand: false.}:
           margin = 6
