@@ -19,7 +19,16 @@
 ## gtk_text_view_*) are public, though, so building the widget directly
 ## against those works fine and gives full control besides.
 
-import std/[os, unicode, strutils, osproc, tempfiles, streams, tables]
+import std/[os, unicode, strutils, osproc, tempfiles, tables, posix]
+
+when not declared(posix_openpt):
+  proc posix_openpt(flags: cint): cint {.importc, header: "<stdlib.h>".}
+when not declared(grantpt):
+  proc grantpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
+when not declared(unlockpt):
+  proc unlockpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
+when not declared(ptsname):
+  proc ptsname(fd: cint): cstring {.importc, header: "<stdlib.h>".}
 import owlkettle
 import owlkettle/adw
 import owlkettle/bindings/gtk
@@ -109,14 +118,18 @@ proc vte_terminal_new(): GtkWidget {.importc, cdecl, dynlib: vteLib.}
 proc vte_terminal_set_scrollback_lines(term: GtkWidget; lines: clong) {.importc, cdecl, dynlib: vteLib.}
 proc vte_terminal_set_size(term: GtkWidget; columns, rows: clong) {.importc, cdecl, dynlib: vteLib.}
 proc vte_terminal_feed_child(term: GtkWidget; text: cstring; length: int) {.importc, cdecl, dynlib: vteLib.}
-proc vte_terminal_spawn_async(term: GtkWidget; ptyFlags: cint; workingDirectory: cstring;
-  argv: cstringArray; envv: cstringArray; spawnFlags: cint;
-  childSetup: pointer; childSetupData: pointer; childSetupDataDestroy: pointer;
-  timeout: cint; cancellable: pointer; callback: pointer; userData: pointer) {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_feed(term: GtkWidget; data: pointer; length: int) {.importc, cdecl, dynlib: vteLib.}
+# GLib fd watch (libglib, already linked) to pump the session PTY into VTE.
+proc g_unix_fd_add(fd: cint; condition: cint; function: pointer; userData: pointer): cuint {.importc, cdecl.}
+proc g_source_remove(tag: cuint): cbool {.importc, cdecl.}
 
-# argv for the embedded session; allocated once and kept alive for the app's
-# lifetime (GSpawn copies it, but a stable pointer avoids any free-timing risk).
+# argv for the embedded R session; allocated once and kept alive for the app's
+# lifetime (used by execvp in the child after fork).
 var gTerminalArgv = allocCStringArray(["R", "--no-save", "--no-restore", "--quiet"])
+# The terminal displays one session at a time (latest); these track it.
+var gTerminalVte = GtkWidget(nil)   ## the live VTE widget, or nil when closed
+var gTerminalMaster: cint = -1      ## displayed session's PTY master fd
+var gTerminalSession = ""           ## displayed session name
 
 # -- App CSS (header-bar height, and a hook for future theming) -------------
 # Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
@@ -543,20 +556,6 @@ renderable EditorTextView of BaseWidget:
     property:
       gtk_text_view_set_accepts_tab(state.internalWidget, cbool(ord(state.acceptsTab)))
 
-renderable TerminalPane of BaseWidget:
-  ## A VTE terminal that spawns an interactive R session on build. Toggled in
-  ## and out of the layout by App.terminalActive; each show is a fresh session.
-  hooks:
-    beforeBuild:
-      state.internalWidget = vte_terminal_new()
-    build:
-      vte_terminal_set_scrollback_lines(state.internalWidget, clong(5000))
-      vte_terminal_set_size(state.internalWidget, clong(80), clong(10))
-      # ptyFlags=VTE_PTY_DEFAULT(0), spawnFlags=G_SPAWN_SEARCH_PATH(4) so "R" is
-      # found on PATH; no working dir / env override, no child setup or callback.
-      vte_terminal_spawn_async(state.internalWidget, cint(0), nil, gTerminalArgv, nil,
-        cint(4), nil, nil, nil, cint(-1), nil, nil, nil)
-
 # -- Keychord translation --------------------------------------------------
 # Only chords with an explicit modifier are ever routed to the reloadable
 # command table (see keychord below); a bare unmodified keypress always
@@ -742,87 +741,174 @@ proc runRscript(code: string): tuple[ok: bool, output: string] =
   except OSError:
     result = (false, "Rscript not found on PATH -- install R to run src blocks")
 
-# -- Persistent R sessions (`:session` header arg) -------------------------
-# A `#+begin_src R :session foo` block runs against a long-lived R process
-# (one per session name), so variables, loaded packages, and options carry
-# across blocks -- matching org-babel's `:session` semantics. Blocks with no
-# `:session` keep using the one-shot runRscript path above.
-#
-# Protocol: an R driver (.nimacs_run) injected at session startup reads a
-# block from a temp file, sinks both output and messages into a buffer while
-# evaluating it in the global env (so errors are caught and the session
-# survives), then replays that buffer to stdout bracketed by BOR/EOR markers.
-# The host writes ".nimacs_run(path)" to the process's stdin and reads its
-# stdout until the EOR marker. Verified against R interactively; see the
-# scratch harness this was built from.
+# -- Persistent R sessions on a PTY (shared with the terminal pane) ---------
+# Each `:session name` is an interactive R spawned on a pseudo-terminal we own.
+# Owning the master fd lets C-c C-c drive it (send code, capture output between
+# markers into #+RESULTS) while the terminal pane displays the *same* R -- one
+# process, both worlds. Markers are built with paste0 so their literals never
+# appear in the driver's echoed source (which would desync the reader).
+# Validated in a standalone PTY harness before wiring in.
 
-const rSessionMarkerBegin = "__NIMACS_BOR__"
-const rSessionMarkerEnd = "__NIMACS_END__"
-const rSessionDriver = """
-.nimacs_run <- function(path) {
-  cat(""" & '"' & rSessionMarkerBegin & '"' & """, "\n", sep = "")
-  con <- textConnection("._nimacs_buf", "w")
-  sink(con); sink(con, type = "message")
-  options(warn = 1)
-  tryCatch(source(path, echo = FALSE, print.eval = TRUE, spaced = FALSE, max.deparse.length = Inf),
-           error = function(e) cat("Error:", conditionMessage(e), "\n"))
-  sink(type = "message"); sink(); close(con)
-  cat(._nimacs_buf, sep = "\n")
-  cat("\n", """ & '"' & rSessionMarkerEnd & '"' & """, "\n", sep = "")
-  flush(stdout())
-}
-"""
+const rMarkerBegin = "__NIMACS_BOR__"
+const rMarkerEnd = "__NIMACS_END__"
+const rSessionDriver =
+  ".nimacs_run <- function(path) { cat(paste0(\"__NIMACS\",\"_BOR__\"),\"\\n\"); " &
+  "con <- textConnection(\"._nimacs_buf\",\"w\"); sink(con); sink(con,type=\"message\"); options(warn=1); " &
+  "tryCatch(source(path,echo=FALSE,print.eval=TRUE,spaced=FALSE,max.deparse.length=Inf), " &
+  "error=function(e) cat(\"Error:\",conditionMessage(e),\"\\n\")); sink(type=\"message\"); sink(); close(con); " &
+  "cat(._nimacs_buf,sep=\"\\n\"); cat(paste0(\"\\n__NIMACS\",\"_END__\"),\"\\n\"); flush(stdout()) }\n"
 
-var gRSessions: Table[string, Process]  ## session name -> live R process
+let gRExe = findExe("R")  ## resolved once so the forked child execs without a PATH-search malloc
 
-proc getRSession(name: string): Process =
-  ## Return the running R process for `name`, spawning (and priming with the
-  ## driver) a fresh one if none exists or the previous one has exited.
-  if gRSessions.hasKey(name) and gRSessions[name].running:
+type
+  RSession = ref object
+    master: cint     ## PTY master fd we read/write
+    pid: Pid         ## the R child process
+    watchId: cuint   ## GLib source id of the terminal display watch (0 = none)
+
+var gRSessions: Table[string, RSession]
+var gLatestSession = ""
+
+proc ptyWrite(fd: cint; s: string) =
+  var off = 0
+  while off < s.len:
+    let n = write(fd, unsafeAddr s[off], s.len - off)
+    if n <= 0: break
+    off += n
+
+proc ptyReadUntil(fd: cint; token: string): string =
+  ## Blocking read until `token` appears; returns everything read.
+  var b: array[4096, char]
+  while token notin result:
+    let n = read(fd, addr b[0], b.len)
+    if n <= 0: break
+    for i in 0 ..< n: result.add(b[i])
+
+proc sessionAlive(s: RSession): bool = kill(s.pid, cint(0)) == 0
+
+proc spawnRSession(): RSession =
+  ## fork/exec an interactive R on a fresh PTY, then prime the driver.
+  if gRExe.len == 0: raise newException(OSError, "R not found on PATH")
+  let master = posix_openpt(O_RDWR or O_NOCTTY)
+  if master < 0: raise newException(OSError, "posix_openpt failed")
+  discard grantpt(master); discard unlockpt(master)
+  let sname = $ptsname(master)
+  let pid = fork()
+  if pid == 0:  # child: attach stdio to the slave, exec R
+    discard setsid()
+    let slave = posix.open(sname.cstring, O_RDWR)
+    discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
+    if slave > 2: discard close(slave)
+    discard close(master)
+    discard execv(gRExe.cstring, gTerminalArgv)
+    quit(127)  # exec failed
+  result = RSession(master: master, pid: pid, watchId: 0)
+  ptyWrite(master, rSessionDriver)
+  # Sync past the banner + driver echo using a token absent from the driver.
+  ptyWrite(master, "cat(paste0(\"NIMACSx\",\"READY\"),\"\\n\")\n")
+  discard ptyReadUntil(master, "NIMACSxREADY")
+
+proc getRSession(name: string): RSession =
+  if gRSessions.hasKey(name) and sessionAlive(gRSessions[name]):
     return gRSessions[name]
-  let p = startProcess("R", args = ["--interactive", "--quiet", "--no-save", "--no-restore"],
-                       options = {poUsePath, poStdErrToStdOut})
-  p.inputStream.write(rSessionDriver & "\n")
-  p.inputStream.flush()
-  gRSessions[name] = p
-  p
+  result = spawnRSession()
+  gRSessions[name] = result
+  gLatestSession = name
+
+proc terminalReadCallback(fd: cint; condition: cint; data: pointer): cbool {.cdecl.} =
+  ## GLib watch: pump the session PTY into the terminal display.
+  var b: array[4096, char]
+  let n = read(fd, addr b[0], b.len)
+  if n <= 0: return cbool(0)  # EOF -> drop the watch
+  if pointer(gTerminalVte) != nil:
+    vte_terminal_feed(gTerminalVte, addr b[0], n)
+  cbool(1)
+
+proc terminalCommitCallback(term: GtkWidget; text: cstring; size: cuint; data: pointer) {.cdecl.} =
+  ## User typed in the terminal -> forward the bytes to the displayed R.
+  if gTerminalMaster >= 0 and size > 0'u32:
+    discard write(gTerminalMaster, cast[pointer](text), size.int)
 
 proc runInSession(name, code: string): tuple[ok: bool, output: string] =
-  var p: Process
+  var s: RSession
   try:
-    p = getRSession(name)
+    s = getRSession(name)
   except OSError:
-    return (false, "R not found on PATH -- install R to run :session src blocks")
+    return (false, "could not start R -- is it on PATH?")
+  # If the terminal is showing this session, pause its watch so our blocking
+  # read gets the bytes; resume after.
+  let hadWatch = s.watchId != 0
+  if hadWatch:
+    discard g_source_remove(s.watchId); s.watchId = 0
   let path = genTempPath("nimacs-babel-", ".R")
   writeFile(path, code)
-  p.inputStream.write(".nimacs_run(\"" & path & "\")\n")
-  p.inputStream.flush()
-  let outStream = p.outputStream
-  var collecting = false
-  var lines: seq[string]
-  while true:
-    var line: string
-    if not outStream.readLine(line): break  # process died before EOR
-    if line == rSessionMarkerEnd: break
-    if collecting: lines.add(line)
-    if line == rSessionMarkerBegin: collecting = true
+  ptyWrite(s.master, ".nimacs_run(\"" & path & "\")\n")
+  let acc = ptyReadUntil(s.master, rMarkerEnd)
   removeFile(path)
+  var lines: seq[string]
+  var collecting = false
+  for rawline in acc.split('\n'):
+    let line = rawline.strip(leading = false, trailing = true, chars = {'\r'})
+    if rMarkerEnd in line: break
+    if collecting: lines.add(line)
+    if rMarkerBegin in line: collecting = true
   while lines.len > 0 and strutils.strip(lines[^1]) == "": lines.setLen(lines.len - 1)
-  (true, lines.join("\n"))
+  let output = lines.join("\n")
+  # Echo the run in the terminal too: show the captured result there.
+  if pointer(gTerminalVte) != nil and gTerminalMaster == s.master and output.len > 0:
+    var shown = output.replace("\n", "\r\n") & "\r\n"
+    vte_terminal_feed(gTerminalVte, addr shown[0], shown.len)
+  if hadWatch:
+    s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)  # G_IO_IN
+  (true, output)
 
 proc shutdownRSessions() =
-  ## Ask every live session to quit cleanly, then release its handle. Called
-  ## once the app's window closes so no R processes are left behind.
-  for name, p in gRSessions:
-    if p.running:
-      try:
-        p.inputStream.write("quit(save=\"no\")\n")
-        p.inputStream.flush()
-      except IOError, OSError:
-        discard
-      discard p.waitForExit()
-    p.close()
+  ## Quit each session's R and reap it, so nothing is left running.
+  for name, s in gRSessions:
+    if s.watchId != 0: discard g_source_remove(s.watchId)
+    ptyWrite(s.master, "q('no')\n")
+    discard close(s.master)
+    discard kill(s.pid, SIGTERM)
+    var status: cint
+    discard waitpid(s.pid, status, 0)
   gRSessions.clear()
+
+proc bindTerminalToSession(vte: GtkWidget) =
+  ## Attach the terminal to the latest session (creating "default" if none),
+  ## watch its PTY, and forward typed input to it.
+  let name = if gLatestSession != "": gLatestSession else: "default"
+  var s: RSession
+  try:
+    s = getRSession(name)
+  except OSError:
+    return
+  gTerminalVte = vte
+  gTerminalMaster = s.master
+  gTerminalSession = name
+  if s.watchId == 0:
+    s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)
+  discard g_signal_connect(vte, "commit", terminalCommitCallback, nil)
+
+proc unbindTerminal() =
+  ## Detach the terminal from its session (the R process keeps running).
+  if gTerminalSession != "" and gRSessions.hasKey(gTerminalSession):
+    let s = gRSessions[gTerminalSession]
+    if s.watchId != 0:
+      discard g_source_remove(s.watchId); s.watchId = 0
+  gTerminalVte = GtkWidget(nil)
+  gTerminalMaster = -1
+  gTerminalSession = ""
+
+renderable TerminalPane of BaseWidget:
+  ## A VTE widget that *displays* the shared R session (we own the PTY; VTE is
+  ## display + keyboard only). Bound to the latest session on build.
+  hooks:
+    beforeBuild:
+      state.internalWidget = vte_terminal_new()
+    build:
+      vte_terminal_set_scrollback_lines(state.internalWidget, clong(5000))
+      vte_terminal_set_size(state.internalWidget, clong(80), clong(10))
+      bindTerminalToSession(state.internalWidget)
 
 proc dedent(code: string): string =
   ## Strip the common leading whitespace from every line -- org src blocks are
@@ -1148,12 +1234,13 @@ method view(app: AppState): Widget =
             if not app.searchActive: app.closeSearch() else: app.status = "Find"
 
         ToggleButton {.addRight.}:
-          tooltip = "R terminal (bottom pane)"
+          tooltip = "R terminal -- shared with :session babel (bottom pane)"
           state = app.terminalActive
           Icon(name = "utilities-terminal-symbolic")
           proc changed(state: bool) =
             app.terminalActive = state
-            app.status = if state: "R terminal started" else: "R terminal closed"
+            if not state: unbindTerminal()  # keep R running, just detach the view
+            app.status = if state: "R terminal (shared session)" else: "R terminal closed"
 
       Box(orient = OrientY):
         if app.searchActive:
