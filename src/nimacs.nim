@@ -19,7 +19,7 @@
 ## gtk_text_view_*) are public, though, so building the widget directly
 ## against those works fine and gives full control besides.
 
-import std/[os, unicode, strutils]
+import std/[os, unicode, strutils, osproc, tempfiles, streams, tables]
 import owlkettle
 import owlkettle/adw
 import owlkettle/bindings/gtk
@@ -347,6 +347,7 @@ viewable App:
   configSearchPaths: seq[string]
   dispatch: Dispatch
   orgMode: bool
+  pendingPrefix: string  ## partial key sequence, e.g. "C-c" awaiting its second chord
 
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
@@ -409,12 +410,233 @@ proc runCommand(app: AppState, cursorPos: int, cmd: CommandProc) =
   if k.status != "":
     app.status = k.status
 
+# -- Org-babel execution: run a src block, capture output, write #+RESULTS --
+# C-c C-c on a `#+begin_src R ... #+end_src` block runs the body through
+# Rscript and inserts (or replaces) a `#+RESULTS:` block right after the
+# block, one `: `-prefixed line per output line -- exactly how org-mode
+# renders `:results output`. Synchronous, matching org-babel's own C-c C-c:
+# the UI blocks until Rscript returns. Only R is wired up so far.
+
+proc lineOfOffset(text: string; offset: int): int =
+  ## 0-based index of the line containing character `offset`.
+  let stop = min(offset, text.len)
+  for i in 0 ..< stop:
+    if text[i] == '\n': inc result
+
+proc runRscript(code: string): tuple[ok: bool, output: string] =
+  ## Write `code` to a temp .R file and run it with Rscript, capturing
+  ## stdout and stderr merged (so warnings/messages land in the results too).
+  let path = genTempPath("nimacs-babel-", ".R")
+  writeFile(path, code)
+  defer: removeFile(path)
+  try:
+    let output = execProcess("Rscript", args = ["--vanilla", path],
+                             options = {poStdErrToStdOut, poUsePath})
+    result = (true, output)
+  except OSError:
+    result = (false, "Rscript not found on PATH -- install R to run src blocks")
+
+# -- Persistent R sessions (`:session` header arg) -------------------------
+# A `#+begin_src R :session foo` block runs against a long-lived R process
+# (one per session name), so variables, loaded packages, and options carry
+# across blocks -- matching org-babel's `:session` semantics. Blocks with no
+# `:session` keep using the one-shot runRscript path above.
+#
+# Protocol: an R driver (.nimacs_run) injected at session startup reads a
+# block from a temp file, sinks both output and messages into a buffer while
+# evaluating it in the global env (so errors are caught and the session
+# survives), then replays that buffer to stdout bracketed by BOR/EOR markers.
+# The host writes ".nimacs_run(path)" to the process's stdin and reads its
+# stdout until the EOR marker. Verified against R interactively; see the
+# scratch harness this was built from.
+
+const rSessionMarkerBegin = "__NIMACS_BOR__"
+const rSessionMarkerEnd = "__NIMACS_END__"
+const rSessionDriver = """
+.nimacs_run <- function(path) {
+  cat(""" & '"' & rSessionMarkerBegin & '"' & """, "\n", sep = "")
+  con <- textConnection("._nimacs_buf", "w")
+  sink(con); sink(con, type = "message")
+  options(warn = 1)
+  tryCatch(source(path, echo = FALSE, print.eval = TRUE, spaced = FALSE, max.deparse.length = Inf),
+           error = function(e) cat("Error:", conditionMessage(e), "\n"))
+  sink(type = "message"); sink(); close(con)
+  cat(._nimacs_buf, sep = "\n")
+  cat("\n", """ & '"' & rSessionMarkerEnd & '"' & """, "\n", sep = "")
+  flush(stdout())
+}
+"""
+
+var gRSessions: Table[string, Process]  ## session name -> live R process
+
+proc getRSession(name: string): Process =
+  ## Return the running R process for `name`, spawning (and priming with the
+  ## driver) a fresh one if none exists or the previous one has exited.
+  if gRSessions.hasKey(name) and gRSessions[name].running:
+    return gRSessions[name]
+  let p = startProcess("R", args = ["--interactive", "--quiet", "--no-save", "--no-restore"],
+                       options = {poUsePath, poStdErrToStdOut})
+  p.inputStream.write(rSessionDriver & "\n")
+  p.inputStream.flush()
+  gRSessions[name] = p
+  p
+
+proc runInSession(name, code: string): tuple[ok: bool, output: string] =
+  var p: Process
+  try:
+    p = getRSession(name)
+  except OSError:
+    return (false, "R not found on PATH -- install R to run :session src blocks")
+  let path = genTempPath("nimacs-babel-", ".R")
+  writeFile(path, code)
+  p.inputStream.write(".nimacs_run(\"" & path & "\")\n")
+  p.inputStream.flush()
+  let outStream = p.outputStream
+  var collecting = false
+  var lines: seq[string]
+  while true:
+    var line: string
+    if not outStream.readLine(line): break  # process died before EOR
+    if line == rSessionMarkerEnd: break
+    if collecting: lines.add(line)
+    if line == rSessionMarkerBegin: collecting = true
+  removeFile(path)
+  while lines.len > 0 and strutils.strip(lines[^1]) == "": lines.setLen(lines.len - 1)
+  (true, lines.join("\n"))
+
+proc shutdownRSessions() =
+  ## Ask every live session to quit cleanly, then release its handle. Called
+  ## once the app's window closes so no R processes are left behind.
+  for name, p in gRSessions:
+    if p.running:
+      try:
+        p.inputStream.write("quit(save=\"no\")\n")
+        p.inputStream.flush()
+      except IOError, OSError:
+        discard
+      discard p.waitForExit()
+    p.close()
+  gRSessions.clear()
+
+proc executeSrcBlock(app: AppState; cursorPos: int) =
+  let text = app.gtkBuffer.bufferText
+  let lines = text.split('\n')
+  let cursorLine = lineOfOffset(text, cursorPos)
+
+  # Find the enclosing #+begin_src by scanning up; bail if we cross an
+  # #+end_src first -- that means the cursor sits below a block, not in one.
+  var beginIdx = -1
+  var i = cursorLine
+  while i >= 0:
+    if i < cursorLine and isEndSrc(lines[i]): break
+    if isBeginSrc(lines[i]): beginIdx = i; break
+    dec i
+  if beginIdx == -1:
+    app.status = "C-c C-c: not inside a #+begin_src block"
+    return
+
+  # Find its #+end_src scanning down.
+  var endIdx = -1
+  var j = beginIdx + 1
+  while j < lines.len:
+    if isEndSrc(lines[j]): endIdx = j; break
+    if isBeginSrc(lines[j]): break  # next block starts -- this one is unterminated
+    inc j
+  if endIdx == -1 or cursorLine > endIdx:
+    app.status = "C-c C-c: not inside a terminated #+begin_src block"
+    return
+
+  # Language token: `#+begin_src R :results output` -> "r".
+  let beginTokens = strutils.splitWhitespace(strutils.strip(lines[beginIdx]))
+  let lang = if beginTokens.len >= 2: beginTokens[1].toLowerAscii() else: ""
+  if lang != "r":
+    app.status = "C-c C-c: only R src blocks are supported (got '" &
+      (if lang == "": "none" else: lang) & "')"
+    return
+
+  # Header args after the language token, e.g. `:session foo :results output`.
+  # `:session name` runs in a persistent process; `:session` alone uses the
+  # session named "default"; absent, each run is a one-shot Rscript.
+  var sessionName = ""
+  var t = 2
+  while t < beginTokens.len:
+    if beginTokens[t] == ":session":
+      sessionName =
+        if t + 1 < beginTokens.len and not beginTokens[t + 1].startsWith(":"):
+          beginTokens[t + 1]
+        else:
+          "default"
+    inc t
+
+  let code = lines[beginIdx + 1 ..< endIdx].join("\n")
+  let (ok, rawOut) =
+    if sessionName != "": runInSession(sessionName, code)
+    else: runRscript(code)
+  if not ok:
+    app.status = rawOut
+    return
+
+  # Build the results block: `#+RESULTS:` then one `: `-prefixed line per
+  # output line. Trailing whitespace/newlines from Rscript are trimmed first.
+  var resultLines = @["#+RESULTS:"]
+  let trimmed = strutils.strip(rawOut, leading = false, trailing = true)
+  if trimmed.len > 0:
+    for outLine in trimmed.split('\n'):
+      resultLines.add(": " & outLine)
+
+  # Splice the results in after #+end_src, replacing any existing #+RESULTS
+  # block (the `#+RESULTS:` line plus the `:`-prefixed lines under it), so
+  # re-running updates in place rather than stacking a second block.
+  var afterIdx = endIdx + 1
+  var scan = afterIdx
+  while scan < lines.len and strutils.strip(lines[scan]) == "": inc scan
+  if scan < lines.len and strutils.strip(lines[scan]).toLowerAscii().startsWith("#+results:"):
+    var q = scan + 1
+    while q < lines.len and lines[q].len > 0 and lines[q][0] == ':': inc q
+    afterIdx = q
+
+  var newLines: seq[string]
+  newLines.add(lines[0 .. endIdx])
+  newLines.add("")            # blank line between the block and its results
+  newLines.add(resultLines)
+  if afterIdx <= lines.high:
+    newLines.add(lines[afterIdx .. ^1])
+
+  # Cursor to the start of the #+RESULTS: line (index endIdx+2 in newLines:
+  # lines[0..endIdx], then the blank, then the results header) so it scrolls
+  # into view after running.
+  var resultsOffset = 0
+  for k in 0 ..< endIdx + 2:
+    resultsOffset += newLines[k].len + 1
+
+  app.gtkBuffer.bufferText = newLines.join("\n")
+  app.gtkBuffer.placeCursorAt(resultsOffset)
+  let where = if sessionName != "": "R session :" & sessionName else: "R (one-shot)"
+  app.status = "Executed " & where & " -- " & $(resultLines.len - 1) & " result line(s)"
+
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
   # Built-in bindings are host-level and always active, regardless of
   # whatever config.nim currently has bound -- rebinding them away would be
   # a footgun (e.g. losing the only way to trigger a reload).
   let chord = keychord(keyval, ctrl, shift)
   if chord == "": return false
+
+  # Two-key prefix sequences: C-c starts one, the next chord completes it.
+  # Currently the only completion is `C-c C-c` -> run the src block at point.
+  if app.pendingPrefix == "C-c":
+    app.pendingPrefix = ""
+    if chord == "C-c":
+      app.executeSrcBlock(cursorPos)
+      discard app.redraw()
+      return true
+    # any other chord: prefix abandoned, fall through to normal handling
+
+  if chord == "C-c":
+    app.pendingPrefix = "C-c"
+    app.status = "C-c-"
+    discard app.redraw()
+    return true
+
   if chord == "C-S-r":
     app.doReload()
   elif chord == "C-s":
@@ -536,6 +758,10 @@ proc main() =
     dispatch = dispatch,
     orgMode = startInOrgMode,
   )))
+
+  # brew() returns once the window closes -- tear down any R sessions we
+  # spawned so no background R processes are left running.
+  shutdownRSessions()
 
 when isMainModule:
   main()
