@@ -19,7 +19,7 @@
 ## gtk_text_view_*) are public, though, so building the widget directly
 ## against those works fine and gives full control besides.
 
-import std/[os, unicode, strutils, osproc, tempfiles, tables, posix]
+import std/[os, unicode, strutils, osproc, tempfiles, tables, posix, algorithm]
 
 when not declared(posix_openpt):
   proc posix_openpt(flags: cint): cint {.importc, header: "<stdlib.h>".}
@@ -119,6 +119,7 @@ proc vte_terminal_set_scrollback_lines(term: GtkWidget; lines: clong) {.importc,
 proc vte_terminal_set_size(term: GtkWidget; columns, rows: clong) {.importc, cdecl, dynlib: vteLib.}
 proc vte_terminal_feed_child(term: GtkWidget; text: cstring; length: int) {.importc, cdecl, dynlib: vteLib.}
 proc vte_terminal_feed(term: GtkWidget; data: pointer; length: int) {.importc, cdecl, dynlib: vteLib.}
+proc vte_terminal_reset(term: GtkWidget; clearTabstops, clearHistory: cbool) {.importc, cdecl, dynlib: vteLib.}
 # GLib fd watch (libglib, already linked) to pump the session PTY into VTE.
 proc g_unix_fd_add(fd: cint; condition: cint; function: pointer; userData: pointer): cuint {.importc, cdecl.}
 proc g_source_remove(tag: cuint): cbool {.importc, cdecl.}
@@ -931,9 +932,29 @@ proc shutdownRSessions() =
     discard waitpid(s.pid, status, 0)
   gRSessions.clear()
 
+var gTerminalTargetKey = ""  ## which gRSessions entry the terminal shows ("" = auto: latest)
+
+proc detachTerminalWatch() =
+  ## Remove the display watch from the currently-bound target (its process keeps
+  ## running). Leaves gTerminalVte alone, so a rebind can reuse the widget.
+  if gTerminalSession != "" and gRSessions.hasKey(gTerminalSession):
+    let s = gRSessions[gTerminalSession]
+    if s.watchId != 0:
+      discard g_source_remove(s.watchId); s.watchId = 0
+
+proc bindTerminalCommon(vte: GtkWidget; s: RSession; key: string) =
+  detachTerminalWatch()                          # drop any previous binding first
+  gTerminalVte = vte
+  gTerminalMaster = s.master
+  gTerminalSession = key
+  vte_terminal_reset(vte, cbool(1), cbool(1))    # clear stale display on rebind
+  if s.log.len > 0:                              # replay this target's transcript
+    vte_terminal_feed(vte, addr s.log[0], s.log.len)
+  if s.watchId == 0:
+    s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)  # G_IO_IN
+
 proc bindTerminalToSession(vte: GtkWidget) =
-  ## Attach the terminal to the latest session, or spawn an R "default" if none,
-  ## watch its PTY, and forward typed input to it.
+  ## Show the latest babel :session, or spawn an R "default" if none.
   var s: RSession
   var key: string
   if gLatestSession != "" and gRSessions.hasKey(gLatestSession):
@@ -945,36 +966,98 @@ proc bindTerminalToSession(vte: GtkWidget) =
     except OSError:
       return
     key = gLatestSession  # getSession set it
-  gTerminalVte = vte
-  gTerminalMaster = s.master
-  gTerminalSession = key
-  # Replay the transcript so reopening the terminal doesn't look wiped.
-  if s.log.len > 0:
-    vte_terminal_feed(vte, addr s.log[0], s.log.len)
-  if s.watchId == 0:
-    s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)
-  discard g_signal_connect(vte, "commit", terminalCommitCallback, nil)
+  bindTerminalCommon(vte, s, key)
+
+proc spawnRaw(argv: seq[string]; workdir: string): RSession =
+  ## fork/exec an arbitrary interactive program on a PTY (no driver) -- for a
+  ## raw terminal (a shell, `claude`, ...). No markers, so babel never targets it.
+  let exe = findExe(argv[0])
+  if exe.len == 0: raise newException(OSError, argv[0] & " not found on PATH")
+  let master = posix_openpt(O_RDWR or O_NOCTTY)
+  if master < 0: raise newException(OSError, "posix_openpt failed")
+  discard grantpt(master); discard unlockpt(master)
+  let sname = $ptsname(master)
+  let cargv = allocCStringArray(argv)
+  let pid = fork()
+  if pid == 0:
+    discard setsid()
+    let slave = posix.open(sname.cstring, O_RDWR)
+    discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
+    if slave > 2: discard close(slave)
+    discard close(master)
+    if workdir.len > 0: discard chdir(workdir.cstring)
+    discard execv(exe.cstring, cargv)
+    quit(127)
+  RSession(master: master, pid: pid, watchId: 0)  # default (empty) spec
+
+proc rawKey(argv: seq[string]): string = "raw\x1f" & argv.join(" ")
+
+proc bindTerminalToKey(vte: GtkWidget; key: string): bool =
+  if gRSessions.hasKey(key) and sessionAlive(gRSessions[key]):
+    bindTerminalCommon(vte, gRSessions[key], key)
+    return true
+  false
+
+proc bindTerminal(vte: GtkWidget) =
+  ## Bind to the chosen target, else the latest session (or a fresh R default).
+  if gTerminalTargetKey.len > 0 and bindTerminalToKey(vte, gTerminalTargetKey):
+    return
+  bindTerminalToSession(vte)
 
 proc unbindTerminal() =
-  ## Detach the terminal from its session (the R process keeps running).
-  if gTerminalSession != "" and gRSessions.hasKey(gTerminalSession):
-    let s = gRSessions[gTerminalSession]
-    if s.watchId != 0:
-      discard g_source_remove(s.watchId); s.watchId = 0
+  ## Detach the terminal entirely (the interpreter/program keeps running).
+  detachTerminalWatch()
   gTerminalVte = GtkWidget(nil)
   gTerminalMaster = -1
   gTerminalSession = ""
 
 renderable TerminalPane of BaseWidget:
-  ## A VTE widget that *displays* the shared R session (we own the PTY; VTE is
-  ## display + keyboard only). Bound to the latest session on build.
+  ## A VTE widget that displays a babel session or a raw program (we own the
+  ## PTY; VTE is display + keyboard only). The "commit" handler forwards typed
+  ## input to whatever master fd is currently bound, so switching targets needs
+  ## no reconnection.
   hooks:
     beforeBuild:
       state.internalWidget = vte_terminal_new()
     build:
       vte_terminal_set_scrollback_lines(state.internalWidget, clong(5000))
       vte_terminal_set_size(state.internalWidget, clong(80), clong(10))
-      bindTerminalToSession(state.internalWidget)
+      discard g_signal_connect(state.internalWidget, "commit", terminalCommitCallback, nil)
+      bindTerminal(state.internalWidget)
+
+proc runningTargets(): seq[string] =
+  ## Keys of the live sessions / raw terminals, for the switcher (stable order).
+  for key, s in gRSessions:
+    if sessionAlive(s): result.add(key)
+  result.sort()
+
+proc keyLabel(key: string): string =
+  ## Friendly switcher label: "r:default", "python:py", or "claude" for raw.
+  let p = key.split('\x1f')
+  if p.len == 2:
+    (if p[0] == "raw": p[1].split(' ')[0] else: p[0] & ":" & p[1])
+  else: key
+
+proc switchTerminalTo(app: AppState; key: string) =
+  ## Make the terminal show an existing target (opening the pane if needed).
+  gTerminalTargetKey = key
+  if app.terminalActive and pointer(gTerminalVte) != nil:
+    discard bindTerminalToKey(gTerminalVte, key)
+  else:
+    app.terminalActive = true  # pane builds -> bindTerminal uses gTerminalTargetKey
+
+proc openTerminalRaw(app: AppState; argv: seq[string]) =
+  ## Spawn (or reuse) a raw interactive program and switch the terminal to it,
+  ## running it in the open file's directory.
+  let key = rawKey(argv)
+  if not (gRSessions.hasKey(key) and sessionAlive(gRSessions[key])):
+    let dir = if gFilePath.len > 0: parentDir(gFilePath) else: ""
+    try:
+      gRSessions[key] = spawnRaw(argv, dir)
+    except OSError:
+      app.status = argv[0] & " not found on PATH"
+      return
+  app.switchTerminalTo(key)
 
 proc dedent(code: string): string =
   ## Strip the common leading whitespace from every line -- org src blocks are
@@ -1305,13 +1388,21 @@ method view(app: AppState): Widget =
             if not app.searchActive: app.closeSearch() else: app.status = "Find"
 
         ToggleButton {.addRight.}:
-          tooltip = "R terminal -- shared with :session babel (bottom pane)"
+          tooltip = "Terminal (bottom pane) -- shared with :session babel"
           state = app.terminalActive
           Icon(name = "utilities-terminal-symbolic")
           proc changed(state: bool) =
             app.terminalActive = state
-            if not state: unbindTerminal()  # keep R running, just detach the view
-            app.status = if state: "R terminal (shared session)" else: "R terminal closed"
+            if not state: unbindTerminal()  # keep processes running, detach the view
+            app.status = if state: "Terminal" else: "Terminal closed"
+
+        Button {.addRight.}:
+          style = [ButtonFlat]
+          tooltip = "Claude Code in the terminal (in the open file's directory)"
+          Icon(name = "starred-symbolic")
+          proc clicked() =
+            app.openTerminalRaw(@["claude"])
+            app.status = "Claude in terminal"
 
       Box(orient = OrientY):
         if app.searchActive:
@@ -1366,6 +1457,18 @@ method view(app: AppState): Widget =
 
         if app.terminalActive:
           Separator() {.expand: false.}
+          Box(orient = OrientX) {.expand: false.}:
+            margin = 2
+            for key in runningTargets():           # one button per running terminal
+              Button:
+                style = if key == gTerminalSession: [ButtonSuggested] else: [ButtonFlat]
+                Label(text = keyLabel(key))
+                proc clicked() = app.switchTerminalTo(key)
+            Button:
+              style = [ButtonFlat]
+              tooltip = "New shell in the terminal"
+              Label(text = "+ shell")
+              proc clicked() = app.openTerminalRaw(@["bash"])
           TerminalPane {.expand: false.}
 
         Label(text = app.status) {.expand: false.}:
