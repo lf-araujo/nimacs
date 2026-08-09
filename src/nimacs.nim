@@ -765,9 +765,19 @@ type
     master: cint     ## PTY master fd we read/write
     pid: Pid         ## the R child process
     watchId: cuint   ## GLib source id of the terminal display watch (0 = none)
+    log: string      ## rolling transcript, replayed when the terminal reopens
+
+const sessionLogCap = 200_000  ## keep the last ~200 KB of transcript
 
 var gRSessions: Table[string, RSession]
 var gLatestSession = ""
+
+proc appendSessionLog(name, data: string) =
+  if name.len == 0 or not gRSessions.hasKey(name): return
+  let s = gRSessions[name]
+  s.log.add(data)
+  if s.log.len > sessionLogCap:
+    s.log = s.log[s.log.len - sessionLogCap .. ^1]
 
 proc ptyWrite(fd: cint; s: string) =
   var off = 0
@@ -822,6 +832,9 @@ proc terminalReadCallback(fd: cint; condition: cint; data: pointer): cbool {.cde
   if n <= 0: return cbool(0)  # EOF -> drop the watch
   if pointer(gTerminalVte) != nil:
     vte_terminal_feed(gTerminalVte, addr b[0], n)
+  var chunk = newString(n)
+  copyMem(addr chunk[0], addr b[0], n)
+  appendSessionLog(gTerminalSession, chunk)  # remember it for replay on reopen
   cbool(1)
 
 proc terminalCommitCallback(term: GtkWidget; text: cstring; size: cuint; data: pointer) {.cdecl.} =
@@ -854,10 +867,13 @@ proc runInSession(name, code: string): tuple[ok: bool, output: string] =
     if rMarkerBegin in line: collecting = true
   while lines.len > 0 and strutils.strip(lines[^1]) == "": lines.setLen(lines.len - 1)
   let output = lines.join("\n")
-  # Echo the run in the terminal too: show the captured result there.
-  if pointer(gTerminalVte) != nil and gTerminalMaster == s.master and output.len > 0:
+  # Echo the run in the terminal too, and log it (so it survives a reopen even
+  # if the terminal was closed when the block ran).
+  if output.len > 0:
     var shown = output.replace("\n", "\r\n") & "\r\n"
-    vte_terminal_feed(gTerminalVte, addr shown[0], shown.len)
+    appendSessionLog(name, shown)
+    if pointer(gTerminalVte) != nil and gTerminalMaster == s.master:
+      vte_terminal_feed(gTerminalVte, addr shown[0], shown.len)
   if hadWatch:
     s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)  # G_IO_IN
   (true, output)
@@ -885,6 +901,9 @@ proc bindTerminalToSession(vte: GtkWidget) =
   gTerminalVte = vte
   gTerminalMaster = s.master
   gTerminalSession = name
+  # Replay the transcript so reopening the terminal doesn't look wiped.
+  if s.log.len > 0:
+    vte_terminal_feed(vte, addr s.log[0], s.log.len)
   if s.watchId == 0:
     s.watchId = g_unix_fd_add(s.master, cint(1), terminalReadCallback, nil)
   discard g_signal_connect(vte, "commit", terminalCommitCallback, nil)
