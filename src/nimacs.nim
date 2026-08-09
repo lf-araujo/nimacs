@@ -87,6 +87,19 @@ proc gtk_source_view_set_highlight_current_line(view: GtkWidget; highlight: cboo
 proc gtk_source_view_set_auto_indent(view: GtkWidget; enable: cbool) {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_view_set_show_right_margin(view: GtkWidget; show: cbool) {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_view_set_right_margin_position(view: GtkWidget; pos: cuint) {.importc, cdecl, dynlib: sourceLib.}
+# Search & replace (GtkSourceSearchContext highlights and iterates matches).
+proc gtk_source_search_settings_new(): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_settings_set_search_text(settings: pointer; text: cstring) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_settings_set_wrap_around(settings: pointer; wrap: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_new(buffer: GtkTextBuffer; settings: pointer): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_set_highlight(context: pointer; highlight: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_forward(context: pointer; iter, matchStart, matchEnd: ptr GtkTextIter; hasWrapped: ptr cbool): cbool {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_backward(context: pointer; iter, matchStart, matchEnd: ptr GtkTextIter; hasWrapped: ptr cbool): cbool {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_replace(context: pointer; matchStart, matchEnd: ptr GtkTextIter; replace: cstring; replaceLength: int; error: ptr pointer): cbool {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_search_context_replace_all(context: pointer; replace: cstring; replaceLength: int; error: ptr pointer): cuint {.importc, cdecl, dynlib: sourceLib.}
+# Core GTK: scroll the view to a match (owlkettle already binds select_range,
+# get_selection_bounds, get_iter_at_offset, place_cursor).
+proc gtk_text_view_scroll_to_iter(view: GtkWidget; iter: ptr GtkTextIter; withinMargin: cdouble; useAlign: cbool; xalign, yalign: cdouble): cbool {.importc, cdecl.}
 
 # -- App CSS (header-bar height, and a hook for future theming) -------------
 # Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
@@ -114,6 +127,7 @@ proc loadAppCss() =
   gtk_style_context_add_provider_for_display(display, provider, 600)
   gCssLoaded = true
 
+var gEditorView = GtkWidget(nil)  ## the live GtkSourceView, for scroll-to-match
 var gFontPt = 11              ## editor font size in points, adjusted by zoom
 var gZoomProvider: pointer = nil
 proc applyZoom() =
@@ -371,6 +385,7 @@ renderable EditorTextView of BaseWidget:
       state.internalWidget = gtk_source_view_new()
     build:
       loadAppCss()  # once, now that GTK is initialised
+      gEditorView = state.internalWidget  # single editor -- remember it for search scrolling
       # Standard code-editor affordances (all GtkSourceView built-ins).
       gtk_source_view_set_show_line_numbers(state.internalWidget, cbool(1))
       gtk_source_view_set_highlight_current_line(state.internalWidget, cbool(1))
@@ -444,6 +459,9 @@ viewable App:
   dispatch: Dispatch
   orgMode: bool
   pendingPrefix: string  ## partial key sequence, e.g. "C-c" awaiting its second chord
+  searchActive: bool     ## find/replace bar shown
+  searchQuery: string
+  replaceText: string
 
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
@@ -813,10 +831,80 @@ proc toggleComment(app: AppState; cursorPos: int) =
   app.gtkBuffer.placeCursorAt(max(ls, cursorPos + (newLine.len - line.len)))
   app.status = "toggled comment"
 
+# -- Find & replace (GtkSourceSearchContext) -------------------------------
+var gSearchContext: pointer = nil
+var gSearchSettings: pointer = nil
+
+proc ensureSearchContext(buf: GtkTextBuffer) =
+  if gSearchContext != nil: return
+  gSearchSettings = gtk_source_search_settings_new()
+  gtk_source_search_settings_set_wrap_around(gSearchSettings, cbool(1))
+  gSearchContext = gtk_source_search_context_new(buf, gSearchSettings)
+  gtk_source_search_context_set_highlight(gSearchContext, cbool(1))  # highlight all matches
+
+proc setSearchText(app: AppState; text: string) =
+  ensureSearchContext(app.gtkBuffer)
+  app.searchQuery = text
+  gtk_source_search_settings_set_search_text(gSearchSettings, text.cstring)
+
+proc searchMove(app: AppState; forward: bool) =
+  ## Select and scroll to the next/previous match from the current selection
+  ## or cursor; wraps around.
+  ensureSearchContext(app.gtkBuffer)
+  if app.searchQuery.len == 0: return
+  let buf = app.gtkBuffer
+  var startIter, mStart, mEnd, selStart, selEnd: GtkTextIter
+  if gtk_text_buffer_get_selection_bounds(buf, selStart.addr, selEnd.addr) != cbool(0):
+    startIter = (if forward: selEnd else: selStart)
+  else:
+    gtk_text_buffer_get_iter_at_offset(buf, startIter.addr, buf.liveCursorOffset().cint)
+  var wrapped: cbool
+  let found =
+    if forward: gtk_source_search_context_forward(gSearchContext, startIter.addr, mStart.addr, mEnd.addr, wrapped.addr)
+    else: gtk_source_search_context_backward(gSearchContext, startIter.addr, mStart.addr, mEnd.addr, wrapped.addr)
+  if found != cbool(0):
+    gtk_text_buffer_select_range(buf, mStart.addr, mEnd.addr)
+    if pointer(gEditorView) != nil:
+      discard gtk_text_view_scroll_to_iter(gEditorView, mStart.addr, 0.1, cbool(0), 0.0, 0.0)
+    app.status = "match" & (if wrapped != cbool(0): " (wrapped)" else: "")
+  else:
+    app.status = "no match for '" & app.searchQuery & "'"
+
+proc searchReplace(app: AppState) =
+  ## Replace the current match (if the selection is one), then advance.
+  ensureSearchContext(app.gtkBuffer)
+  let buf = app.gtkBuffer
+  var selStart, selEnd: GtkTextIter
+  if gtk_text_buffer_get_selection_bounds(buf, selStart.addr, selEnd.addr) != cbool(0):
+    var err: pointer = nil
+    discard gtk_source_search_context_replace(gSearchContext, selStart.addr, selEnd.addr,
+      app.replaceText.cstring, -1, err.addr)
+  app.searchMove(true)
+
+proc searchReplaceAll(app: AppState) =
+  ensureSearchContext(app.gtkBuffer)
+  if app.searchQuery.len == 0: return
+  var err: pointer = nil
+  let n = gtk_source_search_context_replace_all(gSearchContext, app.replaceText.cstring, -1, err.addr)
+  app.status = "replaced " & $n & " occurrence(s)"
+
+proc closeSearch(app: AppState) =
+  app.searchActive = false
+  ensureSearchContext(app.gtkBuffer)
+  gtk_source_search_settings_set_search_text(gSearchSettings, "".cstring)  # clear highlights
+  app.status = "Find closed"
+
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
   # Built-in bindings are host-level and always active, regardless of
   # whatever config.nim currently has bound -- rebinding them away would be
   # a footgun (e.g. losing the only way to trigger a reload).
+  # Escape closes the find bar (it's non-printable, so keychord ignores it).
+  const gdkKeyEscape = 0xff1b
+  if app.searchActive and keyval == gdkKeyEscape:
+    app.closeSearch()
+    discard app.redraw()
+    return true
+
   let chord = keychord(keyval, ctrl, shift)
   if chord == "": return false
 
@@ -848,6 +936,9 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
     gFontPt = max(gFontPt - 1, 6); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
   elif chord == "C-0":
     gFontPt = 11; applyZoom(); app.status = "Zoom reset (" & $gFontPt & "pt)"
+  elif chord == "C-f":
+    app.searchActive = not app.searchActive
+    if not app.searchActive: app.closeSearch() else: app.status = "Find"
   else:
     let cmd = app.dispatch.lookup(chord)
     if cmd == nil:
@@ -898,7 +989,54 @@ method view(app: AppState): Widget =
           Icon(name = "format-text-rich-symbolic")
           proc changed(state: bool) = app.toggleOrgMode(state)
 
+        Button {.addRight.}:
+          style = [ButtonFlat]
+          tooltip = "Find & replace (Ctrl+F)"
+          Icon(name = "edit-find-symbolic")
+          proc clicked() =
+            app.searchActive = not app.searchActive
+            if not app.searchActive: app.closeSearch() else: app.status = "Find"
+
       Box(orient = OrientY):
+        if app.searchActive:
+          Box(orient = OrientX) {.expand: false.}:
+            margin = 4
+            Entry {.expand: true.}:
+              placeholder = "Find"
+              text = app.searchQuery
+              proc changed(text: string) = app.setSearchText(text)
+              proc activate() = app.searchMove(true)
+            Entry {.expand: true.}:
+              placeholder = "Replace"
+              text = app.replaceText
+              proc changed(text: string) = app.replaceText = text
+              proc activate() = app.searchReplace()
+            Button:
+              style = [ButtonFlat]
+              tooltip = "Previous match"
+              Icon(name = "go-up-symbolic")
+              proc clicked() = app.searchMove(false)
+            Button:
+              style = [ButtonFlat]
+              tooltip = "Next match"
+              Icon(name = "go-down-symbolic")
+              proc clicked() = app.searchMove(true)
+            Button:
+              style = [ButtonFlat]
+              tooltip = "Replace"
+              Icon(name = "edit-find-replace-symbolic")
+              proc clicked() = app.searchReplace()
+            Button:
+              style = [ButtonFlat]
+              tooltip = "Replace all"
+              Icon(name = "edit-select-all-symbolic")
+              proc clicked() = app.searchReplaceAll()
+            Button:
+              style = [ButtonFlat]
+              tooltip = "Close (Esc)"
+              Icon(name = "window-close-symbolic")
+              proc clicked() = app.closeSearch()
+
         ScrolledWindow {.expand: true.}:
           EditorTextView:
             margin = 12
