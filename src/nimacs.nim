@@ -82,6 +82,11 @@ proc gtk_source_view_get_completion(view: GtkWidget): pointer {.importc, cdecl, 
 proc gtk_source_completion_words_new(title: cstring): pointer {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_completion_words_register(words: pointer; buf: GtkTextBuffer) {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_completion_add_provider(completion: pointer; provider: pointer) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_set_show_line_numbers(view: GtkWidget; show: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_set_highlight_current_line(view: GtkWidget; highlight: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_set_auto_indent(view: GtkWidget; enable: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_set_show_right_margin(view: GtkWidget; show: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_set_right_margin_position(view: GtkWidget; pos: cuint) {.importc, cdecl, dynlib: sourceLib.}
 
 # -- App CSS (header-bar height, and a hook for future theming) -------------
 # Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
@@ -108,6 +113,19 @@ proc loadAppCss() =
   gtk_css_provider_load_from_data(provider, nimacsCss.cstring, -1)
   gtk_style_context_add_provider_for_display(display, provider, 600)
   gCssLoaded = true
+
+var gFontPt = 11              ## editor font size in points, adjusted by zoom
+var gZoomProvider: pointer = nil
+proc applyZoom() =
+  ## Set the editor font size via a dedicated CSS provider (priority 601, above
+  ## the app stylesheet). Called from key handlers, so GTK is initialised.
+  let display = gdk_display_get_default()
+  if display == nil: return
+  if gZoomProvider == nil:
+    gZoomProvider = gtk_css_provider_new()
+    gtk_style_context_add_provider_for_display(display, gZoomProvider, 601)
+  gtk_css_provider_load_from_data(gZoomProvider,
+    ("textview { font-size: " & $gFontPt & "pt; }").cstring, -1)
 
 # -- Raw GtkTextBuffer helpers ---------------------------------------------
 
@@ -353,6 +371,12 @@ renderable EditorTextView of BaseWidget:
       state.internalWidget = gtk_source_view_new()
     build:
       loadAppCss()  # once, now that GTK is initialised
+      # Standard code-editor affordances (all GtkSourceView built-ins).
+      gtk_source_view_set_show_line_numbers(state.internalWidget, cbool(1))
+      gtk_source_view_set_highlight_current_line(state.internalWidget, cbool(1))
+      gtk_source_view_set_auto_indent(state.internalWidget, cbool(1))
+      gtk_source_view_set_show_right_margin(state.internalWidget, cbool(1))
+      gtk_source_view_set_right_margin_position(state.internalWidget, cuint(80))
       state.handler = KeyHandler()
       let controller = gtk_event_controller_key_new()
       gtk_event_controller_set_propagation_phase(controller, GtkPhaseCapture)
@@ -770,6 +794,25 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
   app.gtkBuffer.placeCursorAt(resultsOffset)
   app.status = "Executed " & where & " -- " & $(resultLines.len - 1) & " result line(s)"
 
+proc toggleComment(app: AppState; cursorPos: int) =
+  ## Toggle a leading `# ` line comment on the cursor's line. `#` is the line
+  ## comment for R/Python/Nim/bash, a sensible default across our languages.
+  let text = app.gtkBuffer.bufferText
+  var ls = cursorPos
+  while ls > 0 and text[ls - 1] != '\n': dec ls
+  var le = cursorPos
+  while le < text.len and text[le] != '\n': inc le
+  let line = text[ls ..< le]
+  let body = strutils.strip(line, leading = true, trailing = false)
+  let indent = line[0 ..< line.len - body.len]
+  var newLine: string
+  if body.startsWith("# "): newLine = indent & body[2 .. ^1]
+  elif body.startsWith("#"): newLine = indent & body[1 .. ^1]
+  else: newLine = indent & "# " & body
+  app.gtkBuffer.bufferText = text[0 ..< ls] & newLine & text[le .. ^1]
+  app.gtkBuffer.placeCursorAt(max(ls, cursorPos + (newLine.len - line.len)))
+  app.status = "toggled comment"
+
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
   # Built-in bindings are host-level and always active, regardless of
   # whatever config.nim currently has bound -- rebinding them away would be
@@ -797,6 +840,14 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
     app.doReload()
   elif chord == "C-s":
     app.saveFile()
+  elif chord == "C-/":
+    app.toggleComment(cursorPos)
+  elif chord == "C-=":
+    gFontPt = min(gFontPt + 1, 40); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
+  elif chord == "C--":
+    gFontPt = max(gFontPt - 1, 6); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
+  elif chord == "C-0":
+    gFontPt = 11; applyZoom(); app.status = "Zoom reset (" & $gFontPt & "pt)"
   else:
     let cmd = app.dispatch.lookup(chord)
     if cmd == nil:
