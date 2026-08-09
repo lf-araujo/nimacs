@@ -1453,6 +1453,20 @@ method view(app: AppState): Widget =
           Icon(name = "format-text-rich-symbolic")
           proc changed(state: bool) = app.toggleOrgMode(state)
 
+        MenuButton {.addRight.}:
+          tooltip = "Menu -- commands & terminals (also Ctrl+Shift+P)"
+          Icon(name = "open-menu-symbolic")
+          Popover:
+            Box(orient = OrientY):
+              margin = 4
+              # Same command registry as the palette, so the menu and the
+              # palette always list the same actions -- including live terminals.
+              for it in app.paletteItems():
+                let action = it
+                ModelButton:
+                  text = action.label
+                  proc clicked() = action.run()
+
         Button {.addRight.}:
           style = [ButtonFlat]
           tooltip = "Find & replace (Ctrl+F)"
@@ -1544,10 +1558,11 @@ method view(app: AppState): Widget =
           Box(orient = OrientX) {.expand: false.}:
             margin = 2
             for key in runningTargets():           # one button per running terminal
+              let k = key                           # capture per iteration for the closure
               Button:
-                style = if key == gTerminalSession: [ButtonSuggested] else: [ButtonFlat]
-                Label(text = keyLabel(key))
-                proc clicked() = app.switchTerminalTo(key)
+                style = if k == gTerminalSession: [ButtonSuggested] else: [ButtonFlat]
+                Label(text = keyLabel(k))
+                proc clicked() = app.switchTerminalTo(k)
             Button:
               style = [ButtonFlat]
               tooltip = "New shell in the terminal"
