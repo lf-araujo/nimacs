@@ -83,6 +83,32 @@ proc gtk_source_completion_words_new(title: cstring): pointer {.importc, cdecl, 
 proc gtk_source_completion_words_register(words: pointer; buf: GtkTextBuffer) {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_completion_add_provider(completion: pointer; provider: pointer) {.importc, cdecl, dynlib: sourceLib.}
 
+# -- App CSS (header-bar height, and a hook for future theming) -------------
+# Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
+proc gtk_css_provider_new(): pointer {.importc, cdecl.}
+proc gtk_css_provider_load_from_data(provider: pointer; data: cstring; length: int) {.importc, cdecl.}
+proc gdk_display_get_default(): pointer {.importc, cdecl.}
+proc gtk_style_context_add_provider_for_display(display: pointer; provider: pointer; priority: cuint) {.importc, cdecl.}
+
+const nimacsCss = """
+/* Slimmer, more GNOME-standard header bar than the owlkettle/adw default. */
+headerbar { min-height: 34px; padding-top: 0; padding-bottom: 0; }
+headerbar button { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
+"""
+
+var gCssLoaded = false
+proc loadAppCss() =
+  ## Install the app stylesheet display-wide at APPLICATION priority (600),
+  ## which overrides the Adwaita theme. Idempotent; needs GTK initialised, so
+  ## it's called from a widget build hook rather than before brew().
+  if gCssLoaded: return
+  let display = gdk_display_get_default()
+  if display == nil: return
+  let provider = gtk_css_provider_new()
+  gtk_css_provider_load_from_data(provider, nimacsCss.cstring, -1)
+  gtk_style_context_add_provider_for_display(display, provider, 600)
+  gCssLoaded = true
+
 # -- Raw GtkTextBuffer helpers ---------------------------------------------
 
 proc newGtkTextBuffer(): GtkTextBuffer =
@@ -326,6 +352,7 @@ renderable EditorTextView of BaseWidget:
       # GtkSourceBuffer, which is what actually drives highlighting.
       state.internalWidget = gtk_source_view_new()
     build:
+      loadAppCss()  # once, now that GTK is initialised
       state.handler = KeyHandler()
       let controller = gtk_event_controller_key_new()
       gtk_event_controller_set_propagation_phase(controller, GtkPhaseCapture)
@@ -410,34 +437,39 @@ const defLangSpec = staticRead("../data/gtksourceview/language-specs/def.lang")
 const rLangSpec = staticRead("../data/gtksourceview/language-specs/R.lang")
 const nimLangSpec = staticRead("../data/gtksourceview/language-specs/nim.lang")
 
-proc langSpecDir(): string =
-  ## Materialise the embedded .lang specs into a cache dir and return it.
+proc langSpecDir(d: Dispatch): string =
+  ## Materialise the embedded .lang specs (plus any config-provided ones) into
+  ## a cache dir and return it.
   result = getCacheDir() / "nimacs" / "language-specs"
   createDir(result)
   writeFile(result / "def.lang", defLangSpec)
   writeFile(result / "R.lang", rLangSpec)
   writeFile(result / "nim.lang", nimLangSpec)
+  for (id, xml) in d.configLangSpecs:   # languages registered from config.nim
+    writeFile(result / (id & ".lang"), xml)
 
-proc langIdForFile(path: string): string =
+proc langIdForFile(d: Dispatch; path: string): string =
   ## GtkSourceView language id for a file, or "" for org/plain (which keep the
-  ## custom org tagging / no highlighting).
-  case path.splitFile.ext.toLowerAscii
+  ## custom org tagging / no highlighting). Config-registered extensions extend
+  ## the built-in R/Nim mapping.
+  let ext = path.splitFile.ext.toLowerAscii
+  case ext
   of ".r": "r"
   of ".nim", ".nims", ".nimble": "nim"
-  else: ""
+  else: d.langIdForExt(ext)
 
-proc setupSourceHighlighting(buf: GtkTextBuffer; filePath: string) =
+proc setupSourceHighlighting(buf: GtkTextBuffer; filePath: string; d: Dispatch) =
   ## Point the buffer at a GtkSourceView language + style scheme based on the
   ## file's extension. Called on startup and whenever the open file changes,
   ## so switching between a code file and an org/plain file updates cleanly.
-  let langId = langIdForFile(filePath)
+  let langId = langIdForFile(d, filePath)
   if langId == "":
     gtk_source_buffer_set_language(buf, nil)
     gtk_source_buffer_set_highlight_syntax(buf, cbool(0))
     gtk_source_buffer_set_style_scheme(buf, nil)  # drop any scheme background
     return
   let lm = gtk_source_language_manager_new()
-  var dirs = allocCStringArray([langSpecDir()])
+  var dirs = allocCStringArray([langSpecDir(d)])
   gtk_source_language_manager_set_search_path(lm, dirs)
   deallocCStringArray(dirs)
   let lang = gtk_source_language_manager_get_language(lm, langId.cstring)
@@ -471,7 +503,7 @@ proc editConfig(app: AppState) =
   # first (matches this project's current no-multiple-buffers scope).
   app.gtkBuffer.bufferText = readFile(app.configPath)
   app.filePath = app.configPath
-  setupSourceHighlighting(app.gtkBuffer, app.configPath)  # config.nim -> Nim highlighting
+  setupSourceHighlighting(app.gtkBuffer, app.configPath, app.dispatch)  # config.nim -> Nim highlighting
   app.status = "Editing " & app.configPath & " -- C-s to save, then Reload Config"
 
 proc fileOpenCallback(sourceObject: pointer; res: pointer; userData: pointer) {.cdecl.} =
@@ -485,7 +517,7 @@ proc fileOpenCallback(sourceObject: pointer; res: pointer; userData: pointer) {.
     if fileExists(path):
       app.gtkBuffer.bufferText = readFile(path)
       app.filePath = path
-      setupSourceHighlighting(app.gtkBuffer, path)  # re-detect language for the new file
+      setupSourceHighlighting(app.gtkBuffer, path, app.dispatch)  # re-detect language for the new file
       app.status = "Opened " & path
   # else: user cancelled -- err is set to "Dismissed by user", not a real
   # failure, so there's nothing to report.
@@ -617,6 +649,20 @@ proc shutdownRSessions() =
     p.close()
   gRSessions.clear()
 
+proc runCommandTemplate(cmdTemplate, code: string): tuple[ok: bool, output: string] =
+  ## Run a config-registered one-shot babel command: write the block body to a
+  ## temp file, substitute `{file}`, run it through the shell, and capture
+  ## stdout+stderr merged (execCmdEx defaults to poStdErrToStdOut).
+  let path = genTempPath("nimacs-babel-", ".src")
+  writeFile(path, code)
+  defer: removeFile(path)
+  let cmd = cmdTemplate.replace("{file}", quoteShell(path))
+  try:
+    let (output, _) = execCmdEx(cmd)
+    result = (true, output)
+  except OSError, IOError:
+    result = (false, "failed to run: " & cmdTemplate)
+
 proc executeSrcBlock(app: AppState; cursorPos: int) =
   let text = app.gtkBuffer.bufferText
   let lines = text.split('\n')
@@ -648,10 +694,6 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
   # Language token: `#+begin_src R :results output` -> "r".
   let beginTokens = strutils.splitWhitespace(strutils.strip(lines[beginIdx]))
   let lang = if beginTokens.len >= 2: beginTokens[1].toLowerAscii() else: ""
-  if lang != "r":
-    app.status = "C-c C-c: only R src blocks are supported (got '" &
-      (if lang == "": "none" else: lang) & "')"
-    return
 
   # Header args after the language token, e.g. `:session foo :results output`.
   # `:session name` runs in a persistent process; `:session` alone uses the
@@ -668,9 +710,25 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
     inc t
 
   let code = lines[beginIdx + 1 ..< endIdx].join("\n")
-  let (ok, rawOut) =
-    if sessionName != "": runInSession(sessionName, code)
-    else: runRscript(code)
+  # R is built in (with :session support); any other language runs through a
+  # runner registered in config.nim via bindLang. Sessions are R-only for now.
+  var ok: bool
+  var rawOut, where: string
+  if lang == "r":
+    if sessionName != "":
+      (ok, rawOut) = runInSession(sessionName, code)
+      where = "R session :" & sessionName
+    else:
+      (ok, rawOut) = runRscript(code)
+      where = "R (one-shot)"
+  else:
+    let cmd = app.dispatch.babelCommand(lang)
+    if cmd == "":
+      app.status = "C-c C-c: no runner for language '" &
+        (if lang == "": "none" else: lang) & "' -- register it with bindLang in config.nim"
+      return
+    (ok, rawOut) = runCommandTemplate(cmd, code)
+    where = lang & " (one-shot)" & (if sessionName != "": "  [:session is R-only]" else: "")
   if not ok:
     app.status = rawOut
     return
@@ -710,7 +768,6 @@ proc executeSrcBlock(app: AppState; cursorPos: int) =
 
   app.gtkBuffer.bufferText = newLines.join("\n")
   app.gtkBuffer.placeCursorAt(resultsOffset)
-  let where = if sessionName != "": "R session :" & sessionName else: "R (one-shot)"
   app.status = "Executed " & where & " -- " & $(resultLines.len - 1) & " result line(s)"
 
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
@@ -832,19 +889,21 @@ proc main() =
     startInOrgMode = true
 
   setupOrgTags(gtkBuffer)
-  setupSourceHighlighting(gtkBuffer, filePath)  # syntax highlighting for code files
+
+  # Load config first: it may register babel languages and highlight specs
+  # that setupSourceHighlighting needs below.
+  let projectRoot = getAppDir()
+  let configPath = projectRoot / "config.nim"
+  let searchPaths = @[projectRoot / "src"]
+  let dispatch = newDispatch(cacheKey())
+  let (ok, msg) = dispatch.reloadConfig(configPath, searchPaths)
+  let initialStatus = if ok: msg else: "config load failed: " & msg
+
+  setupSourceHighlighting(gtkBuffer, filePath, dispatch)  # highlighting (incl. config langs)
   gOrgMode = startInOrgMode
   retagOrgBlocks(gtkBuffer)  # apply org tags to the initial text before first draw
   discard g_signal_connect_data(pointer(gtkBuffer), "changed".cstring,
     cast[pointer](bufferChangedCallback), nil, nil, G_CONNECT_AFTER)
-
-  let projectRoot = getAppDir()
-  let configPath = projectRoot / "config.nim"
-  let searchPaths = @[projectRoot / "src"]
-
-  let dispatch = newDispatch(cacheKey())
-  let (ok, msg) = dispatch.reloadConfig(configPath, searchPaths)
-  let initialStatus = if ok: msg else: "config load failed: " & msg
 
   # `gui(...)` is the DSL entry point -- it's what translates the
   # `field = value` syntax into the widget's real hasX/valX pairs, so the

@@ -37,11 +37,25 @@ session name. Run the two blocks below in order (=C-c C-c= in each):
   round(summary(fit)$r.squared, 3)
 #+end_src
 
+* Other languages, straight from your config
+
+R is built in, but other babel languages are registered in =config.nim= (edit
+it from the header bar, then Reload Config) -- no host rebuild. The stock config
+registers Python and bash, so this runs with =C-c C-c= too:
+
+#+begin_src python
+  xs = [1, 2, 3, 4]
+  print("mean:", sum(xs) / len(xs))
+#+end_src
+
 * Next steps
 
 - Run any =#+begin_src R= block with =C-c C-c= (needs R on your PATH).
 - Add =:session name= to share state across blocks; omit it for a fresh,
-  isolated one-shot run each time.
+  isolated one-shot run each time (R only).
+- Register more languages in =config.nim= with =bindLang(ctx, "lang",
+  "cmd {file}", ".ext", specXml)= -- =C-c C-c= then runs them, and code files
+  with that extension get syntax highlighting.
 - Press =C-s= to save. This is a scratch buffer, so pass a path on the command
   line (=nimacs file.org=) to enable saving to a real file.
 - Edit =config.nim= from the header bar, then Reload Config (=C-S-r=) to

@@ -30,11 +30,21 @@ proc uppercaseLine(k: ptr EditorKernel) {.cdecl.} =
 proc sayHello(k: ptr EditorKernel) {.cdecl.} =
   k.status = "Hello"
 
-proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc) {.exportc, dynlib.} =
+proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc;
+                      bindLang: BindLangProc) {.exportc, dynlib.} =
   register(ctx, "insert-timestamp", insertTimestamp)
   register(ctx, "uppercase-line", uppercaseLine)
   register(ctx, "say-hello", sayHello)
   bindP(ctx, "C-t", "insert-timestamp")
   bindP(ctx, "C-u", "uppercase-line")
   bindP(ctx, "C-h", "say-hello")
+
+  # Org-babel languages. R is built in (with :session support); register more
+  # here and C-c C-c runs their src blocks -- no host rebuild needed. `{file}`
+  # is replaced with a temp file holding the block body; stdout+stderr go to
+  # #+RESULTS. The 4th/5th args add syntax highlighting: file extensions to
+  # treat as this language, and a GtkSourceView .lang (here "" -- highlighting
+  # needs a real .lang; pass one, e.g. `staticRead("python.lang")`, to enable).
+  bindLang(ctx, "python", "python3 {file}", ".py,.pyw", "")
+  bindLang(ctx, "bash", "bash {file}", ".sh,.bash", "")
 
