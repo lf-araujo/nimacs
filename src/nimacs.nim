@@ -59,10 +59,32 @@ proc `==`(a, b: GtkTextBuffer): bool {.borrow.}
   ## `GtkTextBuffer` is a `distinct pointer`; owlkettle's `renderable` macro
   ## needs `==` to detect changes between renders for the `gtkBuffer` field.
 
+# -- GtkSourceView FFI -----------------------------------------------------
+# Bound directly against the runtime soname (no pkg-config/dev files needed,
+# and none are installed on Solus anyway). GtkSourceBuffer is-a GtkTextBuffer
+# and GtkSourceView is-a GtkTextView, so every existing helper, tag, and hook
+# keeps working -- we only swap the two constructors and add highlighting
+# setup. Style schemes are compiled into the .so; only the .lang language
+# definitions must be shipped (see setupSourceHighlighting). Verified against
+# libgtksourceview-5.so.0 with the vendored def/R/nim specs.
+const sourceLib = "libgtksourceview-5.so.0"
+proc gtk_source_buffer_new(table: pointer): GtkTextBuffer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_new(): GtkWidget {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_language_manager_new(): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_language_manager_set_search_path(lm: pointer; dirs: cstringArray) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_language_manager_get_language(lm: pointer; id: cstring): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_buffer_set_language(buf: GtkTextBuffer; lang: pointer) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_buffer_set_highlight_syntax(buf: GtkTextBuffer; highlight: cbool) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_style_scheme_manager_get_default(): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_style_scheme_manager_get_scheme(sm: pointer; id: cstring): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_buffer_set_style_scheme(buf: GtkTextBuffer; scheme: pointer) {.importc, cdecl, dynlib: sourceLib.}
+
 # -- Raw GtkTextBuffer helpers ---------------------------------------------
 
 proc newGtkTextBuffer(): GtkTextBuffer =
-  gtk_text_buffer_new(GtkTextTagTable(nil))
+  # A GtkSourceBuffer (subclass of GtkTextBuffer) so code files can be syntax
+  # highlighted; for org/plain buffers it behaves exactly like a plain one.
+  gtk_source_buffer_new(nil)
 
 proc bufferText(buf: GtkTextBuffer): string =
   var a, b: GtkTextIter
@@ -142,6 +164,12 @@ proc setupOrgTags(buf: GtkTextBuffer) =
     discard gtk_text_tag_table_add(table, tag)
   gProseTag.setStringProp("family", "Sans")        # generic Pango alias -> system proportional font
   gCodeTag.setStringProp("family", "Monospace")     # generic Pango alias -> system monospace font
+  # Shade the whole block (delimiter lines included, since they're tagged as
+  # code too) so it reads as a distinct panel rather than blending into the
+  # prose. paragraph-background fills the full line width, not just the glyph
+  # runs. Tuned for a light theme for now; the GtkSourceView work will make
+  # this follow the Adwaita light/dark scheme.
+  gCodeTag.setStringProp("paragraph-background", "#f0f2f4")
   gHeadingTag.setStringProp("family", "Sans")
   gHeadingTag.setIntProp("weight", 700)             # PANGO_WEIGHT_BOLD
   gHeadingTag.setIntProp("size", 14 * 1024)         # Pango units (1/1024 pt) -- "size" confirmed working
@@ -288,7 +316,10 @@ renderable EditorTextView of BaseWidget:
 
   hooks:
     beforeBuild:
-      state.internalWidget = gtk_text_view_new()
+      # GtkSourceView (is-a GtkTextView), so all the gtk_text_view_* hooks
+      # below still apply; the buffer set via the gtkBuffer hook is a
+      # GtkSourceBuffer, which is what actually drives highlighting.
+      state.internalWidget = gtk_source_view_new()
     build:
       state.handler = KeyHandler()
       let controller = gtk_event_controller_key_new()
@@ -355,6 +386,58 @@ proc toggleOrgMode(app: AppState, state: bool) =
   retagOrgBlocks(app.gtkBuffer)  # apply/clear immediately, don't wait for the next edit
   app.status = if state: "Org babel mode on" else: "Org babel mode off"
 
+# -- GtkSourceView highlighting setup --------------------------------------
+# The vendored .lang specs are embedded at compile time and written to a
+# cache dir at runtime, so highlighting works regardless of where the binary
+# ends up (`nimble install` doesn't copy data/). Style schemes need no files
+# -- they're built into libgtksourceview-5.
+
+const defLangSpec = staticRead("../data/gtksourceview/language-specs/def.lang")
+const rLangSpec = staticRead("../data/gtksourceview/language-specs/R.lang")
+const nimLangSpec = staticRead("../data/gtksourceview/language-specs/nim.lang")
+
+proc langSpecDir(): string =
+  ## Materialise the embedded .lang specs into a cache dir and return it.
+  result = getCacheDir() / "nimacs" / "language-specs"
+  createDir(result)
+  writeFile(result / "def.lang", defLangSpec)
+  writeFile(result / "R.lang", rLangSpec)
+  writeFile(result / "nim.lang", nimLangSpec)
+
+proc langIdForFile(path: string): string =
+  ## GtkSourceView language id for a file, or "" for org/plain (which keep the
+  ## custom org tagging / no highlighting).
+  case path.splitFile.ext.toLowerAscii
+  of ".r": "r"
+  of ".nim", ".nims", ".nimble": "nim"
+  else: ""
+
+proc setupSourceHighlighting(buf: GtkTextBuffer; filePath: string) =
+  ## Point the buffer at a GtkSourceView language + style scheme based on the
+  ## file's extension. Called on startup and whenever the open file changes,
+  ## so switching between a code file and an org/plain file updates cleanly.
+  let langId = langIdForFile(filePath)
+  if langId == "":
+    gtk_source_buffer_set_language(buf, nil)
+    gtk_source_buffer_set_highlight_syntax(buf, cbool(0))
+    gtk_source_buffer_set_style_scheme(buf, nil)  # drop any scheme background
+    return
+  let lm = gtk_source_language_manager_new()
+  var dirs = allocCStringArray([langSpecDir()])
+  gtk_source_language_manager_set_search_path(lm, dirs)
+  deallocCStringArray(dirs)
+  let lang = gtk_source_language_manager_get_language(lm, langId.cstring)
+  if lang == nil:
+    return
+  gtk_source_buffer_set_language(buf, lang)
+  gtk_source_buffer_set_highlight_syntax(buf, cbool(1))
+  # Adwaita (light) for now, to match the light-tuned org code-block shade;
+  # theme-aware light/dark selection is a follow-up.
+  let sm = gtk_source_style_scheme_manager_get_default()
+  let scheme = gtk_source_style_scheme_manager_get_scheme(sm, "Adwaita".cstring)
+  if scheme != nil:
+    gtk_source_buffer_set_style_scheme(buf, scheme)
+
 proc saveFile(app: AppState) =
   if app.filePath == "":
     app.status = "No file -- pass a path on the command line to enable saving"
@@ -374,6 +457,7 @@ proc editConfig(app: AppState) =
   # first (matches this project's current no-multiple-buffers scope).
   app.gtkBuffer.bufferText = readFile(app.configPath)
   app.filePath = app.configPath
+  setupSourceHighlighting(app.gtkBuffer, app.configPath)  # config.nim -> Nim highlighting
   app.status = "Editing " & app.configPath & " -- C-s to save, then Reload Config"
 
 proc fileOpenCallback(sourceObject: pointer; res: pointer; userData: pointer) {.cdecl.} =
@@ -387,6 +471,7 @@ proc fileOpenCallback(sourceObject: pointer; res: pointer; userData: pointer) {.
     if fileExists(path):
       app.gtkBuffer.bufferText = readFile(path)
       app.filePath = path
+      setupSourceHighlighting(app.gtkBuffer, path)  # re-detect language for the new file
       app.status = "Opened " & path
   # else: user cancelled -- err is set to "Dismissed by user", not a real
   # failure, so there's nothing to report.
@@ -733,6 +818,7 @@ proc main() =
     startInOrgMode = true
 
   setupOrgTags(gtkBuffer)
+  setupSourceHighlighting(gtkBuffer, filePath)  # syntax highlighting for code files
   gOrgMode = startInOrgMode
   retagOrgBlocks(gtkBuffer)  # apply org tags to the initial text before first draw
   discard g_signal_connect_data(pointer(gtkBuffer), "changed".cstring,
