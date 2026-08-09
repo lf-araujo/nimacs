@@ -32,7 +32,10 @@ when not declared(ptsname):
 import owlkettle
 import owlkettle/adw
 import owlkettle/bindings/gtk
-import nimacs/[kernel, dispatch, hotcompile]
+import nimacs/[kernel, dispatch, hotcompile, lsp]
+
+var gLspServers = {"nim": "nimlangserver --stdio"}.toTable  ## langId -> server command
+var gLspClients: Table[string, LspClient]                  ## langId -> live client
 
 # Built-in example document shown when nimacs is launched without a file.
 # Embedded at compile time (rather than read from disk at runtime) so it is
@@ -590,6 +593,10 @@ viewable App:
   paletteActive: bool    ## command palette overlay shown
   paletteQuery: string
   paletteSelected: int
+  completionActive: bool ## LSP completion overlay shown
+  completionItems: seq[string]
+  completionSelected: int
+  completionPrefix: string
 
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
@@ -934,6 +941,19 @@ proc shutdownRSessions() =
     var status: cint
     discard waitpid(s.pid, status, 0)
   gRSessions.clear()
+
+proc getLspClient(langId, rootDir: string): LspClient =
+  ## Start (once) the language server for `langId`, or return the running one.
+  if gLspClients.hasKey(langId): return gLspClients[langId]
+  let cmd = gLspServers.getOrDefault(langId, "")
+  if cmd.len == 0: return nil
+  result = startLsp(cmd, uriOf(rootDir))
+  gLspClients[langId] = result  # cache even nil, so we don't retry a broken server every keystroke
+
+proc shutdownLspClients() =
+  for langId, c in gLspClients:
+    shutdownLsp(c)
+  gLspClients.clear()
 
 var gTerminalTargetKey = ""  ## which gRSessions entry the terminal shows ("" = auto: latest)
 
@@ -1356,6 +1376,55 @@ proc handlePaletteKey(app: AppState; keyval: int): bool =
   discard app.redraw()
   true
 
+proc identPrefix(text: string; pos: int): string =
+  var start = pos
+  while start > 0 and text[start - 1] in {'a'..'z', 'A'..'Z', '0'..'9', '_'}: dec start
+  text[start ..< pos]
+
+proc lspComplete(app: AppState; cursorPos: int) =
+  ## Ctrl+Space: ask the language server for completions at the cursor.
+  let langId = langIdForFile(app.dispatch, app.filePath)
+  if langId.len == 0 or not gLspServers.hasKey(langId):
+    app.status = "No LSP server for this file type"; return
+  if app.filePath.len == 0:
+    app.status = "Save the file to use LSP completion"; return
+  let client = getLspClient(langId, parentDir(app.filePath))
+  if client == nil or not client.initialized:
+    app.status = "LSP server unavailable for " & langId; return
+  let text = app.gtkBuffer.bufferText
+  client.syncDoc(uriOf(app.filePath), langId, text)   # keep the server's copy current
+  let line = lineOfOffset(text, cursorPos)
+  var lineStart = cursorPos
+  while lineStart > 0 and text[lineStart - 1] != '\n': dec lineStart
+  let prefix = identPrefix(text, cursorPos)
+  var items = client.completion(uriOf(app.filePath), line, cursorPos - lineStart)
+  if prefix.len > 0:
+    let lp = prefix.toLowerAscii
+    var filtered: seq[string]
+    for it in items:
+      if it.toLowerAscii.startsWith(lp): filtered.add it
+    items = filtered
+  if items.len == 0:
+    app.completionActive = false; app.status = "No completions"; return
+  if items.len > 200: items.setLen(200)
+  app.completionItems = items
+  app.completionSelected = 0
+  app.completionPrefix = prefix
+  app.completionActive = true
+  app.status = $items.len & " completions (Enter to insert, Esc to cancel)"
+
+proc acceptCompletion(app: AppState) =
+  app.completionActive = false
+  if app.completionSelected < 0 or app.completionSelected >= app.completionItems.len: return
+  let item = app.completionItems[app.completionSelected]
+  let cur = app.gtkBuffer.liveCursorOffset()
+  let start = cur - app.completionPrefix.len
+  let text = app.gtkBuffer.bufferText
+  if start >= 0 and cur <= text.len:
+    app.gtkBuffer.bufferText = text[0 ..< start] & item & text[cur .. ^1]
+    app.gtkBuffer.placeCursorAt(start + item.len)
+  app.status = "inserted " & item
+
 proc sendLineToSession(app: AppState; cursorPos: int) =
   ## Ctrl+Enter: send the cursor's line (in a src block) to a running session of
   ## the block's language -- like RStudio/ESS "send line to console".
@@ -1413,6 +1482,22 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
   # Ctrl+Enter: send the current src-block line to its language's session.
   if ctrl and (keyval == 0xff0d or keyval == 0xff8d):  # Return / KP_Enter
     app.sendLineToSession(cursorPos)
+    discard app.redraw()
+    return true
+
+  # LSP completion popup navigation, when open.
+  if app.completionActive:
+    case keyval
+    of 0xff1b: app.completionActive = false; discard app.redraw(); return true  # Esc
+    of 0xff0d, 0xff8d: app.acceptCompletion(); discard app.redraw(); return true # Enter
+    of 0xff52: app.completionSelected = max(0, app.completionSelected - 1); discard app.redraw(); return true  # Up
+    of 0xff54: app.completionSelected = min(app.completionItems.len - 1, app.completionSelected + 1); discard app.redraw(); return true  # Down
+    else:
+      app.completionActive = false; discard app.redraw()  # any other key closes it, then acts normally
+
+  # Ctrl+Space: request LSP completion.
+  if ctrl and keyval == 0x20:  # space
+    app.lspComplete(cursorPos)
     discard app.redraw()
     return true
 
@@ -1563,6 +1648,16 @@ method view(app: AppState): Widget =
                 Label(text = (if i == app.paletteSelected: "▶  " else: "      ") & it.label) {.expand: false.}:
                   xalign = 0.0
 
+        if app.completionActive:
+          Box(orient = OrientY) {.expand: false.}:
+            margin = 8
+            Label(text = "LSP complete: " & app.completionPrefix) {.expand: false.}:
+              xalign = 0.0
+            for i, it in app.completionItems:
+              if i < 10:  # cap the visible completions
+                Label(text = (if i == app.completionSelected: "▶  " else: "      ") & it) {.expand: false.}:
+                  xalign = 0.0
+
         if app.searchActive:
           Box(orient = OrientX) {.expand: false.}:
             margin = 4
@@ -1692,9 +1787,10 @@ proc main() =
     orgMode = startInOrgMode,
   )))
 
-  # brew() returns once the window closes -- tear down any R sessions we
-  # spawned so no background R processes are left running.
+  # brew() returns once the window closes -- tear down the interpreters and
+  # language servers we spawned so nothing is left running.
   shutdownRSessions()
+  shutdownLspClients()
 
 when isMainModule:
   main()
