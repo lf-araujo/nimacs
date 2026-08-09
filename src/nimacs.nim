@@ -1356,10 +1356,65 @@ proc handlePaletteKey(app: AppState; keyval: int): bool =
   discard app.redraw()
   true
 
+proc sendLineToSession(app: AppState; cursorPos: int) =
+  ## Ctrl+Enter: send the cursor's line (in a src block) to a running session of
+  ## the block's language -- like RStudio/ESS "send line to console".
+  let text = app.gtkBuffer.bufferText
+  let lines = text.split('\n')
+  let cursorLine = lineOfOffset(text, cursorPos)
+
+  # Language of the enclosing #+begin_src block.
+  var lang = ""
+  var i = cursorLine
+  while i >= 0:
+    if i < cursorLine and isEndSrc(lines[i]): break
+    if isBeginSrc(lines[i]):
+      let toks = strutils.splitWhitespace(strutils.strip(lines[i]))
+      if toks.len >= 2: lang = toks[1].toLowerAscii()
+      break
+    dec i
+  if lang.len == 0 or not gReplSpecs.hasKey(lang):
+    app.status = "Ctrl+Enter: not inside a src block with a :session language"
+    return
+
+  # Pick the latest session of this language, creating a default if none exist.
+  var key = ""
+  if gLatestSession.startsWith(lang & "\x1f") and gRSessions.hasKey(gLatestSession):
+    key = gLatestSession
+  else:
+    for k in gRSessions.keys:
+      if k.startsWith(lang & "\x1f") and sessionAlive(gRSessions[k]):
+        key = k; break
+  if key.len == 0:
+    try:
+      discard getSession(lang, "default")
+      key = sessionKey(lang, "default")
+    except OSError:
+      app.status = "could not start " & lang
+      return
+
+  # De-indent the line (Python's REPL rejects a leading indent) and send it.
+  let lineText = strutils.strip(lines[cursorLine], leading = true, trailing = false)
+  if lineText.len > 0:
+    ptyWrite(gRSessions[key].master, lineText & "\n")
+  app.switchTerminalTo(key)  # show the session so its output is visible
+  # Advance to the next line, RStudio-style.
+  if cursorLine + 1 < lines.len:
+    var off = 0
+    for j in 0 .. cursorLine: off += lines[j].len + 1
+    app.gtkBuffer.placeCursorAt(off)
+  app.status = "sent line to " & keyLabel(key)
+
 proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): bool =
   # The command palette, when open, swallows every key (filter/navigate/run).
   if app.paletteActive:
     return app.handlePaletteKey(keyval)
+
+  # Ctrl+Enter: send the current src-block line to its language's session.
+  if ctrl and (keyval == 0xff0d or keyval == 0xff8d):  # Return / KP_Enter
+    app.sendLineToSession(cursorPos)
+    discard app.redraw()
+    return true
 
   # Built-in bindings are host-level and always active, regardless of
   # whatever config.nim currently has bound -- rebinding them away would be
