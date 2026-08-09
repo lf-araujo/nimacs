@@ -1311,6 +1311,11 @@ proc paletteItems(app: AppState): seq[PaletteItem] =
     let k = key
     result.add PaletteItem(label: "Terminal: switch to " & keyLabel(k),
       run: proc() = app.switchTerminalTo(k))
+  # Commands registered from config.nim -- so your own config feeds the palette.
+  for (name, fn) in app.dispatch.configCommands:
+    let f = fn
+    result.add PaletteItem(label: "Command: " & name,
+      run: proc() = app.runCommand(app.gtkBuffer.liveCursorOffset(), f))
   # LSP servers will add palette items here in the future.
 
 proc paletteFiltered(app: AppState): seq[PaletteItem] =

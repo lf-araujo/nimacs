@@ -72,6 +72,11 @@ iterator configRepls*(d: Dispatch): tuple[lang: string, fields: ReplFields] =
   for lang, fields in d.replSpecs:
     yield (lang, fields)
 
+iterator configCommands*(d: Dispatch): tuple[name: string, fn: CommandProc] =
+  ## Commands config.nim registered (for the palette / menu).
+  for name, fn in d.commands:
+    yield (name, fn)
+
 proc lookup*(d: Dispatch; keychord: string): CommandProc =
   let name = d.keymap.getOrDefault(keychord, "")
   if name == "": return nil
