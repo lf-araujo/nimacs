@@ -105,13 +105,27 @@ proc gtk_text_view_scroll_to_iter(view: GtkWidget; iter: ptr GtkTextIter; within
 # Core GTK symbols, linked against the same libgtk-4 owlkettle already uses.
 proc gtk_css_provider_new(): pointer {.importc, cdecl.}
 proc gtk_css_provider_load_from_data(provider: pointer; data: cstring; length: int) {.importc, cdecl.}
+proc gtk_css_provider_load_from_string(provider: pointer; css: cstring) {.importc, cdecl.}
 proc gdk_display_get_default(): pointer {.importc, cdecl.}
 proc gtk_style_context_add_provider_for_display(display: pointer; provider: pointer; priority: cuint) {.importc, cdecl.}
 
 const nimacsCss = """
-/* Slimmer, more GNOME-standard header bar than the owlkettle/adw default. */
-headerbar { min-height: 34px; padding-top: 0; padding-bottom: 0; }
-headerbar button { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
+/* Slim, compact header bar. min-height on the headerbar alone isn't enough --
+   the buttons' own min-height drives the final height, so shrink both. Keep
+   button sizes non-zero, or the icons get requested at size 0 and fail. */
+headerbar {
+  min-height: 26px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+headerbar button,
+headerbar .toggle {
+  min-height: 22px;
+  min-width: 22px;
+  padding: 1px 8px;
+  margin-top: 2px;
+  margin-bottom: 2px;
+}
 """
 
 var gCssLoaded = false
@@ -123,7 +137,7 @@ proc loadAppCss() =
   let display = gdk_display_get_default()
   if display == nil: return
   let provider = gtk_css_provider_new()
-  gtk_css_provider_load_from_data(provider, nimacsCss.cstring, -1)
+  gtk_css_provider_load_from_string(provider, nimacsCss.cstring)
   gtk_style_context_add_provider_for_display(display, provider, 600)
   gCssLoaded = true
 
@@ -138,8 +152,8 @@ proc applyZoom() =
   if gZoomProvider == nil:
     gZoomProvider = gtk_css_provider_new()
     gtk_style_context_add_provider_for_display(display, gZoomProvider, 601)
-  gtk_css_provider_load_from_data(gZoomProvider,
-    ("textview { font-size: " & $gFontPt & "pt; }").cstring, -1)
+  gtk_css_provider_load_from_string(gZoomProvider,
+    ("textview { font-size: " & $gFontPt & "pt; }").cstring)
 
 # -- Raw GtkTextBuffer helpers ---------------------------------------------
 
@@ -181,6 +195,7 @@ proc liveCursorOffset(buf: GtkTextBuffer): int =
 
 var
   gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag: GtkTextTag
+  gTitleTag, gMetaTag: GtkTextTag  ## #+TITLE: (large) and #+AUTHOR:/#+DATE: (medium)
   gOrgMode = false
     ## Mirrors app.orgMode. bufferChangedCallback (a raw "changed" signal
     ## callback, connected in main() before the live AppState even exists)
@@ -222,7 +237,9 @@ proc setupOrgTags(buf: GtkTextBuffer) =
   gHeadingTag = gtk_text_tag_new("nimacs-heading".cstring)
   gLinkTag = gtk_text_tag_new("nimacs-link".cstring)
   gHiddenTag = gtk_text_tag_new("nimacs-hidden".cstring)
-  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag]:
+  gTitleTag = gtk_text_tag_new("nimacs-title".cstring)
+  gMetaTag = gtk_text_tag_new("nimacs-meta".cstring)
+  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag, gTitleTag, gMetaTag]:
     discard gtk_text_tag_table_add(table, tag)
   gProseTag.setStringProp("family", "Sans")        # generic Pango alias -> system proportional font
   gCodeTag.setStringProp("family", "Monospace")     # generic Pango alias -> system monospace font
@@ -239,9 +256,20 @@ proc setupOrgTags(buf: GtkTextBuffer) =
   gLinkTag.setStringProp("foreground", "#2563eb")
   gLinkTag.setIntProp("underline", 1)               # PANGO_UNDERLINE_SINGLE
   gHiddenTag.setBoolProp("invisible", true)
+  # #+TITLE: large & bold; #+AUTHOR:/#+DATE: medium & muted -- document header.
+  gTitleTag.setStringProp("family", "Sans")
+  gTitleTag.setIntProp("weight", 700)
+  gTitleTag.setIntProp("size", 22 * 1024)
+  gMetaTag.setStringProp("family", "Sans")
+  gMetaTag.setIntProp("size", 15 * 1024)
+  gMetaTag.setStringProp("foreground", "#666666")
 
 proc isBeginSrc(line: string): bool = strutils.strip(line).toLowerAscii().startsWith("#+begin_src")
 proc isEndSrc(line: string): bool = strutils.strip(line).toLowerAscii() == "#+end_src"
+proc isTitleLine(line: string): bool = strutils.strip(line).toLowerAscii().startsWith("#+title:")
+proc isMetaLine(line: string): bool =
+  let s = strutils.strip(line).toLowerAscii()
+  s.startsWith("#+author:") or s.startsWith("#+date:") or s.startsWith("#+subtitle:")
 
 proc isHeading(line: string): bool =
   ## Org headlines start at column 0 (unlike src blocks, which may be
@@ -306,7 +334,7 @@ proc retagOrgBlocks(buf: GtkTextBuffer) =
   var bufStart, bufEnd: GtkTextIter
   gtk_text_buffer_get_start_iter(buf, bufStart.addr)
   gtk_text_buffer_get_end_iter(buf, bufEnd.addr)
-  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag]:
+  for tag in [gProseTag, gCodeTag, gHeadingTag, gLinkTag, gHiddenTag, gTitleTag, gMetaTag]:
     gtk_text_buffer_remove_tag(buf, tag, bufStart.addr, bufEnd.addr)
   if not gOrgMode:
     return  # toggled off -- tags cleared above, plain view, nothing more to do
@@ -336,6 +364,10 @@ proc retagOrgBlocks(buf: GtkTextBuffer) =
       if isBeginSrc(lineText): inSrc = true
     elif isHeading(lineText):
       gtk_text_buffer_apply_tag(buf, gHeadingTag, lineStart.addr, lineEnd.addr)
+    elif isTitleLine(lineText):
+      gtk_text_buffer_apply_tag(buf, gTitleTag, lineStart.addr, lineEnd.addr)
+    elif isMetaLine(lineText):
+      gtk_text_buffer_apply_tag(buf, gMetaTag, lineStart.addr, lineEnd.addr)
     else:
       gtk_text_buffer_apply_tag(buf, gProseTag, lineStart.addr, lineEnd.addr)
       retagLinks(buf, lineNum, lineText)
@@ -374,6 +406,7 @@ renderable EditorTextView of BaseWidget:
   acceptsTab: bool = true
   handler {.private, onlyState.}: KeyHandler
   wordsProvider {.private, onlyState.}: pointer  ## GtkSourceCompletionWords, registered per buffer
+  completionSetup {.private, onlyState.}: bool   ## wired once, after the buffer exists
 
   proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool
 
@@ -397,13 +430,6 @@ renderable EditorTextView of BaseWidget:
       gtk_event_controller_set_propagation_phase(controller, GtkPhaseCapture)
       discard g_signal_connect(controller, "key-pressed", keyPressedCallback, state.handler[].addr)
       gtk_widget_add_controller(state.internalWidget, controller)
-      # Buffer-word completion: GtkSourceView supplies the popup UI; the
-      # words provider offers identifiers already present in the buffer. The
-      # buffer to scan is attached in the gtkBuffer hook below (it isn't set
-      # yet at build time). Ctrl+Space triggers it; it also pops up as you type.
-      let completion = gtk_source_view_get_completion(state.internalWidget)
-      state.wordsProvider = gtk_source_completion_words_new("Words".cstring)
-      gtk_source_completion_add_provider(completion, state.wordsProvider)
     connectEvents:
       state.handler.onKeyPress =
         if state.onKeyPress.isNil: nil else: state.onKeyPress.callback
@@ -411,7 +437,14 @@ renderable EditorTextView of BaseWidget:
   hooks gtkBuffer:
     property:
       gtk_text_view_set_buffer(state.internalWidget, state.gtkBuffer)
-      if state.wordsProvider != nil:
+      # Buffer-word completion: wire it once, now that the buffer exists.
+      # GtkSourceView supplies the popup UI; the words provider offers
+      # identifiers already present in the buffer (Ctrl+Space, and as-you-type).
+      if not state.completionSetup:
+        state.completionSetup = true
+        let completion = gtk_source_view_get_completion(state.internalWidget)
+        state.wordsProvider = gtk_source_completion_words_new("Words".cstring)
+        gtk_source_completion_add_provider(completion, state.wordsProvider)
         gtk_source_completion_words_register(state.wordsProvider, state.gtkBuffer)
 
   hooks monospace:
