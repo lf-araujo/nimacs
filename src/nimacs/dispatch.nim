@@ -13,12 +13,15 @@ import ./hotcompile
 export config_api
 
 type
+  ReplFields* = object  ## config-provided pieces of an interactive :session spec
+    command*, prime*, ready*, run*, quit*: string
   Dispatch* = ref object
     commands: Table[string, CommandProc]
     keymap: Table[string, string]  ## keychord -> command name
     babelRunners: Table[string, string]  ## babel langId -> one-shot run template
     langByExt: Table[string, string]     ## file extension -> highlight langId
     langSpecs: Table[string, string]     ## langId -> GtkSourceView .lang XML
+    replSpecs: Table[string, ReplFields] ## langId -> interactive :session spec
     currentLib: LibHandle
     reloadCounter: int
     key: string  ## hotcompile cache key (nim version hash)
@@ -30,6 +33,7 @@ proc newDispatch*(cacheKey: string): Dispatch =
     babelRunners: initTable[string, string](),
     langByExt: initTable[string, string](),
     langSpecs: initTable[string, string](),
+    replSpecs: initTable[string, ReplFields](),
     currentLib: nil,
     reloadCounter: 0,
     key: cacheKey,
@@ -55,6 +59,18 @@ proc hostBindLang(ctxRaw: pointer; langId, command, extensions, langSpec: cstrin
     let ext = e.strip().toLowerAscii
     if ext.len > 0:
       d.langByExt[(if ext.startsWith("."): ext else: "." & ext)] = id
+
+proc hostBindRepl(ctxRaw: pointer; langId, command, prime, ready, run, quitCmd: cstring) {.cdecl.} =
+  let d = cast[Dispatch](ctxRaw)
+  let id = ($langId).toLowerAscii
+  if id.len == 0 or ($command).len == 0: return
+  d.replSpecs[id] = ReplFields(command: $command, prime: $prime, ready: $ready,
+                               run: $run, quit: $quitCmd)
+
+iterator configRepls*(d: Dispatch): tuple[lang: string, fields: ReplFields] =
+  ## Config-registered interactive :session specs (langId, fields).
+  for lang, fields in d.replSpecs:
+    yield (lang, fields)
 
 proc lookup*(d: Dispatch; keychord: string): CommandProc =
   let name = d.keymap.getOrDefault(keychord, "")
@@ -100,7 +116,8 @@ proc reloadConfig*(d: Dispatch; configPath: string; searchPaths: seq[string]): t
   d.babelRunners.clear()
   d.langByExt.clear()
   d.langSpecs.clear()
-  configureFn(cast[pointer](d), hostRegister, hostBind, hostBindLang)
+  d.replSpecs.clear()
+  configureFn(cast[pointer](d), hostRegister, hostBind, hostBindLang, hostBindRepl)
 
   let previousLib = d.currentLib
   d.currentLib = newLib
@@ -108,4 +125,5 @@ proc reloadConfig*(d: Dispatch; configPath: string; searchPaths: seq[string]): t
     unloadLib(previousLib)
 
   result = (true, "config reloaded (" & $d.commands.len & " commands, " &
-    $d.keymap.len & " bindings, " & $d.babelRunners.len & " babel langs)")
+    $d.keymap.len & " bindings, " & $d.babelRunners.len & " babel langs, " &
+    $d.replSpecs.len & " sessions)")

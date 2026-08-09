@@ -658,10 +658,12 @@ proc saveFile(app: AppState) =
   gtk_text_buffer_set_modified(app.gtkBuffer, cbool(0))  # clean again -> no close prompt
   app.status = "Saved " & app.filePath
 
+proc rebuildReplSpecs(d: Dispatch)  # forward decl; defined with the REPL engine below
+
 proc doReload(app: AppState) =
   let (ok, msg) = app.dispatch.reloadConfig(app.configPath, app.configSearchPaths)
+  if ok: rebuildReplSpecs(app.dispatch)  # pick up any bindRepl session specs
   app.status = msg
-  discard ok
 
 proc editConfig(app: AppState) =
   # Single-buffer editor -- "edit config" means load config.nim's text into
@@ -796,6 +798,16 @@ proc registerBuiltinRepls() =
     pyDriver, "print('NIMACSx''READY')\n", "_nrun(\"{file}\")\n", "exit()\n")
   gReplSpecs["bash"] = mkSpec(@["bash"],
     bashDriver, "printf '%s\\n' \"NIMACSx\"\"READY\"\n", "_nrun \"{file}\"\n", "exit\n")
+
+proc rebuildReplSpecs(d: Dispatch) =
+  ## Reset to the built-ins plus whatever config.nim registered via bindRepl.
+  ## Run after every config (re)load. Running sessions keep their own spec copy.
+  gReplSpecs.clear()
+  registerBuiltinRepls()
+  for (lang, f) in d.configRepls:
+    let argv = strutils.splitWhitespace(f.command)
+    if argv.len > 0:
+      gReplSpecs[lang.toLowerAscii] = mkSpec(argv, f.prime, f.ready, f.run, f.quit)
 
 proc sessionKey(lang, name: string): string = lang & "\x1f" & name
 
@@ -1373,7 +1385,6 @@ proc setupIconTheme() =
 
 proc main() =
   setupIconTheme()
-  registerBuiltinRepls()  # R / Python / bash interactive :session support
   let args = commandLineParams()
   let filePath = if args.len > 0: args[0] else: ""
   let gtkBuffer = newGtkTextBuffer()
@@ -1395,6 +1406,7 @@ proc main() =
   let searchPaths = @[projectRoot / "src"]
   let dispatch = newDispatch(cacheKey())
   let (ok, msg) = dispatch.reloadConfig(configPath, searchPaths)
+  rebuildReplSpecs(dispatch)  # built-in R/Python/bash + any config-registered sessions
   let initialStatus = if ok: msg else: "config load failed: " & msg
 
   setupSourceHighlighting(gtkBuffer, filePath, dispatch)  # highlighting (incl. config langs)

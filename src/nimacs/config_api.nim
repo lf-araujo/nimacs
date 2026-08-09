@@ -31,5 +31,24 @@ type
     ##                 this language (e.g. ".py,.pyw"), or "" for none.
     ##   langSpec   -- GtkSourceView .lang XML for highlighting, or "" to use a
     ##                 built-in/already-present spec of the same id.
+  BindReplProc* = proc (ctx: pointer; langId: cstring; command: cstring;
+                        prime: cstring; ready: cstring; run: cstring;
+                        quitCmd: cstring) {.cdecl, gcsafe.}
+    ## Register a persistent interactive `:session` interpreter for a language,
+    ## shared with the terminal pane. R/Python/bash are built in; add more here.
+    ## The interpreter runs on a pseudo-terminal; the host sends `prime` once,
+    ## then `run` per block, and reads output between the fixed markers
+    ## `__NIMACS_BOR__` and `__NIMACS_END__`.
+    ##   command -- interpreter command line, space-split into argv, launched
+    ##              interactively (e.g. "julia -q", "node -i").
+    ##   prime   -- one line defining a run-helper that prints the two markers.
+    ##              Split the marker literals so they never appear contiguously
+    ##              in the helper's echo (that would desync the reader), e.g.
+    ##              Julia: println("__NIMACS" * "_BOR__").
+    ##   ready   -- prints the literal token `NIMACSxREADY` (also split), so the
+    ##              host can read past the banner + prime echo.
+    ##   run     -- a marker-free call to the helper; `{file}` -> the block's
+    ##              temp file.
+    ##   quitCmd -- graceful shutdown command (e.g. "exit()").
   ConfigureProc* = proc (ctx: pointer; register: RegisterProc; bindP: BindProc;
-                         bindLang: BindLangProc) {.cdecl, gcsafe.}
+                         bindLang: BindLangProc; bindRepl: BindReplProc) {.cdecl, gcsafe.}

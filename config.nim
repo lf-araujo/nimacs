@@ -31,7 +31,7 @@ proc sayHello(k: ptr EditorKernel) {.cdecl.} =
   k.status = "Hello"
 
 proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc;
-                      bindLang: BindLangProc) {.exportc, dynlib.} =
+                      bindLang: BindLangProc; bindRepl: BindReplProc) {.exportc, dynlib.} =
   register(ctx, "insert-timestamp", insertTimestamp)
   register(ctx, "uppercase-line", uppercaseLine)
   register(ctx, "say-hello", sayHello)
@@ -47,4 +47,19 @@ proc nimacs_configure(ctx: pointer; register: RegisterProc; bindP: BindProc;
   # needs a real .lang; pass one, e.g. `staticRead("python.lang")`, to enable).
   bindLang(ctx, "python", "python3 {file}", ".py,.pyw", "")
   bindLang(ctx, "bash", "bash {file}", ".sh,.bash", "")
+
+  # Interactive `:session` interpreters (shared with the terminal pane). R,
+  # Python, and bash are built in; add more with bindRepl. The interpreter runs
+  # on a PTY; `prime` defines a helper that prints the markers `__NIMACS_BOR__`
+  # /`__NIMACS_END__` (split the literals so they don't appear in the helper's
+  # echo), `run` calls it ({file} -> temp file), `ready` prints NIMACSxREADY.
+  # Example for Julia (uncomment if `julia` is installed):
+  #
+  # bindRepl(ctx, "julia", "julia -q --color=no",
+  #   "function _nrun(p); println(\"__NIMACS\" * \"_BOR__\"); try; include(p); " &
+  #     "catch e; showerror(stdout, e); println(); end; " &
+  #     "println(\"__NIMACS\" * \"_END__\"); flush(stdout); end\n",
+  #   "println(\"NIMACSx\" * \"READY\")\n",
+  #   "_nrun(\"{file}\")\n",
+  #   "exit()\n")
 
