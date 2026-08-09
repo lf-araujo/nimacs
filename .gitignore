@@ -1,4 +1,4 @@
-nimacs
+/nimacs
 *.so
 nimcache/
 *~
