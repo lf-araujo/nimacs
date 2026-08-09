@@ -78,6 +78,10 @@ proc gtk_source_buffer_set_highlight_syntax(buf: GtkTextBuffer; highlight: cbool
 proc gtk_source_style_scheme_manager_get_default(): pointer {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_style_scheme_manager_get_scheme(sm: pointer; id: cstring): pointer {.importc, cdecl, dynlib: sourceLib.}
 proc gtk_source_buffer_set_style_scheme(buf: GtkTextBuffer; scheme: pointer) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_view_get_completion(view: GtkWidget): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_completion_words_new(title: cstring): pointer {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_completion_words_register(words: pointer; buf: GtkTextBuffer) {.importc, cdecl, dynlib: sourceLib.}
+proc gtk_source_completion_add_provider(completion: pointer; provider: pointer) {.importc, cdecl, dynlib: sourceLib.}
 
 # -- Raw GtkTextBuffer helpers ---------------------------------------------
 
@@ -311,6 +315,7 @@ renderable EditorTextView of BaseWidget:
   editable: bool = true
   acceptsTab: bool = true
   handler {.private, onlyState.}: KeyHandler
+  wordsProvider {.private, onlyState.}: pointer  ## GtkSourceCompletionWords, registered per buffer
 
   proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool
 
@@ -326,6 +331,13 @@ renderable EditorTextView of BaseWidget:
       gtk_event_controller_set_propagation_phase(controller, GtkPhaseCapture)
       discard g_signal_connect(controller, "key-pressed", keyPressedCallback, state.handler[].addr)
       gtk_widget_add_controller(state.internalWidget, controller)
+      # Buffer-word completion: GtkSourceView supplies the popup UI; the
+      # words provider offers identifiers already present in the buffer. The
+      # buffer to scan is attached in the gtkBuffer hook below (it isn't set
+      # yet at build time). Ctrl+Space triggers it; it also pops up as you type.
+      let completion = gtk_source_view_get_completion(state.internalWidget)
+      state.wordsProvider = gtk_source_completion_words_new("Words".cstring)
+      gtk_source_completion_add_provider(completion, state.wordsProvider)
     connectEvents:
       state.handler.onKeyPress =
         if state.onKeyPress.isNil: nil else: state.onKeyPress.callback
@@ -333,6 +345,8 @@ renderable EditorTextView of BaseWidget:
   hooks gtkBuffer:
     property:
       gtk_text_view_set_buffer(state.internalWidget, state.gtkBuffer)
+      if state.wordsProvider != nil:
+        gtk_source_completion_words_register(state.wordsProvider, state.gtkBuffer)
 
   hooks monospace:
     property:
