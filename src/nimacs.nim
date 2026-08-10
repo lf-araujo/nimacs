@@ -1317,6 +1317,8 @@ type PaletteItem = object
   label: string
   run: proc() {.closure.}
 
+proc toggleBlockEdit(app: AppState; cursorPos: int)  # forward decl; defined below
+
 proc paletteItems(app: AppState): seq[PaletteItem] =
   result.add PaletteItem(label: "Open file", run: proc() = app.openFile())
   result.add PaletteItem(label: "Save", run: proc() = app.saveFile())
@@ -1325,6 +1327,7 @@ proc paletteItems(app: AppState): seq[PaletteItem] =
   result.add PaletteItem(label: "Toggle Org babel mode", run: proc() = app.toggleOrgMode(not app.orgMode))
   result.add PaletteItem(label: "Find and replace", run: proc() = app.searchActive = true)
   result.add PaletteItem(label: "Comment: toggle line", run: proc() = app.toggleComment(app.gtkBuffer.liveCursorOffset()))
+  result.add PaletteItem(label: "Edit src block in dedicated buffer (C-c ')", run: proc() = app.toggleBlockEdit(app.gtkBuffer.liveCursorOffset()))
   result.add PaletteItem(label: "Terminal: Claude Code", run: proc() = app.openTerminalRaw(@["claude"]))
   result.add PaletteItem(label: "Terminal: new shell", run: proc() = app.openTerminalRaw(@["bash"]))
   for key in runningTargets():
@@ -1486,6 +1489,93 @@ proc acceptCompletion(app: AppState) =
     app.gtkBuffer.placeCursorAt(start + item.len)
   app.status = "inserted " & item
 
+# -- Edit src block in a dedicated buffer (C-c ', like org-edit-special) -----
+# Swaps the single buffer to the block's de-indented body as a real language
+# file (so native LSP + save work), and writes it back into the org doc on
+# return, re-applying the original indentation.
+var gInBlockEdit = false
+var gBlockOrgText = ""
+var gBlockBegin, gBlockEnd, gBlockIndent = 0
+var gBlockOrgFile = ""
+var gBlockOrgMode = false
+
+proc enterBlockEdit(app: AppState; cursorPos: int) =
+  let text = app.gtkBuffer.bufferText
+  let lines = text.split('\n')
+  let cursorLine = lineOfOffset(text, cursorPos)
+  var beginIdx = -1
+  var i = cursorLine
+  while i >= 0:
+    if i < cursorLine and isEndSrc(lines[i]): break
+    if isBeginSrc(lines[i]): beginIdx = i; break
+    dec i
+  var endIdx = -1
+  if beginIdx != -1:
+    var j = beginIdx + 1
+    while j < lines.len:
+      if isEndSrc(lines[j]): endIdx = j; break
+      if isBeginSrc(lines[j]): break
+      inc j
+  if beginIdx == -1 or endIdx == -1 or cursorLine <= beginIdx or cursorLine > endIdx:
+    app.status = "C-c ': not inside a src block"
+    return
+  let toks = strutils.splitWhitespace(strutils.strip(lines[beginIdx]))
+  let lang = if toks.len >= 2: toks[1].toLowerAscii() else: "txt"
+  let body = lines[beginIdx + 1 .. endIdx - 1]
+  var minIndent = high(int)
+  for bl in body:
+    if strutils.strip(bl).len == 0: continue
+    var k = 0
+    while k < bl.len and bl[k] in {' ', '\t'}: inc k
+    minIndent = min(minIndent, k)
+  if minIndent == high(int): minIndent = 0
+  var dedented: seq[string]
+  for bl in body:
+    dedented.add(if bl.len >= minIndent: bl[minIndent .. ^1] else: bl)
+  let blockText = dedented.join("\n")
+
+  gBlockOrgText = text; gBlockBegin = beginIdx; gBlockEnd = endIdx
+  gBlockIndent = minIndent; gBlockOrgFile = app.filePath; gBlockOrgMode = app.orgMode
+  gInBlockEdit = true
+  let tmp = lspBlockTmp(lang)  # a real .R/.nim/.py file -> native LSP + save
+  writeFile(tmp, blockText)
+  app.gtkBuffer.bufferText = blockText
+  app.filePath = tmp; gFilePath = tmp
+  gtk_text_buffer_set_modified(app.gtkBuffer, cbool(0))
+  gOrgMode = false; app.orgMode = false
+  setupSourceHighlighting(app.gtkBuffer, tmp, app.dispatch)
+  retagOrgBlocks(app.gtkBuffer)  # clears org tags
+  app.gtkBuffer.placeCursorAt(0)
+  app.status = "Editing " & lang & " block -- Ctrl+Space for LSP, C-c ' to return"
+
+proc exitBlockEdit(app: AppState) =
+  let edited = app.gtkBuffer.bufferText.split('\n')
+  let indent = " ".repeat(gBlockIndent)
+  var reindented: seq[string]
+  for el in edited:
+    reindented.add(if el.len > 0: indent & el else: el)
+  let orgLines = gBlockOrgText.split('\n')
+  var newLines: seq[string]
+  newLines.add(orgLines[0 .. gBlockBegin])       # through #+begin_src
+  newLines.add(reindented)
+  if gBlockEnd <= orgLines.high:
+    newLines.add(orgLines[gBlockEnd .. ^1])       # from #+end_src on
+  app.gtkBuffer.bufferText = newLines.join("\n")
+  app.filePath = gBlockOrgFile; gFilePath = gBlockOrgFile
+  gtk_text_buffer_set_modified(app.gtkBuffer, cbool(1))  # org doc changed
+  gOrgMode = gBlockOrgMode; app.orgMode = gBlockOrgMode
+  setupSourceHighlighting(app.gtkBuffer, gBlockOrgFile, app.dispatch)
+  retagOrgBlocks(app.gtkBuffer)
+  var off = 0
+  for k in 0 .. min(gBlockBegin, orgLines.high): off += orgLines[k].len + 1
+  app.gtkBuffer.placeCursorAt(off)
+  gInBlockEdit = false
+  app.status = "Returned to org"
+
+proc toggleBlockEdit(app: AppState; cursorPos: int) =
+  if gInBlockEdit: app.exitBlockEdit()
+  else: app.enterBlockEdit(cursorPos)
+
 proc sendLineToSession(app: AppState; cursorPos: int) =
   ## Ctrl+Enter: send the cursor's line (in a src block) to a running session of
   ## the block's language -- like RStudio/ESS "send line to console".
@@ -1581,6 +1671,10 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
     app.pendingPrefix = ""
     if chord == "C-c":
       app.executeSrcBlock(cursorPos)
+      discard app.redraw()
+      return true
+    elif chord == "'":                # C-c ' -> edit block in a dedicated buffer
+      app.toggleBlockEdit(cursorPos)
       discard app.redraw()
       return true
     # any other chord: prefix abandoned, fall through to normal handling
