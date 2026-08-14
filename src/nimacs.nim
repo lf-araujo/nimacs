@@ -1898,8 +1898,10 @@ method view(app: AppState): Widget =
               Icon(name = "window-close-symbolic")
               proc clicked() = app.closeSearch()
 
-        Box(orient = OrientX) {.expand: true.}:
-          ScrolledWindow {.expand: true.}:
+        Paned(orient = OrientX) {.expand: true.}:
+          # Divider is draggable; collapse the right pane when not in block-edit.
+          initialPosition = (if gInBlockEdit: 620 else: 100000)
+          ScrolledWindow {.resize: true.}:
             EditorTextView:
               margin = 12
               gtkBuffer = app.gtkBuffer
@@ -1911,11 +1913,10 @@ method view(app: AppState): Widget =
                 app.handleKey(keyval, ctrl, shift, cursorPos)
 
           # Objects/environment pane -- opens with the C-c ' src-edit environment.
-          if gInBlockEdit:
-            Separator() {.expand: false.}
-            ScrolledWindow {.expand: false.}:
-              Box(orient = OrientY):
-                margin = 6
+          ScrolledWindow {.resize: true, shrink: true.}:
+            Box(orient = OrientY):
+              margin = 6
+              if gInBlockEdit:
                 Label(text = "Objects  (" & gBlockLang & ")") {.expand: false.}:
                   xalign = 0.0
                 for o in app.objectsList:
