@@ -598,6 +598,29 @@ viewable App:
   completionSelected: int
   completionPrefix: string
 
+# -- Command registry ------------------------------------------------------
+# One source of named actions. Built-ins are registered here; keybindings are
+# data (chord -> command name), so they're rebindable; and the palette + menu
+# derive from the registry. (Lesson from legmacs: built-ins and user actions
+# should be the same kind of thing.)
+type Command = object
+  label: string
+  run: proc(app: AppState) {.closure.}
+
+var gCommands: OrderedTable[string, Command]  ## name -> command
+var gKeymap: Table[string, string]            ## keychord -> command name
+
+proc defcommand(name, label: string; run: proc(app: AppState)) =
+  gCommands[name] = Command(label: label, run: run)
+
+proc bindkey(chord, name: string) = gKeymap[chord] = name
+
+proc runNamedCommand(app: AppState; name: string): bool =
+  if gCommands.hasKey(name):
+    gCommands[name].run(app)
+    return true
+  false
+
 proc toggleOrgMode(app: AppState, state: bool) =
   app.orgMode = state
   gOrgMode = state
@@ -1320,21 +1343,20 @@ type PaletteItem = object
 proc toggleBlockEdit(app: AppState; cursorPos: int)  # forward decl; defined below
 
 proc paletteItems(app: AppState): seq[PaletteItem] =
-  result.add PaletteItem(label: "Open file", run: proc() = app.openFile())
-  result.add PaletteItem(label: "Save", run: proc() = app.saveFile())
-  result.add PaletteItem(label: "Reload config", run: proc() = app.doReload())
-  result.add PaletteItem(label: "Edit config.nim", run: proc() = app.editConfig())
-  result.add PaletteItem(label: "Toggle Org babel mode", run: proc() = app.toggleOrgMode(not app.orgMode))
-  result.add PaletteItem(label: "Find and replace", run: proc() = app.searchActive = true)
-  result.add PaletteItem(label: "Comment: toggle line", run: proc() = app.toggleComment(app.gtkBuffer.liveCursorOffset()))
-  result.add PaletteItem(label: "Edit src block in dedicated buffer (C-c ')", run: proc() = app.toggleBlockEdit(app.gtkBuffer.liveCursorOffset()))
-  result.add PaletteItem(label: "Terminal: Claude Code", run: proc() = app.openTerminalRaw(@["claude"]))
-  result.add PaletteItem(label: "Terminal: new shell", run: proc() = app.openTerminalRaw(@["bash"]))
+  # Every registered command (built-ins live in the same registry as anything
+  # else), tagged with its keybinding if it has one.
+  var keyFor: Table[string, string]
+  for chord, name in gKeymap: keyFor[name] = chord
+  for name, c in gCommands:
+    let cmd = c
+    let suffix = if keyFor.hasKey(name): "   (" & keyFor[name] & ")" else: ""
+    result.add PaletteItem(label: c.label & suffix, run: proc() = cmd.run(app))
+  # Live terminals to switch to.
   for key in runningTargets():
     let k = key
     result.add PaletteItem(label: "Terminal: switch to " & keyLabel(k),
       run: proc() = app.switchTerminalTo(k))
-  # Commands registered from config.nim -- so your own config feeds the palette.
+  # Commands registered from config.nim.
   for (name, fn) in app.dispatch.configCommands:
     let f = fn
     result.add PaletteItem(label: "Command: " & name,
@@ -1685,24 +1707,9 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
     discard app.redraw()
     return true
 
-  if chord == "C-S-r":
-    app.doReload()
-  elif chord == "C-s":
-    app.saveFile()
-  elif chord == "C-/":
-    app.toggleComment(cursorPos)
-  elif chord == "C-=":
-    gFontPt = min(gFontPt + 1, 40); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
-  elif chord == "C--":
-    gFontPt = max(gFontPt - 1, 6); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
-  elif chord == "C-0":
-    gFontPt = 11; applyZoom(); app.status = "Zoom reset (" & $gFontPt & "pt)"
-  elif chord == "C-f":
-    app.searchActive = not app.searchActive
-    if not app.searchActive: app.closeSearch() else: app.status = "Find"
-  elif chord == "C-S-p":
-    app.paletteActive = true; app.paletteQuery = ""; app.paletteSelected = 0
-    app.status = "Command palette -- type to filter, Enter to run, Esc to close"
+  # A registered built-in command bound to this chord, else a config command.
+  if gKeymap.hasKey(chord) and app.runNamedCommand(gKeymap[chord]):
+    discard
   else:
     let cmd = app.dispatch.lookup(chord)
     if cmd == nil:
@@ -1884,6 +1891,49 @@ method view(app: AppState): Widget =
           margin = 6
           xalign = 0.0
 
+proc cmdFind(app: AppState) =
+  if app.searchActive: app.closeSearch() else: app.searchActive = true
+proc cmdPalette(app: AppState) =
+  app.paletteActive = true; app.paletteQuery = ""; app.paletteSelected = 0
+proc cmdZoomIn(app: AppState) =
+  gFontPt = min(gFontPt + 1, 40); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
+proc cmdZoomOut(app: AppState) =
+  gFontPt = max(gFontPt - 1, 6); applyZoom(); app.status = "Zoom " & $gFontPt & "pt"
+proc cmdZoomReset(app: AppState) =
+  gFontPt = 11; applyZoom(); app.status = "Zoom reset"
+
+proc registerCommands() =
+  ## Built-in actions + default keybindings. Keybindings are data (chord ->
+  ## name), so they can be rebound, and the palette/menu derive from this.
+  defcommand("open-file", "Open file", proc(app: AppState) = app.openFile())
+  defcommand("save", "Save", proc(app: AppState) = app.saveFile())
+  defcommand("reload-config", "Reload config", proc(app: AppState) = app.doReload())
+  defcommand("edit-config", "Edit config.nim", proc(app: AppState) = app.editConfig())
+  defcommand("toggle-org", "Toggle Org babel mode", proc(app: AppState) = app.toggleOrgMode(not app.orgMode))
+  defcommand("comment-toggle", "Comment: toggle line",
+    proc(app: AppState) = app.toggleComment(app.gtkBuffer.liveCursorOffset()))
+  defcommand("block-edit", "Edit src block in dedicated buffer",
+    proc(app: AppState) = app.toggleBlockEdit(app.gtkBuffer.liveCursorOffset()))
+  defcommand("complete", "LSP complete",
+    proc(app: AppState) = app.lspComplete(app.gtkBuffer.liveCursorOffset()))
+  defcommand("send-line", "Send line to session",
+    proc(app: AppState) = app.sendLineToSession(app.gtkBuffer.liveCursorOffset()))
+  defcommand("terminal-claude", "Terminal: Claude Code", proc(app: AppState) = app.openTerminalRaw(@["claude"]))
+  defcommand("terminal-shell", "Terminal: new shell", proc(app: AppState) = app.openTerminalRaw(@["bash"]))
+  defcommand("find", "Find and replace", cmdFind)
+  defcommand("command-palette", "Command palette", cmdPalette)
+  defcommand("zoom-in", "Zoom in", cmdZoomIn)
+  defcommand("zoom-out", "Zoom out", cmdZoomOut)
+  defcommand("zoom-reset", "Zoom reset", cmdZoomReset)
+  bindkey("C-s", "save")
+  bindkey("C-S-r", "reload-config")
+  bindkey("C-/", "comment-toggle")
+  bindkey("C-=", "zoom-in")
+  bindkey("C--", "zoom-out")
+  bindkey("C-0", "zoom-reset")
+  bindkey("C-f", "find")
+  bindkey("C-S-p", "command-palette")
+
 proc setupIconTheme() =
   # GTK looks up icon themes (Adwaita, for the header-bar button icons) via
   # XDG_DATA_DIRS/share/icons. Not set by default, and the conda env's own
@@ -1897,6 +1947,7 @@ proc setupIconTheme() =
 
 proc main() =
   setupIconTheme()
+  registerCommands()  # built-in command registry + default keybindings
   let args = commandLineParams()
   let filePath = if args.len > 0: args[0] else: ""
   let gtkBuffer = newGtkTextBuffer()
