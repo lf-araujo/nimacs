@@ -597,6 +597,7 @@ viewable App:
   completionItems: seq[string]
   completionSelected: int
   completionPrefix: string
+  objectsList: seq[string]  ## session memory contents, shown in block-edit mode
 
 # -- Command registry ------------------------------------------------------
 # One source of named actions. Built-ins are registered here; keybindings are
@@ -1520,6 +1521,40 @@ var gBlockOrgText = ""
 var gBlockBegin, gBlockEnd, gBlockIndent = 0
 var gBlockOrgFile = ""
 var gBlockOrgMode = false
+var gBlockLang = ""   ## language of the block being edited (for the objects pane)
+
+# Per-language query that lists the session's objects, for the objects pane.
+var gObjectsQuery = {
+  "r": "for (o in ls(envir=globalenv())) cat(o, \"  <\", tryCatch(class(get(o, envir=globalenv()))[1], error=function(e) \"?\"), \">\\n\", sep=\"\")",
+  "python": "for _k in sorted(list(globals())):\n if not _k.startswith('_'):\n  print(_k, '<'+type(globals()[_k]).__name__+'>')",
+  "bash": "for _v in $(compgen -v); do echo \"$_v\"; done | grep -vE '^(BASH|COMP|PS[0-9]|EUID|PPID|UID|_|IFS|OPTIND|HIST)' | sort | head -60"
+}.toTable
+
+proc sessionKeyForLang(lang: string): string =
+  ## The latest live session key for `lang`, or "".
+  if gLatestSession.startsWith(lang & "\x1f") and gRSessions.hasKey(gLatestSession):
+    return gLatestSession
+  for k in gRSessions.keys:
+    if k.startsWith(lang & "\x1f") and sessionAlive(gRSessions[k]): return k
+  ""
+
+proc refreshObjects(app: AppState) =
+  ## Populate the objects pane from the block language's session memory.
+  app.objectsList = @[]
+  if gBlockLang.len == 0: return
+  let key = sessionKeyForLang(gBlockLang)
+  if key.len == 0:
+    app.objectsList = @["(no " & gBlockLang & " session yet -- run code first)"]; return
+  let query = gObjectsQuery.getOrDefault(gBlockLang, "")
+  if query.len == 0:
+    app.objectsList = @["(no objects query for " & gBlockLang & ")"]; return
+  let parts = key.split('\x1f')
+  let (ok, output) = runInSession(gBlockLang, (if parts.len == 2: parts[1] else: "default"), query)
+  if ok:
+    for line in output.splitLines():
+      if strutils.strip(line).len > 0: app.objectsList.add line
+  if app.objectsList.len == 0:
+    app.objectsList = @["(empty environment)"]
 
 proc enterBlockEdit(app: AppState; cursorPos: int) =
   let text = app.gtkBuffer.bufferText
@@ -1558,6 +1593,7 @@ proc enterBlockEdit(app: AppState; cursorPos: int) =
 
   gBlockOrgText = text; gBlockBegin = beginIdx; gBlockEnd = endIdx
   gBlockIndent = minIndent; gBlockOrgFile = app.filePath; gBlockOrgMode = app.orgMode
+  gBlockLang = lang
   gInBlockEdit = true
   let tmp = lspBlockTmp(lang)  # a real .R/.nim/.py file -> native LSP + save
   writeFile(tmp, blockText)
@@ -1568,6 +1604,7 @@ proc enterBlockEdit(app: AppState; cursorPos: int) =
   setupSourceHighlighting(app.gtkBuffer, tmp, app.dispatch)
   retagOrgBlocks(app.gtkBuffer)  # clears org tags
   app.gtkBuffer.placeCursorAt(0)
+  app.refreshObjects()  # populate the objects pane from the session
   app.status = "Editing " & lang & " block -- Ctrl+Space for LSP, C-c ' to return"
 
 proc exitBlockEdit(app: AppState) =
@@ -1592,6 +1629,8 @@ proc exitBlockEdit(app: AppState) =
   for k in 0 .. min(gBlockBegin, orgLines.high): off += orgLines[k].len + 1
   app.gtkBuffer.placeCursorAt(off)
   gInBlockEdit = false
+  gBlockLang = ""
+  app.objectsList = @[]
   app.status = "Returned to org"
 
 proc toggleBlockEdit(app: AppState; cursorPos: int) =
@@ -1859,16 +1898,29 @@ method view(app: AppState): Widget =
               Icon(name = "window-close-symbolic")
               proc clicked() = app.closeSearch()
 
-        ScrolledWindow {.expand: true.}:
-          EditorTextView:
-            margin = 12
-            gtkBuffer = app.gtkBuffer
-            monospace = true
-            cursorVisible = true
-            editable = true
-            acceptsTab = true
-            proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool =
-              app.handleKey(keyval, ctrl, shift, cursorPos)
+        Box(orient = OrientX) {.expand: true.}:
+          ScrolledWindow {.expand: true.}:
+            EditorTextView:
+              margin = 12
+              gtkBuffer = app.gtkBuffer
+              monospace = true
+              cursorVisible = true
+              editable = true
+              acceptsTab = true
+              proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool =
+                app.handleKey(keyval, ctrl, shift, cursorPos)
+
+          # Objects/environment pane -- opens with the C-c ' src-edit environment.
+          if gInBlockEdit:
+            Separator() {.expand: false.}
+            ScrolledWindow {.expand: false.}:
+              Box(orient = OrientY):
+                margin = 6
+                Label(text = "Objects  (" & gBlockLang & ")") {.expand: false.}:
+                  xalign = 0.0
+                for o in app.objectsList:
+                  Label(text = o) {.expand: false.}:
+                    xalign = 0.0
 
         if app.terminalActive:
           Separator() {.expand: false.}
@@ -1918,6 +1970,7 @@ proc registerCommands() =
     proc(app: AppState) = app.lspComplete(app.gtkBuffer.liveCursorOffset()))
   defcommand("send-line", "Send line to session",
     proc(app: AppState) = app.sendLineToSession(app.gtkBuffer.liveCursorOffset()))
+  defcommand("refresh-objects", "Objects: refresh pane", proc(app: AppState) = app.refreshObjects())
   defcommand("terminal-claude", "Terminal: Claude Code", proc(app: AppState) = app.openTerminalRaw(@["claude"]))
   defcommand("terminal-shell", "Terminal: new shell", proc(app: AppState) = app.openTerminalRaw(@["bash"]))
   defcommand("find", "Find and replace", cmdFind)
