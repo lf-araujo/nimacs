@@ -8,7 +8,8 @@
 import uirelays
 import widgets/synedit
 import focimsession
-import std/[tables, strutils]
+import std/[tables, strutils, os, osproc]
+when defined(posix): import std/posix
 
 export uirelays, synedit, focimsession   # config sees Event/KeyCode/SynEdit/ReplSpec/...
 
@@ -180,6 +181,37 @@ proc babelExecute*(app: var App) =
   app.msg = "babel: ran " & (if lang.len > 0: lang else: "?") & " block"
   app.runHooks("after-babel")
 
+proc recompileConfig*(app: var App) =
+  ## Hot-reload the config the honest way for compiled Nim (the xmonad model):
+  ## rebuild the binary -- which recompiles focimconfig.nim with it -- and, on
+  ## success, re-exec ourselves, handing off the current file and cursor line.
+  ## A compile error is shown in the session pane and nothing is replaced.
+  when not defined(posix):
+    app.msg = "recompile: only implemented on POSIX so far"
+    return
+  else:
+    app.msg = "recompiling..."
+    let dir = getAppDir()
+    let (outp, code) = execCmdEx("nim c --hints:off -o:focim src/focim.nim",
+                                 workingDir = dir)
+    if code != 0:
+      app.sess.appendOutput("-- recompile FAILED --\n" & outp & "\n")
+      app.msg = "recompile failed (see session pane)"
+      return
+    # persist the buffer so edits survive the exec
+    var fileArg = app.filePath
+    if fileArg.len == 0:
+      fileArg = getTempDir() / "focim-scratch.txt"
+      writeFile(fileArg, app.ed.fullText())
+    elif app.ed.changed:
+      app.ed.saveToFile(app.filePath); app.ed.markSaved()
+    let line = app.ed.currentLine
+    for s in app.sessions.values: closeSession(s)   # reap child REPLs first
+    let bin = getAppFilename()
+    let argv = allocCStringArray(@[bin, fileArg, "--goto", $line])
+    discard execv(bin.cstring, argv)
+    app.msg = "recompile: exec failed"   # only reached if execv failed
+
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
   defcommand("save", "Save", saveCmd)
@@ -190,7 +222,9 @@ proc registerBuiltins*() =
   defcommand("undo", "Undo", proc(app: var App) = app.ed.undo())
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
   defcommand("palette", "Command palette", paletteCmd)
+  defcommand("recompile", "Recompile config & restart", recompileConfig)
   bindkey("C-s", "save")
+  bindkey("C-c r", "recompile")
   bindkey("C-q", "quit")
   bindkey("C-Enter", "run-line")
   bindkey("C-c C-c", "babel-execute")

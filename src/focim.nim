@@ -9,7 +9,7 @@ import uirelays
 import uirelays/layout
 import focimcore
 import focimconfig
-import std/[os, tables]
+import std/[os, tables, strutils]
 
 const fontPath =
   when defined(windows): "C:/Windows/Fonts/consola.ttf"
@@ -92,6 +92,12 @@ proc main() =
                    "#+begin_src r :session default\n" &
                    "x <- c(10, 20, 30)\nmean(x)\nsummary(x)\n#+end_src\n")
   app.sess.setText("session output\n")
+
+  # `--goto N`: restore the cursor line after a recompile re-exec.
+  for i in 1 .. paramCount() - 1:
+    if paramStr(i) == "--goto":
+      try: app.ed.gotoLine(parseInt(paramStr(i + 1)), 0)
+      except ValueError: discard
 
   configure(app)            # user config (focimconfig.nim) -- full-typed, no ABI
   app.runHooks("startup")

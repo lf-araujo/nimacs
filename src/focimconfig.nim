@@ -1,8 +1,10 @@
 ## focim user configuration -- plain Nim with full access to the editor model.
 ## This is the "deep ABI": no GObject/.so boundary like the GTK build needed.
 ## A command is a Nim proc; a keybinding or a language is data; a hook is a proc
-## that fires at an editor event. Edit this file and rebuild (`nimble focim`) to
-## apply -- the host calls `configure(app)` once, after the built-ins load.
+## that fires at an editor event. Edit this file and press C-c r inside focim
+## (command "recompile") -- it rebuilds the binary, which recompiles THIS file,
+## and re-execs, restoring your file and cursor. (`nimble focim` also works.)
+## The host calls `configure(app)` once, after the built-ins load.
 
 import focimcore
 import std/times
