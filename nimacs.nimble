@@ -8,10 +8,17 @@ srcDir        = "src"
 bin           = @["nimacs"]
 
 requires "nim >= 2.0.0"
-requires "owlkettle"
+requires "owlkettle"                                   # GTK version (src/nimacs.nim)
+requires "https://github.com/nim-lang/uirelays"        # focim branch (src/focim.nim)
 
-task build, "Build the nimacs binary (project root)":
+task build, "Build the GTK nimacs binary":
   exec "nim c -o:nimacs src/nimacs.nim"
 
-task run, "Build and run nimacs":
+task run, "Build and run the GTK nimacs":
   exec "nim c -r -o:nimacs src/nimacs.nim"
+
+task focim, "Build the uirelays (native, cross-platform) nimacs":
+  exec "nim c -o:focim src/focim.nim"
+
+task focimrun, "Build and run the uirelays nimacs":
+  exec "nim c -r -o:focim src/focim.nim"
