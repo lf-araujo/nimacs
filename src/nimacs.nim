@@ -598,6 +598,7 @@ viewable App:
   completionSelected: int
   completionPrefix: string
   objectsList: seq[string]  ## session memory contents, shown in block-edit mode
+  helpText: string          ## help/doc for the symbol at point, shown in block-edit mode
 
 # -- Command registry ------------------------------------------------------
 # One source of named actions. Built-ins are registered here; keybindings are
@@ -1556,6 +1557,46 @@ proc refreshObjects(app: AppState) =
   if app.objectsList.len == 0:
     app.objectsList = @["(empty environment)"]
 
+# Per-language query rendering help/doc for a symbol ({sym}) to plain text.
+var gHelpQuery = {
+  "r": "cat(tryCatch(paste(capture.output(tools:::Rd2txt(utils:::.getHelpFile(as.character(help(\"{sym}\"))))), collapse=\"\\n\"), error=function(e) paste(\"No help for\", \"{sym}\")))",
+  "python": "import pydoc as _p\ntry:\n print(_p.render_doc({sym}, renderer=_p.plaintext))\nexcept Exception as _e:\n print('No help for {sym}:', _e)",
+  "bash": "help {sym} 2>&1 | head -60 || type {sym} 2>&1"
+}.toTable
+
+proc wordAt(text: string; pos: int): string =
+  const idc = {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
+  var s = pos
+  while s > 0 and text[s - 1] in idc: dec s
+  var e = pos
+  while e < text.len and text[e] in idc: inc e
+  if s < e: text[s ..< e] else: ""
+
+proc cleanOverstrike(s: string): string =
+  ## Strip terminal overstrike (X\bY -> Y), as used by R's Rd2txt bold/underline.
+  var i = 0
+  while i < s.len:
+    if i + 1 < s.len and s[i + 1] == '\b': inc i, 2
+    else: (result.add s[i]; inc i)
+
+proc showHelp(app: AppState; cursorPos: int) =
+  var lang = gBlockLang
+  if lang.len == 0: lang = langIdForFile(app.dispatch, app.filePath)
+  if lang.len == 0 or not gHelpQuery.hasKey(lang):
+    app.status = "No help provider for this language"; return
+  let sym = wordAt(app.gtkBuffer.bufferText, cursorPos)
+  if sym.len == 0:
+    app.status = "No symbol at cursor"; return
+  let key = sessionKeyForLang(lang)
+  if key.len == 0:
+    app.helpText = "(no " & lang & " session -- run code first)"; return
+  let parts = key.split('\x1f')
+  let query = gHelpQuery[lang].replace("{sym}", sym)
+  let (ok, output) = runInSession(lang, (if parts.len == 2: parts[1] else: "default"), query)
+  app.helpText = if ok and strutils.strip(output).len > 0: cleanOverstrike(output)
+                 else: "(no help for '" & sym & "')"
+  app.status = "Help: " & sym
+
 proc enterBlockEdit(app: AppState; cursorPos: int) =
   let text = app.gtkBuffer.bufferText
   let lines = text.split('\n')
@@ -1631,6 +1672,7 @@ proc exitBlockEdit(app: AppState) =
   gInBlockEdit = false
   gBlockLang = ""
   app.objectsList = @[]
+  app.helpText = ""
   app.status = "Returned to org"
 
 proc toggleBlockEdit(app: AppState; cursorPos: int) =
@@ -1694,6 +1736,12 @@ proc handleKey(app: AppState, keyval: int, ctrl, shift: bool, cursorPos: int): b
   # Ctrl+Enter: send the current src-block line to its language's session.
   if ctrl and (keyval == 0xff0d or keyval == 0xff8d):  # Return / KP_Enter
     app.sendLineToSession(cursorPos)
+    discard app.redraw()
+    return true
+
+  # F1: help for the symbol at the cursor.
+  if keyval == 0xffbe:  # GDK_KEY_F1
+    app.showHelp(cursorPos)
     discard app.redraw()
     return true
 
@@ -1912,15 +1960,25 @@ method view(app: AppState): Widget =
               proc onKeyPress(keyval: int, ctrl, shift: bool, cursorPos: int): bool =
                 app.handleKey(keyval, ctrl, shift, cursorPos)
 
-          # Objects/environment pane -- opens with the C-c ' src-edit environment.
-          ScrolledWindow {.resize: true, shrink: true.}:
-            Box(orient = OrientY):
-              margin = 6
-              if gInBlockEdit:
-                Label(text = "Objects  (" & gBlockLang & ")") {.expand: false.}:
-                  xalign = 0.0
-                for o in app.objectsList:
-                  Label(text = o) {.expand: false.}:
+          # Right column of the src-edit environment: objects (top) / help (bottom).
+          Paned(orient = OrientY) {.resize: true, shrink: true.}:
+            initialPosition = 320
+            ScrolledWindow {.resize: true.}:
+              Box(orient = OrientY):
+                margin = 6
+                if gInBlockEdit:
+                  Label(text = "Objects  (" & gBlockLang & ")") {.expand: false.}:
+                    xalign = 0.0
+                  for o in app.objectsList:
+                    Label(text = o) {.expand: false.}:
+                      xalign = 0.0
+            ScrolledWindow {.resize: true, shrink: true.}:
+              Box(orient = OrientY):
+                margin = 6
+                if gInBlockEdit:
+                  Label(text = "Help  (F1 / palette: Help for symbol)") {.expand: false.}:
+                    xalign = 0.0
+                  Label(text = app.helpText) {.expand: false.}:
                     xalign = 0.0
 
         if app.terminalActive:
@@ -1972,6 +2030,7 @@ proc registerCommands() =
   defcommand("send-line", "Send line to session",
     proc(app: AppState) = app.sendLineToSession(app.gtkBuffer.liveCursorOffset()))
   defcommand("refresh-objects", "Objects: refresh pane", proc(app: AppState) = app.refreshObjects())
+  defcommand("show-help", "Help for symbol at cursor", proc(app: AppState) = app.showHelp(app.gtkBuffer.liveCursorOffset()))
   defcommand("terminal-claude", "Terminal: Claude Code", proc(app: AppState) = app.openTerminalRaw(@["claude"]))
   defcommand("terminal-shell", "Terminal: new shell", proc(app: AppState) = app.openTerminalRaw(@["bash"]))
   defcommand("find", "Find and replace", cmdFind)
