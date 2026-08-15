@@ -15,8 +15,9 @@ export uirelays, synedit, focimsession   # config sees Event/KeyCode/SynEdit/Rep
 
 type
   App* = object
-    ed*, sess*: SynEdit
+    ed*, sess*, objects*, help*: SynEdit
     sessions*: Table[string, Session]     ## key: langId & "/" & sessionName
+    curLang*, curSession*: string         ## the session objects/help track
     font*: Font
     filePath*, msg*: string
     running*: bool
@@ -34,6 +35,8 @@ var
   gKeymap*: Table[string, string]         ## chord (or "C-c C-c") -> command name
   gRepls*: Table[string, ReplSpec]        ## langId -> interpreter spec
   gHooks*: Table[string, seq[Hook]]       ## event name -> hooks
+  gObjectsQuery*: Table[string, string]   ## langId -> code listing the env
+  gHelpQuery*: Table[string, string]      ## langId -> code, {word} substituted
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -90,6 +93,51 @@ proc paletteFiltered*(app: App): seq[(string, string)] =
   for name, c in gCommands:
     if q.len == 0 or q in c.label.toLowerAscii: result.add (name, c.label)
 
+# -- objects / help panes --------------------------------------------------
+proc isWordChar(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
+
+proc wordAtCursor*(app: App): string =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  if line.len == 0: return ""
+  var a = min(app.ed.currentCol, line.len - 1)
+  if not isWordChar(line[a]) and a > 0: dec a   # cursor just past a word
+  if not isWordChar(line[a]): return ""
+  var s = a
+  while s > 0 and isWordChar(line[s - 1]): dec s
+  var e = a
+  while e + 1 < line.len and isWordChar(line[e + 1]): inc e
+  line[s .. e]
+
+proc cleanOverstrike(s: string): string =
+  ## R's Rd2txt renders bold/underline as "X\bX" / "_\bX"; drop the first glyph
+  ## and the backspace, keeping what follows.
+  var i = 0
+  while i < s.len:
+    if i + 1 < s.len and s[i + 1] == '\b': i += 2
+    else: result.add s[i]; inc i
+
+proc refreshObjects*(app: var App) =
+  let lang = (if app.curLang.len > 0: app.curLang else: "r").toLowerAscii
+  if not gObjectsQuery.hasKey(lang):
+    app.objects.setText("(no objects query for " & lang & ")"); return
+  let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
+  if s == nil: app.objects.setText("(no session)"); return
+  let outp = s.runBlock(gObjectsQuery[lang])
+  app.objects.setText("Objects [" & lang & "/" & app.curSession & "]\n" &
+                      (if strutils.strip(outp).len > 0: outp else: "(none)"))
+
+proc showHelp*(app: var App) =
+  let w = wordAtCursor(app)
+  if w.len == 0: app.msg = "no word at cursor"; return
+  let lang = (if app.curLang.len > 0: app.curLang else: "r").toLowerAscii
+  if not gHelpQuery.hasKey(lang):
+    app.help.setText("(no help query for " & lang & ")"); return
+  let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
+  if s == nil: app.help.setText("(no session)"); return
+  let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w)))
+  app.help.setText("Help: " & w & "\n\n" & outp)
+  app.msg = "help: " & w
+
 # -- built-in commands -----------------------------------------------------
 proc dedentBody(lines: seq[string]): string =
   var minIndent = high(int)
@@ -107,12 +155,14 @@ proc dedentBody(lines: seq[string]): string =
 proc runLine*(app: var App) =
   let line = app.ed.getLineText(app.ed.currentLine)
   if strutils.strip(line).len == 0: return
+  app.curLang = "r"; app.curSession = "default"
   let s = getSession(app, "r", "default")
   if s == nil: app.msg = "could not start R (on PATH?)"; return
   let outp = s.runBlock(line)
   app.sess.appendOutput("> " & line & "\n")
   if outp.len > 0: app.sess.appendOutput(outp & "\n")
   app.msg = "ran line"
+  refreshObjects(app)
 
 proc saveCmd*(app: var App) =
   if app.filePath.len > 0:
@@ -152,6 +202,7 @@ proc babelExecute*(app: var App) =
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
+  app.curLang = lang; app.curSession = sessName
   let s = getSession(app, lang, sessName)
   if s == nil: app.msg = "no session for '" & lang & "'"; return
   let outp = s.runBlock(dedentBody(bodyLines))
@@ -179,6 +230,7 @@ proc babelExecute*(app: var App) =
   app.ed.setText(outLines.join("\n"))
   app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1), 0)
   app.msg = "babel: ran " & (if lang.len > 0: lang else: "?") & " block"
+  refreshObjects(app)
   app.runHooks("after-babel")
 
 proc recompileConfig*(app: var App) =
@@ -214,6 +266,23 @@ proc recompileConfig*(app: var App) =
 
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
+
+  gObjectsQuery["r"] =
+    "local({ ns <- ls(envir=.GlobalEnv); " &
+    "if (length(ns)==0) cat('(none)\\n') else " &
+    "for (n in ns) cat(n, '  <', paste(class(get(n, envir=.GlobalEnv)), collapse=','), '>\\n', sep='') })\n"
+  gObjectsQuery["python"] =
+    "print('\\n'.join(f'{k}  <{type(v).__name__}>' " &
+    "for k,v in list(globals().items()) if not k.startswith('_')) or '(none)')\n"
+
+  gHelpQuery["r"] =
+    "local({ h <- tryCatch(utils:::.getHelpFile(as.character(help('{word}'))), " &
+    "error=function(e) NULL); if (is.null(h)) cat('no help for {word}\\n') else tools::Rd2txt(h) })\n"
+  gHelpQuery["python"] =
+    "import pydoc as _pd\n" &
+    "try:\n    print(_pd.render_doc('{word}', renderer=_pd.plaintext))\n" &
+    "except Exception as _e:\n    print('no help for {word}:', _e)\n"
+
   defcommand("save", "Save", saveCmd)
   defcommand("quit", "Quit", quitCmd)
   defcommand("run-line", "Run current line in session", runLine)
@@ -223,8 +292,12 @@ proc registerBuiltins*() =
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
   defcommand("palette", "Command palette", paletteCmd)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
+  defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
+  defcommand("show-help", "Help: for word at cursor", showHelp)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
+  bindkey("C-c o", "refresh-objects")
+  bindkey("F1", "show-help")
   bindkey("C-q", "quit")
   bindkey("C-Enter", "run-line")
   bindkey("C-c C-c", "babel-execute")

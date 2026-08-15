@@ -16,7 +16,12 @@ const fontPath =
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
-const layoutSrc = "(layout (editor) (session (lines 12)) (status (lines 1)))"
+const layoutSrc =
+  "(layout" &
+  "  (cols" &
+  "    (rows (editor (stretch 3)) (session (stretch 2)))" &
+  "    (rows (px 340) (objects (stretch 1)) (help (stretch 1))))" &
+  "  (status (lines 1)))"
 
 proc drawPalette(app: App; area: Rect; lineH: int) =
   let boxW = min(area.w - 80, 620)
@@ -83,7 +88,11 @@ proc main() =
 
   registerBuiltins()
   var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
+                objects: createSynEdit(font), help: createSynEdit(font),
+                curLang: "r", curSession: "default",
                 font: font, running: true, msg: "ready")
+  app.objects.setText("Objects\n(run a block: C-c C-c)\n")
+  app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
     app.filePath = paramStr(1); app.ed.loadFromFile(app.filePath)
   else:
@@ -131,6 +140,12 @@ proc main() =
     if cells.hasKey("session"):
       fillRect(cells["session"], sessBg)
       discard app.sess.draw(noEvent, cells["session"], focused = false)
+    if cells.hasKey("objects"):
+      fillRect(cells["objects"], sessBg)
+      discard app.objects.draw(noEvent, cells["objects"], focused = false)
+    if cells.hasKey("help"):
+      fillRect(cells["help"], sessBg)
+      discard app.help.draw(noEvent, cells["help"], focused = false)
     if cells.hasKey("status"):
       let sr = cells["status"]
       fillRect(sr, statusBg)
