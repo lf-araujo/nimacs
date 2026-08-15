@@ -20,10 +20,11 @@ const layoutSrc = "(layout (editor) (session (lines 12)) (status (lines 1)))"
 type
   App = object
     ed, sess: SynEdit
-    session: Session
+    sessions: Table[string, Session]   ## key: langId & "/" & sessionName
     font: Font
     filePath, msg: string
     running: bool
+    pendingPrefix: string              ## e.g. "C-c" awaiting the next chord
     paletteActive: bool
     paletteQuery: string
     paletteSel: int
@@ -38,16 +39,106 @@ proc defcommand(name, label: string; run: proc(app: var App)) =
   gCommands[name] = Command(label: label, run: run)
 proc bindkey(chord, name: string) = gKeymap[chord] = name
 
+# -- sessions --------------------------------------------------------------
+proc specFor(lang: string): (bool, ReplSpec) =
+  ## Which interpreter drives a given src-block language. Only R for now;
+  ## config-registered specs (bindRepl) will extend this, as in the GTK build.
+  case lang.toLowerAscii
+  of "r", "rscript": (true, rSpec)
+  else: (false, ReplSpec())
+
+proc getSession(app: var App; lang, name: string): Session =
+  let (ok, spec) = specFor(lang)
+  if not ok: return nil
+  let key = lang.toLowerAscii & "/" & name
+  if app.sessions.hasKey(key) and app.sessions[key] != nil:
+    return app.sessions[key]
+  let s = startSession(spec)
+  if s != nil: app.sessions[key] = s
+  s
+
+proc dedentBody(lines: seq[string]): string =
+  ## Strip the common leading whitespace (org src blocks are indented).
+  var minIndent = high(int)
+  for ln in lines:
+    if strutils.strip(ln).len == 0: continue
+    var n = 0
+    while n < ln.len and ln[n] in {' ', '\t'}: inc n
+    minIndent = min(minIndent, n)
+  if minIndent == high(int): minIndent = 0
+  var outl: seq[string]
+  for ln in lines:
+    outl.add (if ln.len >= minIndent: ln[minIndent .. ^1] else: ln)
+  outl.join("\n")
+
 # -- command implementations -----------------------------------------------
 proc runLine(app: var App) =
   let line = app.ed.getLineText(app.ed.currentLine)
   if strutils.strip(line).len == 0: return
-  if app.session == nil: app.session = startSession(rSpec)
-  if app.session == nil: app.msg = "could not start R (on PATH?)"; return
-  let outp = app.session.runBlock(line)
+  let s = getSession(app, "r", "default")
+  if s == nil: app.msg = "could not start R (on PATH?)"; return
+  let outp = s.runBlock(line)
   app.sess.appendOutput("> " & line & "\n")
   if outp.len > 0: app.sess.appendOutput(outp & "\n")
   app.msg = "ran line"
+
+proc babelExecute(app: var App) =
+  ## org-babel C-c C-c: run the src block enclosing the cursor in its
+  ## :session and splice the output back as a #+RESULTS: block.
+  let total = app.ed.getLineCount()
+  let cur = app.ed.currentLine
+  var b = -1
+  var header = ""
+  for i in countdown(cur, 0):
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if low.startsWith("#+begin_src"):
+      b = i; header = strutils.strip(app.ed.getLineText(i)); break
+    if low.startsWith("#+end_src") and i < cur: break   # cursor sits below a block
+  if b < 0: app.msg = "not in a src block"; return
+  var e = -1
+  for i in b + 1 ..< total:
+    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+end_src"):
+      e = i; break
+  if e < 0 or cur > e: app.msg = "not in a src block"; return
+
+  let hdr = strutils.splitWhitespace(header)
+  let lang = if hdr.len >= 2: hdr[1] else: ""
+  var sessName = "default"
+  var k = 2
+  while k < hdr.len:
+    if hdr[k] == ":session" and k + 1 < hdr.len: sessName = hdr[k + 1]
+    inc k
+
+  var bodyLines: seq[string]
+  for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
+  let s = getSession(app, lang, sessName)
+  if s == nil: app.msg = "no session for '" & lang & "'"; return
+  let outp = s.runBlock(dedentBody(bodyLines))
+  app.sess.appendOutput("# " & (if lang.len > 0: lang else: "?") &
+                        " [" & sessName & "]\n" & outp & "\n")
+
+  # find an existing results block right after #+end_src (skip blanks)
+  var p = e + 1
+  while p < total and strutils.strip(app.ed.getLineText(p)).len == 0: inc p
+  var removeTo = e + 1
+  if p < total and strutils.strip(app.ed.getLineText(p)).toLowerAscii.startsWith("#+results:"):
+    inc p
+    while p < total and strutils.strip(app.ed.getLineText(p)).startsWith(":"): inc p
+    removeTo = p
+
+  var outLines: seq[string]
+  for i in 0 .. e: outLines.add app.ed.getLineText(i)
+  outLines.add ""
+  outLines.add "#+RESULTS:"
+  if strutils.strip(outp).len == 0:
+    outLines.add ": "
+  else:
+    for ln in outp.split('\n'): outLines.add ": " & ln
+  for i in removeTo ..< total: outLines.add app.ed.getLineText(i)
+
+  app.ed.setText(outLines.join("\n"))
+  app.ed.gotoLine(min(cur, app.ed.getLineCount() - 1), 0)
+  app.msg = "babel: ran " & (if lang.len > 0: lang else: "?") & " block"
 
 proc saveCmd(app: var App) =
   if app.filePath.len > 0:
@@ -67,13 +158,20 @@ proc registerCommands() =
   defcommand("undo", "Undo", proc(app: var App) = app.ed.undo())
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
   defcommand("palette", "Command palette", paletteCmd)
+  defcommand("babel-execute", "Org-babel: run this src block", babelExecute)
   bindkey("C-s", "save")
   bindkey("C-q", "quit")
   bindkey("C-Enter", "run-line")
+  bindkey("C-c C-c", "babel-execute")
   bindkey("C-/", "comment-toggle")
   bindkey("C-z", "undo")
   bindkey("C-y", "redo")
   bindkey("C-S-p", "palette")
+
+proc isPrefix(chord: string): bool =
+  ## True if `chord` begins a multi-key binding (e.g. "C-c" for "C-c C-c").
+  for k in gKeymap.keys:
+    if k.startsWith(chord & " "): return true
 
 # -- keychords -------------------------------------------------------------
 proc keyName(k: KeyCode): string =
@@ -160,8 +258,13 @@ proc main() =
   if paramCount() >= 1 and fileExists(paramStr(1)):
     app.filePath = paramStr(1); app.ed.loadFromFile(app.filePath)
   else:
-    app.ed.setText("# Ctrl+Enter runs the current line in R. C-S-p: palette.\n\n" &
-                   "x <- c(10, 20, 30)\nmean(x)\nsummary(x)\n")
+    app.ed.setText("#+TITLE: focim scratch\n\n" &
+                   "C-c C-c runs the block below; C-Enter runs one line; C-S-p opens the palette.\n\n" &
+                   "#+begin_src r :session default\n" &
+                   "x <- c(10, 20, 30)\n" &
+                   "mean(x)\n" &
+                   "summary(x)\n" &
+                   "#+end_src\n")
   app.sess.setText("R session -- cursor on a line, Ctrl+Enter to run.\n")
 
   let lay = parseLayout(layoutSrc)
@@ -181,8 +284,17 @@ proc main() =
       handlePalette(app, e); consumed = true
     else:
       let chord = chordOf(e)
-      if chord.len > 0 and gKeymap.hasKey(chord):
-        gCommands[gKeymap[chord]].run(app); consumed = true
+      if chord.len > 0:
+        if app.pendingPrefix.len > 0:                 # completing a prefix seq
+          let full = app.pendingPrefix & " " & chord
+          app.pendingPrefix = ""
+          if gKeymap.hasKey(full): gCommands[gKeymap[full]].run(app)
+          else: app.msg = full & " is unbound"
+          consumed = true
+        elif gKeymap.hasKey(chord):
+          gCommands[gKeymap[chord]].run(app); consumed = true
+        elif isPrefix(chord):
+          app.pendingPrefix = chord; app.msg = chord & "-"; consumed = true
 
     screen = getWindowLayout()
     let cells = resolve(lay, screen.width, screen.height, lineH)
@@ -210,7 +322,7 @@ proc main() =
 
     refresh()
 
-  closeSession(app.session)
+  for s in app.sessions.values: closeSession(s)
   closeFont(font)
 
 when isMainModule:
