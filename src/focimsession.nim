@@ -15,6 +15,7 @@ when not declared(posix_openpt):
 type
   ReplSpec* = object
     argv*: seq[string]
+    env*: seq[(string, string)]   ## extra env for the child (before execv)
     prime*, ready*, run*, quit*: string
   Session* = ref object
     master: cint
@@ -35,6 +36,26 @@ let rSpec* = ReplSpec(
   ready: "cat(paste0(\"NIMACSx\",\"READY\"),\"\\n\")\n",
   run: ".nimacs_run(\"{file}\")\n",
   quit: "q('no')\n")
+
+let pySpec* = ReplSpec(
+  argv: @["python3", "-q", "-u"],
+  env: @[("PYTHON_BASIC_REPL", "1")],   # kill PyREPL's ANSI so the PTY stays clean
+  prime: "import sys as _sys, io as _io, contextlib as _cl, traceback as _tb\n" &
+         "def _nimacs_run(path):\n" &
+         "    print('__NIMACS' '_BOR__')\n" &
+         "    _b=_io.StringIO()\n" &
+         "    try:\n" &
+         "        with _cl.redirect_stdout(_b), _cl.redirect_stderr(_b):\n" &
+         "            exec(compile(open(path).read(),path,'exec'), globals())\n" &
+         "    except Exception:\n" &
+         "        _b.write(_tb.format_exc())\n" &
+         "    print(_b.getvalue(), end='')\n" &
+         "    print('\\n__NIMACS' '_END__')\n" &
+         "    _sys.stdout.flush()\n" &
+         "\n",
+  ready: "print('NIMACS' 'xREADY')\n",
+  run: "_nimacs_run('{file}')\n",
+  quit: "exit()\n")
 
 proc ptyWrite(fd: cint; s: string) =
   var off = 0
@@ -61,6 +82,7 @@ proc startSession*(spec: ReplSpec): Session =
   let pid = fork()
   if pid == 0:
     discard setsid()
+    for (k, v) in spec.env: putEnv(k, v)
     let slave = posix.open(sname.cstring, O_RDWR)
     discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
     if slave > 2: discard close(slave)
