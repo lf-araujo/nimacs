@@ -35,6 +35,7 @@ type
     completionSel*: int
     completionPrefix*: string
     focus*: string                        ## which pane gets keyboard events
+    replInput*: string                    ## the session pane's live prompt line
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -226,6 +227,20 @@ proc runLine*(app: var App) =
   app.sess.appendOutput("> " & line & "\n")
   if outp.len > 0: app.sess.appendOutput(outp & "\n")
   app.msg = "ran line"
+  refreshObjects(app)
+
+proc replSubmit*(app: var App) =
+  ## Run the session pane's prompt line in the current session (the same one the
+  ## blocks use, so state is shared) and echo the result.
+  let line = app.replInput
+  app.replInput = ""
+  if strutils.strip(line).len == 0: return
+  let lang = if app.curLang.len > 0: app.curLang else: "r"
+  let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
+  app.sess.appendOutput(lang & "> " & line & "\n")
+  if s == nil: app.sess.appendOutput("(no " & lang & " session)\n"); return
+  let outp = s.runBlock(line)
+  if outp.len > 0: app.sess.appendOutput(outp & "\n")
   refreshObjects(app)
 
 proc saveCmd*(app: var App) =

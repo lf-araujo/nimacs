@@ -186,12 +186,35 @@ proc main() =
     if not consumed and not app.paletteActive:
       consumed = dispatch(app, e)
 
+    # Session pane as a live REPL: when it has focus, type at the prompt.
+    if not consumed and not app.paletteActive and not app.completionActive and
+       app.focus == "session":
+      case e.kind
+      of KeyDownEvent:
+        if e.key == KeyEnter: replSubmit(app); consumed = true
+        elif e.key == KeyBackspace:
+          if app.replInput.len > 0: app.replInput.setLen(app.replInput.len - 1)
+          consumed = true
+      of TextInputEvent:
+        for ch in e.text:
+          if ch == '\0': break
+          app.replInput.add ch
+        consumed = true
+      else: discard
+
     if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc else: layPlain
     let cells = resolve(lay, screen.width, screen.height, lineH)
+
+    if e.kind == MouseDownEvent:          # click a pane to focus it
+      for nm in ["editor", "session", "objects", "help"]:
+        if cells.hasKey(nm):
+          let r = cells[nm]
+          if e.x >= r.x and e.x < r.x + r.w and e.y >= r.y and e.y < r.y + r.h:
+            app.focus = nm
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
     var editorRect = rect(0, 0, screen.width, screen.height)
@@ -213,8 +236,17 @@ proc main() =
       editorRect = cells["editor"]
       discard app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
     if cells.hasKey("session"):
-      fillRect(cells["session"], sessBg)
-      discard app.sess.draw(evFor("session"), cells["session"], focused = app.focus == "session")
+      let r = cells["session"]
+      fillRect(r, sessBg)
+      let ph = lineH                       # bottom row = live REPL prompt
+      discard app.sess.draw(evFor("session"),
+        rect(r.x, r.y, r.w, max(lineH, r.h - ph)), focused = app.focus == "session")
+      let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
+      let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
+      fillRect(pr, pbg)
+      let caret = if app.focus == "session": "_" else: ""
+      discard drawText(app.font, pr.x + 4, pr.y,
+        app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
