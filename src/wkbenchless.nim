@@ -18,6 +18,12 @@ const fontPath =
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
+when defined(linux):
+  # We're multithreaded (the terminal widget starts a background thread), but
+  # uirelays opens Xlib without XInitThreads(). Under X11/XWayland that wedges
+  # input. Call it before any Xlib use (i.e. before createWindow).
+  proc XInitThreads(): cint {.importc, dynlib: "libX11.so.6".}
+
 const layoutBare =                         # no session yet: just the editor
   "(layout (editor) (divS (px 2)) (status (lines 1)))"
 const layoutPlain =                        # a session exists
@@ -155,6 +161,7 @@ proc dispatch(app: var App; e: Event): bool =
   false
 
 proc main() =
+  when defined(linux): discard XInitThreads()   # before any Xlib call
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
   var metrics, bigMetrics: FontMetrics
