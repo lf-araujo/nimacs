@@ -6,3 +6,5 @@ nimcache/
 \#*\#
 toolchain/
 /wkbenchless
+*.insyncdl
+.~*
