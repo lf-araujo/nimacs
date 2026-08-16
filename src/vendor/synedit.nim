@@ -175,6 +175,7 @@ type
     cacheId: int
     # Rendering
     font: Font
+    bigFont*: Font           ## larger font for org #+title/#+author/* headings
     theme*: Theme
     flags*: set[RenderFlag]
     showLineNumbers*: bool
@@ -2076,7 +2077,7 @@ proc createSynEdit*(font: Font; theme = defaultTheme()): SynEdit =
     selected: (-1, -1), bracketA: -1, bracketB: -1, hotLink: (-1, -1),
     readOnly: -1, tabSize: TabWidth, lang: langNim,
     actionLines: -1, closeLines: -1, closeHover: -1,
-    font: font, theme: theme, flags: {},
+    font: font, bigFont: font, theme: theme, flags: {},
     showLineNumbers: false, cursorVisible: true, lastBlinkTick: 0)
   # A subtle block tint: nudge the bg toward mid-gray (works on dark and light).
   proc nudge(v: uint8): uint8 =
@@ -2590,6 +2591,17 @@ proc scrollGrip(s: SynEdit; area: Rect; lineH: int): Rect =
   result = rect(area.x + area.w - ScrollBarWidth, gripY,
                 ScrollBarWidth - 2, gripH)
 
+proc isBigOrgLine(s: SynEdit; i: int): bool =
+  ## org #+title / #+author / top-level headings render in bigFont.
+  if s.lang != langOrg: return false
+  var t = ""
+  var j = i
+  while j < s.len and s[j] != '\L' and t.len < 12:
+    t.add s[j]; inc j
+  let ls = t.strip(leading = true, trailing = false).toLowerAscii
+  result = ls.startsWith("#+title") or ls.startsWith("#+author") or
+           (ls.len > 0 and ls[0] == '*')
+
 proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   ## Core rendering. Paints the buffer, optionally with a blinking cursor.
   let lineH = fontLineSkip(s.font)
@@ -2652,7 +2664,10 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     let closeLine = s.closeLines >= 0 and thisLine >= s.closeLines
     let lineY = dim.y
     let lineStart = i
+    let savedFont = s.font
+    if isBigOrgLine(s, i): s.font = s.bigFont   # taller row, bigger glyphs
     i = s.drawTextLine(i, dim, blink)
+    s.font = savedFont
     if actionLine or closeLine:
       # Drawn after the text, so the per-token backgrounds cannot paint over
       # the frame's top and bottom edges -- and so the button occludes a

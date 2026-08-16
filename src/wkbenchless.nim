@@ -156,17 +156,20 @@ proc dispatch(app: var App; e: Event): bool =
 proc main() =
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
-  var metrics: FontMetrics
+  var metrics, bigMetrics: FontMetrics
   var fontSize = 15
   var font = openFont(fontPath, fontSize, metrics)
+  var bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)   # ~1.5x
   var lineH = metrics.lineHeight
 
   registerBuiltins()
   var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
                 objects: createSynEdit(font), help: createSynEdit(font),
                 curLang: "r", curSession: "default", focus: "editor",
-                font: font, fontSize: fontSize, running: true, msg: "ready")
+                font: font, bigFont: bigFont, fontSize: fontSize,
+                running: true, msg: "ready")
   app.ed.showLineNumbers = true
+  app.ed.bigFont = bigFont
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
@@ -243,14 +246,16 @@ proc main() =
     if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
 
-    if app.fontSize != fontSize:                 # zoom: re-open the font
+    if app.fontSize != fontSize:                 # zoom: re-open the fonts
       fontSize = app.fontSize
       font = openFont(fontPath, fontSize, metrics)
+      bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)
       lineH = metrics.lineHeight
-      app.font = font
+      app.font = font; app.bigFont = bigFont
       app.ed.setFont(font); app.sess.setFont(font)
       app.objects.setFont(font); app.help.setFont(font)
-      for b in app.buffers.mitems: b.ed.setFont(font)
+      app.ed.bigFont = bigFont
+      for b in app.buffers.mitems: b.ed.setFont(font); b.ed.bigFont = bigFont
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc

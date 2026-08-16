@@ -23,6 +23,7 @@ type
     docLang*: string                      ## the buffer's LSP languageId ("" = none)
     lsp*: Table[string, LspClient]        ## langId -> language server
     font*: Font
+    bigFont*: Font                        ## larger font for org headers/headings
     fontSize*: int                        ## desired editor font size (host applies)
     filePath*, msg*: string
     running*: bool
@@ -156,6 +157,7 @@ proc openFile*(app: var App; path: string) =
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
   ed.showLineNumbers = true
+  ed.bigFont = app.bigFont
   let ext = splitFile(path).ext
   ed.lang = fileExtToLanguage(ext)
   try: ed.loadFromFile(path)
