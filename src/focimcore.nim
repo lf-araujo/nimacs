@@ -8,16 +8,19 @@
 import uirelays
 import widgets/synedit
 import focimsession
+import nimacs/lsp                    # pure std/json LSP client -- portable, no GTK
 import std/[tables, strutils, os, osproc]
 when defined(posix): import std/posix
 
-export uirelays, synedit, focimsession   # config sees Event/KeyCode/SynEdit/ReplSpec/...
+export uirelays, synedit, focimsession, lsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
 
 type
   App* = object
     ed*, sess*, objects*, help*: SynEdit
     sessions*: Table[string, Session]     ## key: langId & "/" & sessionName
     curLang*, curSession*: string         ## the session objects/help track
+    docLang*: string                      ## the buffer's LSP languageId ("" = none)
+    lsp*: Table[string, LspClient]        ## langId -> language server
     font*: Font
     filePath*, msg*: string
     running*: bool
@@ -25,6 +28,10 @@ type
     paletteActive*: bool
     paletteQuery*: string
     paletteSel*: int
+    completionActive*: bool
+    completionItems*: seq[string]
+    completionSel*: int
+    completionPrefix*: string
   Command* = object
     label*: string
     run*: proc(app: var App)
@@ -38,6 +45,7 @@ var
   gObjectsQuery*: Table[string, string]   ## langId -> code listing the env
   gHelpQuery*: Table[string, string]      ## langId -> code, {word} substituted
   gRebuildCmd*: string                    ## shell command C-c r runs to rebuild
+  gLspServers*: Table[string, string]     ## langId -> server command (argv, space-split)
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -138,6 +146,51 @@ proc showHelp*(app: var App) =
   let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w)))
   app.help.setText("Help: " & w & "\n\n" & outp)
   app.msg = "help: " & w
+
+# -- LSP completion --------------------------------------------------------
+proc prefixBeforeCursor(app: App): string =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  let upto = min(app.ed.currentCol, line.len)
+  var s = upto
+  while s > 0 and isWordChar(line[s - 1]): dec s
+  line[s ..< upto]
+
+proc getLspClient*(app: var App; lang: string): LspClient =
+  let key = lang.toLowerAscii
+  if app.lsp.hasKey(key) and app.lsp[key] != nil: return app.lsp[key]
+  if not gLspServers.hasKey(key): return nil
+  let root = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+  let c = startLsp(gLspServers[key], uriOf(root))
+  if c != nil: app.lsp[key] = c
+  c
+
+proc lspComplete*(app: var App) =
+  if app.docLang.len == 0:
+    app.msg = "no LSP language (open a source file)"; return
+  let c = getLspClient(app, app.docLang)
+  if c == nil:
+    app.msg = "no LSP server for " & app.docLang & " (not installed?)"; return
+  let uri = if app.filePath.len > 0: uriOf(app.filePath) else: "file:///focim-scratch"
+  c.syncDoc(uri, app.docLang, app.ed.fullText())
+  let items = c.completion(uri, app.ed.currentLine, app.ed.currentCol)
+  if items.len == 0: app.msg = "no completions"; return
+  let pre = prefixBeforeCursor(app)
+  var filtered: seq[string]
+  for it in items:
+    if pre.len == 0 or it.toLowerAscii.startsWith(pre.toLowerAscii): filtered.add it
+  app.completionItems = if filtered.len > 0: filtered else: items
+  app.completionPrefix = pre
+  app.completionSel = 0
+  app.completionActive = true
+  app.msg = $app.completionItems.len & " completions"
+
+proc completionAccept*(app: var App) =
+  app.completionActive = false
+  if app.completionSel < 0 or app.completionSel >= app.completionItems.len: return
+  let label = app.completionItems[app.completionSel]
+  for _ in 0 ..< app.completionPrefix.len: app.ed.backspace(false)
+  app.ed.insertText(label)
+  app.msg = "inserted " & label
 
 # -- built-in commands -----------------------------------------------------
 proc dedentBody(lines: seq[string]): string =
@@ -288,6 +341,10 @@ proc registerBuiltins*() =
   gRepls["r"] = rSpec
   gRebuildCmd = detectRebuildCmd()   # config may override before first C-c r
 
+  gLspServers["nim"] = "nimlangserver"
+  gLspServers["python"] = "pylsp"
+  gLspServers["r"] = "R --no-echo -e languageserver::run()"
+
   gObjectsQuery["r"] =
     "local({ ns <- ls(envir=.GlobalEnv); " &
     "if (length(ns)==0) cat('(none)\\n') else " &
@@ -315,10 +372,12 @@ proc registerBuiltins*() =
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
+  defcommand("complete", "LSP: complete at cursor", lspComplete)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
   bindkey("F1", "show-help")
+  bindkey("C-Space", "complete")
   bindkey("C-q", "quit")
   bindkey("C-Enter", "run-line")
   bindkey("C-c C-c", "babel-execute")

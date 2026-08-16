@@ -23,6 +23,17 @@ const layoutSrc =
   "    (rows (px 340) (objects (stretch 1)) (help (stretch 1))))" &
   "  (status (lines 1)))"
 
+proc langIdOf(ext: string): string =
+  ## The LSP languageId for a file extension ("" = none).
+  case ext.toLowerAscii
+  of ".nim", ".nims": "nim"
+  of ".py", ".pyw": "python"
+  of ".r": "r"
+  of ".c", ".h": "c"
+  of ".cpp", ".cxx", ".hpp": "cpp"
+  of ".js": "javascript"
+  else: ""
+
 proc drawPalette(app: App; area: Rect; lineH: int) =
   let boxW = min(area.w - 80, 620)
   let bx = area.x + (area.w - boxW) div 2
@@ -62,6 +73,35 @@ proc handlePalette(app: var App; e: Event) =
       app.paletteQuery.add ch
     app.paletteSel = 0
 
+proc drawCompletion(app: App; area: Rect; lineH: int) =
+  let rows = min(app.completionItems.len, 8)
+  if rows == 0: return
+  var chars = 8
+  for i in 0 ..< rows: chars = max(chars, app.completionItems[i].len)
+  let w = min(chars * (lineH div 2 + 1) + 16, area.w - 40)
+  let bx = area.x + 24
+  let by = area.y + 24
+  let boxBg = color(40, 44, 52)
+  fillRect(rect(bx, by, w, rows * lineH + 8), boxBg)
+  var y = by + 4
+  for i in 0 ..< rows:
+    let rowBg = if i == app.completionSel: color(60, 72, 96) else: boxBg
+    fillRect(rect(bx + 2, y, w - 4, lineH), rowBg)
+    discard drawText(app.font, bx + 6, y, app.completionItems[i], color(222, 222, 222), rowBg)
+    y += lineH
+
+proc handleCompletion(app: var App; e: Event): bool =
+  ## Returns true if consumed. On a non-navigation key it dismisses the popup
+  ## and returns false so the key reaches the editor.
+  if e.kind != KeyDownEvent: return false
+  case e.key
+  of KeyEsc: app.completionActive = false; true
+  of KeyEnter, KeyTab: completionAccept(app); true
+  of KeyUp: app.completionSel = max(0, app.completionSel - 1); true
+  of KeyDown:
+    app.completionSel = min(app.completionItems.len - 1, app.completionSel + 1); true
+  else: app.completionActive = false; false
+
 proc dispatch(app: var App; e: Event): bool =
   ## Route a key through the keymap (with prefix-sequence support). Returns
   ## true if the event was consumed by a command/prefix.
@@ -95,6 +135,9 @@ proc main() =
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
     app.filePath = paramStr(1); app.ed.loadFromFile(app.filePath)
+    let ext = splitFile(app.filePath).ext
+    app.ed.lang = fileExtToLanguage(ext)   # SynEdit's built-in highlighter
+    app.docLang = langIdOf(ext)            # for LSP
   else:
     app.ed.setText("#+TITLE: focim scratch\n\n" &
                    "C-c C-c runs the block; C-Enter runs a line; C-S-p opens the palette.\n\n" &
@@ -126,7 +169,9 @@ proc main() =
     var consumed = false
     if app.paletteActive:
       handlePalette(app, e); consumed = true
-    else:
+    elif app.completionActive:
+      consumed = handleCompletion(app, e)
+    if not consumed and not app.paletteActive:
       consumed = dispatch(app, e)
 
     screen = getWindowLayout()
@@ -156,12 +201,15 @@ proc main() =
         $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) & "   " & app.msg,
         statusFg, statusBg)
 
+    if app.completionActive:
+      drawCompletion(app, editorRect, lineH)
     if app.paletteActive:
       drawPalette(app, editorRect, lineH)
 
     refresh()
 
   for s in app.sessions.values: closeSession(s)
+  for c in app.lsp.values: shutdownLsp(c)
   closeFont(font)
 
 when isMainModule:
