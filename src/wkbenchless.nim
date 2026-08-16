@@ -24,9 +24,9 @@ const layoutPlain =                        # a session exists
 const layoutSrc =                          # the 4-quadrant src-edit env
   "(layout" &
   "  (cols" &
-  "    (rows (stretch 4) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
+  "    (rows (stretch 3) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
   "    (divV (px 2))" &
-  "    (rows (stretch 1) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
+  "    (rows (stretch 7) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
   "  (divS (px 2))" &
   "  (status (lines 1)))"
 
