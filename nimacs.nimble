@@ -22,3 +22,8 @@ task focim, "Build the uirelays (native, cross-platform) nimacs":
 
 task focimrun, "Build and run the uirelays nimacs":
   exec "nim c -r -o:focim src/focim.nim"
+
+task bundle, "Bundle a self-contained toolchain (Nim + zig) for focim's C-c r":
+  # Pass the zig path after `--`, e.g.  nimble bundle -- /opt/zig/zig
+  let zig = if paramCount() >= 3: paramStr(paramCount()) else: ""
+  exec "bash scripts/bundle-toolchain.sh " & zig

@@ -37,6 +37,7 @@ var
   gHooks*: Table[string, seq[Hook]]       ## event name -> hooks
   gObjectsQuery*: Table[string, string]   ## langId -> code listing the env
   gHelpQuery*: Table[string, string]      ## langId -> code, {word} substituted
+  gRebuildCmd*: string                    ## shell command C-c r runs to rebuild
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -233,6 +234,24 @@ proc babelExecute*(app: var App) =
   refreshObjects(app)
   app.runHooks("after-babel")
 
+proc detectRebuildCmd*(): string =
+  ## The command C-c r runs to rebuild focim. Prefer a toolchain bundled under
+  ## <appdir>/toolchain so hot-reload needs no system compiler: a Nim under
+  ## toolchain/nim/bin (it finds its own stdlib beside it) and, if present, zig
+  ## as the hermetic C backend (single binary, ships its own libc, cross-
+  ## compiles -- the user's pick over tcc). Falls back to the system `nim`.
+  let base = "c --hints:off -o:focim src/focim.nim"
+  let dir = getAppDir()
+  let bnim = dir / "toolchain" / "nim" / "bin" / "nim"
+  let bzig = dir / "toolchain" / "zig" / "zig"
+  let nimExe = if fileExists(bnim): bnim.quoteShell else: "nim"
+  if fileExists(bzig):
+    let cc = (bzig & " cc").quoteShell     # Nim drives zig as a clang-alike
+    result = nimExe & " " & "--cc:clang --clang.exe:" & cc &
+             " --clang.linkerexe:" & cc & " " & base
+  else:
+    result = nimExe & " " & base
+
 proc recompileConfig*(app: var App) =
   ## Hot-reload the config the honest way for compiled Nim (the xmonad model):
   ## rebuild the binary -- which recompiles focimconfig.nim with it -- and, on
@@ -244,10 +263,11 @@ proc recompileConfig*(app: var App) =
   else:
     app.msg = "recompiling..."
     let dir = getAppDir()
-    let (outp, code) = execCmdEx("nim c --hints:off -o:focim src/focim.nim",
-                                 workingDir = dir)
+    if gRebuildCmd.len == 0: gRebuildCmd = detectRebuildCmd()
+    let (outp, code) = execCmdEx(gRebuildCmd, workingDir = dir)
     if code != 0:
-      app.sess.appendOutput("-- recompile FAILED --\n" & outp & "\n")
+      app.sess.appendOutput("-- recompile FAILED --\n$ " & gRebuildCmd & "\n" &
+                            outp & "\n")
       app.msg = "recompile failed (see session pane)"
       return
     # persist the buffer so edits survive the exec
@@ -266,6 +286,7 @@ proc recompileConfig*(app: var App) =
 
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
+  gRebuildCmd = detectRebuildCmd()   # config may override before first C-c r
 
   gObjectsQuery["r"] =
     "local({ ns <- ls(envir=.GlobalEnv); " &
