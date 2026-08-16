@@ -44,7 +44,9 @@ proc configure*(app: var App) =
   bindkey("C--", "zoom-out")
   bindkey("C-0", "zoom-reset")
   bindkey("C-c C-o", "open-link")       # open org link at cursor
-  bindkey("C-c a", "claude")            # launch claude in a terminal
+  bindkey("C-c a", "claude")            # claude/terminal in the bottom panel (prefix)
+  bindkey("M-t", "terminal")            # bash terminal -- SIMPLE non-prefix key
+  bindkey("F2", "terminal")             # another simple key to test
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.
