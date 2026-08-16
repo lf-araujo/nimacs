@@ -165,6 +165,7 @@ proc main() =
                 objects: createSynEdit(font), help: createSynEdit(font),
                 curLang: "r", curSession: "default", focus: "editor",
                 font: font, running: true, msg: "ready")
+  app.ed.showLineNumbers = true
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):

@@ -154,6 +154,7 @@ proc openFile*(app: var App; path: string) =
   for i, b in app.buffers:
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
+  ed.showLineNumbers = true
   let ext = splitFile(path).ext
   ed.lang = fileExtToLanguage(ext)
   try: ed.loadFromFile(path)

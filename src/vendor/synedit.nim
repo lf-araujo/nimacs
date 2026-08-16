@@ -205,6 +205,10 @@ type
     scrollGrabOffset: int
     # Highlighting
     highlighter: Indexer
+    # org src-block shading: char ranges to paint with srcBlockBg (set by
+    # highlightOrg, read by getBg). Emulates the GTK version's shaded blocks.
+    srcBlockRanges: seq[Slice[int]]
+    srcBlockBg*: Color
     # Markers (search results, etc.)
     markers: seq[Marker]
     # Line decorations (breakpoints, active execution line, etc.)
@@ -997,6 +1001,8 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
   ## carries the in-block state that a per-token tokenizer cannot.
   var insideBlock = false
   var blockLang = langNone
+  var blockStart = first
+  s.srcBlockRanges.setLen(0)             # org calls this full-buffer, so rebuild
   var pos = first
   while pos > 0 and s[pos-1] != '\L': dec pos
   while pos <= last:
@@ -1012,8 +1018,10 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       let parts = stripped.splitWhitespace()
       blockLang = if parts.len >= 2: strToLanguage(parts[1]) else: langNone
       insideBlock = true
+      blockStart = lineStart
     elif ls.startsWith("#+end_src"):
       for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, TokenClass.Directive)
+      if insideBlock: s.srcBlockRanges.add(blockStart .. lineEnd)
       insideBlock = false; blockLang = langNone
     elif insideBlock and blockLang != langNone:
       var g: GeneralTokenizer
@@ -1041,6 +1049,7 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, tc)
       if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.Whitespace)
     pos = lineEnd + 1
+  if insideBlock: s.srcBlockRanges.add(blockStart .. last)   # unterminated block
 
 proc highlightEverything(s: var SynEdit) =
   if s.lang == langNone: return
@@ -2069,6 +2078,10 @@ proc createSynEdit*(font: Font; theme = defaultTheme()): SynEdit =
     actionLines: -1, closeLines: -1, closeHover: -1,
     font: font, theme: theme, flags: {},
     showLineNumbers: false, cursorVisible: true, lastBlinkTick: 0)
+  # A subtle block tint: nudge the bg toward mid-gray (works on dark and light).
+  proc nudge(v: uint8): uint8 =
+    (if v.int < 128: min(255, v.int + 12) else: max(0, v.int - 12)).uint8
+  result.srcBlockBg = color(nudge(theme.bg.r), nudge(theme.bg.g), nudge(theme.bg.b))
 
 # ---------------------------------------------------------------------------
 # Drawing
@@ -2216,6 +2229,8 @@ proc getBg(s: SynEdit; i: int): Color =
   if i == s.bracketA or i == s.bracketB: return s.theme.bracketBg
   for m in s.markers:
     if m.a <= i and i <= m.b: return m.color
+  for r in s.srcBlockRanges:
+    if i in r: return s.srcBlockBg
   return s.theme.bg
 
 proc underline*(s: var SynEdit; a, b: int) =
