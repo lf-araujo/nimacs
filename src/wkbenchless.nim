@@ -228,6 +228,11 @@ proc main() =
         # also emit (e.g. M-x -> 'x', C-c e -> 'e') so it isn't typed anywhere.
         if e.kind == KeyDownEvent: suppressText = true
 
+    # Vim modal editing (after commands, so bound chords still work).
+    if not consumed and app.vimEnabled and app.focus == "editor" and
+       not app.paletteActive and not app.completionActive:
+      consumed = vimHandle(app, e)
+
     # Session pane as a live REPL: when it has focus, type at the prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
        app.focus == "session":
@@ -333,10 +338,14 @@ proc main() =
       fillRect(sr, statusBg)
       let name = if app.filePath.len > 0: extractFilename(app.filePath) else: "*scratch*"
       let dirty = if app.ed.changed: " [+]" else: ""
+      let vimTag =
+        if not app.vimEnabled: ""
+        elif app.vimMode == vmInsert: "-- INSERT --   "
+        else: "-- NORMAL --   "
       discard drawText(app.font, sr.x + 6, sr.y,
-        "  wkbenchless   " & name & dirty & "   " &
+        "  wkbenchless   " & vimTag & name & dirty & "   " &
         $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
-        "   m:" & $lastMouse.x & "," & $lastMouse.y & "   " & app.msg,
+        "   " & app.msg,
         statusFg, statusBg)
 
     if app.completionActive:

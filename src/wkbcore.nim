@@ -43,6 +43,9 @@ type
     completionPrefix*: string
     focus*: string                        ## which pane gets keyboard events
     replInput*: string                    ## the session pane's live prompt line
+    vimEnabled*: bool                     ## modal (vim) editing
+    vimMode*: VimMode
+    vimPending*: string                   ## pending operator/prefix (d, g, y)
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -55,6 +58,7 @@ type
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
   PaletteMode* = enum pmCommands, pmBuffers, pmFiles
+  VimMode* = enum vmNormal, vmInsert
   BufferState* = object
     ed*: SynEdit
     filePath*, docLang*: string
@@ -720,6 +724,143 @@ proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
 
+# -- vim mode --------------------------------------------------------------
+proc vimGoto(app: var App; line, col: int) =
+  let ln = clamp(line, 0, max(0, app.ed.getLineCount() - 1))
+  let ll = app.ed.getLineText(ln).len
+  app.ed.gotoLine(ln, clamp(col, 0, ll))
+
+proc vimMove(app: var App; dLine, dCol: int) =
+  vimGoto(app, app.ed.currentLine + dLine, app.ed.currentCol + dCol)
+
+proc vimFirstNonBlank(app: var App) =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  var i = 0
+  while i < line.len and line[i] in {' ', '\t'}: inc i
+  vimGoto(app, app.ed.currentLine, i)
+
+proc vimToEol(app: var App; append = false) =
+  let ll = app.ed.getLineText(app.ed.currentLine).len
+  vimGoto(app, app.ed.currentLine, if append: ll else: max(0, ll - 1))
+
+proc isVimWord(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_'}
+
+proc vimWordForward(app: var App) =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  var i = app.ed.currentCol
+  if i < line.len and isVimWord(line[i]):
+    while i < line.len and isVimWord(line[i]): inc i
+  while i < line.len and line[i] in {' ', '\t'}: inc i
+  if i >= line.len and app.ed.currentLine < app.ed.getLineCount() - 1:
+    vimGoto(app, app.ed.currentLine + 1, 0)
+  else:
+    vimGoto(app, app.ed.currentLine, i)
+
+proc vimWordBackward(app: var App) =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  var i = app.ed.currentCol - 1
+  while i > 0 and line[i] in {' ', '\t'}: dec i
+  while i > 0 and isVimWord(line[i - 1]): dec i
+  vimGoto(app, app.ed.currentLine, max(0, i))
+
+proc vimDeleteN(app: var App; n: int) =
+  for _ in 0 ..< max(0, n): app.ed.deleteKey()
+
+proc vimDeleteToEol(app: var App) =
+  vimDeleteN(app, app.ed.getLineText(app.ed.currentLine).len - app.ed.currentCol)
+
+proc vimDeleteWord(app: var App) =
+  let line = app.ed.getLineText(app.ed.currentLine)
+  var i = app.ed.currentCol
+  if i < line.len and isVimWord(line[i]):
+    while i < line.len and isVimWord(line[i]): inc i
+  while i < line.len and line[i] in {' ', '\t'}: inc i
+  vimDeleteN(app, i - app.ed.currentCol)
+
+proc vimYankLine(app: var App) =
+  putClipboardText(app.ed.getLineText(app.ed.currentLine) & "\n")
+
+proc vimNormalChar(app: var App; c: char) =
+  case app.vimPending
+  of "d":
+    app.vimPending = ""
+    case c
+    of 'd': vimYankLine(app); app.ed.deleteLine()
+    of 'w': vimDeleteWord(app)
+    of '$': vimDeleteToEol(app)
+    else: discard
+    return
+  of "g":
+    app.vimPending = ""
+    if c == 'g': vimGoto(app, 0, 0)
+    return
+  of "y":
+    app.vimPending = ""
+    if c == 'y': vimYankLine(app)
+    return
+  else: discard
+  case c
+  of 'h': vimMove(app, 0, -1)
+  of 'l': vimMove(app, 0, 1)
+  of 'j': vimMove(app, 1, 0)
+  of 'k': vimMove(app, -1, 0)
+  of 'w': vimWordForward(app)
+  of 'b': vimWordBackward(app)
+  of '0': vimGoto(app, app.ed.currentLine, 0)
+  of '$': vimToEol(app)
+  of '^': vimFirstNonBlank(app)
+  of 'G': vimGoto(app, app.ed.getLineCount() - 1, 0)
+  of 'g': app.vimPending = "g"
+  of 'd': app.vimPending = "d"
+  of 'y': app.vimPending = "y"
+  of 'D': vimDeleteToEol(app)
+  of 'x': app.ed.deleteKey()
+  of 'i': app.vimMode = vmInsert
+  of 'I': vimFirstNonBlank(app); app.vimMode = vmInsert
+  of 'a': vimMove(app, 0, 1); app.vimMode = vmInsert
+  of 'A': vimToEol(app, append = true); app.vimMode = vmInsert
+  of 'o': app.ed.insertLineBelow(); app.vimMode = vmInsert
+  of 'O': app.ed.insertLineAbove(); app.vimMode = vmInsert
+  of 'u': app.ed.undo()
+  of 'p': app.ed.insertText(getClipboardText())
+  else: discard
+
+proc vimHandle*(app: var App; e: Event): bool =
+  ## True if consumed. Insert mode consumes only Esc (typing flows to the
+  ## editor); normal mode consumes everything.
+  if app.vimMode == vmInsert:
+    if e.kind == KeyDownEvent and e.key == KeyEsc:
+      app.vimMode = vmNormal
+      vimGoto(app, app.ed.currentLine, max(0, app.ed.currentCol - 1))
+      return true
+    return false
+  case e.kind
+  of TextInputEvent:
+    var c = '\0'
+    for ch in e.text:
+      if ch != '\0': c = ch; break
+    if c != '\0': vimNormalChar(app, c)
+    return true
+  of KeyDownEvent:
+    case e.key
+    of KeyEsc: app.vimPending = ""
+    of KeyLeft: vimMove(app, 0, -1)
+    of KeyRight: vimMove(app, 0, 1)
+    of KeyUp: vimMove(app, -1, 0)
+    of KeyDown, KeyEnter: vimMove(app, 1, 0)
+    of KeyBackspace: vimMove(app, 0, -1)
+    of KeyR:
+      if CtrlPressed in e.mods: app.ed.redo()
+    else: discard
+    return true
+  else: return false
+
+proc toggleVim*(app: var App) =
+  app.vimEnabled = not app.vimEnabled
+  app.vimMode = vmNormal
+  app.vimPending = ""
+  app.msg = "vim mode " & (if app.vimEnabled: "on (NORMAL)" else: "off")
+
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
   gRepls["python"] = pySpec
@@ -762,6 +903,7 @@ proc registerBuiltins*() =
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
+  defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)

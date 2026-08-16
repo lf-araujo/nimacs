@@ -1673,7 +1673,7 @@ proc backspace*(s: var SynEdit; smartIndent: bool) =
     s.removeSelectedText()
   s.cursorMoved()
 
-proc deleteKey(s: var SynEdit) =
+proc deleteKey*(s: var SynEdit) =
   if s.selected.b < 0:
     if s.cursor >= s.len: return
     let L = s.lastRuneLen(s.cursor.int + 1)
