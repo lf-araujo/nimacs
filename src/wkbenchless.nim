@@ -1,14 +1,15 @@
-## nimacs on uirelays (the "focim" branch): a pure-Nim, custom-rendered editor
-## targeting Windows/macOS/Linux. The GTK version (nimacs.nim) stays on main.
+## wkbenchless: a pure-Nim, custom-rendered literate editor (org-babel + LSP +
+## interactive sessions) on uirelays, targeting Windows/macOS/Linux. A native,
+## deeply Nim-configurable "workbench-less" alternative to heavier IDEs.
 ##
 ## This module is the HOST: it owns the window, fonts, the NIF layout and the
-## main event loop. The editor model lives in focimcore (shared with user
-## config); focimconfig is the user's own Nim configuration.
+## main event loop. The editor model lives in wkbcore (shared with user
+## config); wkbconfig is the user's own Nim configuration.
 
 import uirelays
 import uirelays/layout
-import focimcore
-import focimconfig
+import wkbcore
+import wkbconfig
 import std/[os, tables, strutils]
 
 const fontPath =
@@ -133,7 +134,7 @@ proc dispatch(app: var App; e: Event): bool =
 
 proc main() =
   var screen = createWindow(960, 700)
-  setWindowTitle("nimacs (focim)")
+  setWindowTitle("wkbenchless")
   var metrics: FontMetrics
   let font = openFont(fontPath, 15, metrics)
   let lineH = metrics.lineHeight
@@ -152,7 +153,7 @@ proc main() =
     app.docLang = langIdOf(ext)            # for LSP
     app.ed.loadFromFile(app.filePath)
   else:
-    app.ed.setText("#+TITLE: focim scratch\n\n" &
+    app.ed.setText("#+TITLE: wkbenchless scratch\n\n" &
                    "C-c C-c runs the block; C-Enter runs a line; M-x opens the palette.\n" &
                    "C-c k opens a terminal; C-c s switches session; C-c n cycles focus.\n\n" &
                    "#+begin_src r :session default\n" &
@@ -165,7 +166,7 @@ proc main() =
       try: app.ed.gotoLine(parseInt(paramStr(i + 1)), 0)
       except ValueError: discard
 
-  configure(app)            # user config (focimconfig.nim) -- full-typed, no ABI
+  configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
   app.runHooks("startup")
 
   let layBare = parseLayout(layoutBare)
@@ -292,7 +293,7 @@ proc main() =
       let name = if app.filePath.len > 0: extractFilename(app.filePath) else: "*scratch*"
       let dirty = if app.ed.changed: " [+]" else: ""
       discard drawText(app.font, sr.x + 6, sr.y,
-        "  focim   " & name & dirty & "   " &
+        "  wkbenchless   " & name & dirty & "   " &
         $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
         "   m:" & $lastMouse.x & "," & $lastMouse.y & "   " & app.msg,
         statusFg, statusBg)

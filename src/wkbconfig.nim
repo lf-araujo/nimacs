@@ -1,18 +1,18 @@
-## focim user configuration -- plain Nim with full access to the editor model.
+## wkbenchless user configuration -- plain Nim with full access to the editor model.
 ## This is the "deep ABI": no GObject/.so boundary like the GTK build needed.
 ## A command is a Nim proc; a keybinding or a language is data; a hook is a proc
-## that fires at an editor event. Edit this file and press C-c r inside focim
+## that fires at an editor event. Edit this file and press C-c r inside wkbenchless
 ## (command "recompile") -- it rebuilds the binary, which recompiles THIS file,
-## and re-execs, restoring your file and cursor. (`nimble focim` also works.)
+## and re-execs, restoring your file and cursor. (`nimble wkbenchless` also works.)
 ## The host calls `configure(app)` once, after the built-ins load.
 
-import focimcore
+import wkbcore
 import std/times
 
 proc configure*(app: var App) =
   # ---- Keymap ---------------------------------------------------------------
   # Every default binding lives here so you can see and change them all. The
-  # command names come from focimcore's registerBuiltins (run M-x to browse
+  # command names come from wkbcore's registerBuiltins (run M-x to browse
   # them). Rebind, remove, or add freely, then C-c r to apply. (M-x and C-q are
   # also set in core as a recovery net.) Note: Shift+letter chords don't reach
   # the X11 driver, so the palette is M-x, not C-S-p.
@@ -45,12 +45,12 @@ proc configure*(app: var App) =
     a.msg = "inserted date")
   bindkey("C-c d", "insert-date")
 
-  # Teach focim a new language: Python org-babel :session blocks.
+  # Teach wkbenchless a new language: Python org-babel :session blocks.
   registerRepl("python", pySpec)
 
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
   #    note after every babel run.
   addHook("startup", proc(a: var App) =
-    a.msg = "focim ready -- config loaded")
+    a.msg = "wkbenchless ready -- config loaded")
   addHook("after-babel", proc(a: var App) =
     a.sess.appendOutput("-- (after-babel hook) --\n"))

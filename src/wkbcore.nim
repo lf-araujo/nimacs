@@ -1,18 +1,18 @@
-## focim core: the editor model that user config can touch DIRECTLY -- the point
-## of the pure-Nim rewrite. There is no ABI boundary: the host (focim.nim) does
-## rendering, the user config (focimconfig.nim) imports this module and calls
+## wkbenchless core: the editor model that user config can touch DIRECTLY -- the point
+## of the pure-Nim rewrite. There is no ABI boundary: the host (wkbenchless.nim) does
+## rendering, the user config (wkbconfig.nim) imports this module and calls
 ## defcommand / bindkey / registerRepl / addHook against the exact same App and
 ## SynEdit types the host uses. Commands are Nim procs; keys and languages are
 ## data; hooks fire at editor events.
 
 import uirelays
 import vendor/synedit          # our patched copy of uirelays' SynEdit (adds langR/langOrg)
-import focimsession
-import nimacs/lsp                    # pure std/json LSP client -- portable, no GTK
+import wkbsession
+import wkblsp                    # pure std/json LSP client -- portable, no GTK
 import std/[tables, strutils, os, osproc, algorithm]
 when defined(posix): import std/posix
 
-export uirelays, synedit, focimsession, lsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
+export uirelays, synedit, wkbsession, wkblsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
   # `synedit` above is src/vendor/synedit
 
 type
@@ -181,7 +181,7 @@ proc lspComplete*(app: var App) =
   let c = getLspClient(app, app.docLang)
   if c == nil:
     app.msg = "no LSP server for " & app.docLang & " (not installed?)"; return
-  let uri = if app.filePath.len > 0: uriOf(app.filePath) else: "file:///focim-scratch"
+  let uri = if app.filePath.len > 0: uriOf(app.filePath) else: "file:///wkbenchless-scratch"
   c.syncDoc(uri, app.docLang, app.ed.fullText())
   let items = c.completion(uri, app.ed.currentLine, app.ed.currentCol)
   if items.len == 0: app.msg = "no completions"; return
@@ -303,7 +303,7 @@ proc findBlockAt(app: App; cur: int): tuple[b, e: int; header: string] =
       result.e = i; break
   if result.e < 0 or cur > result.e: result = (-1, -1, "")
 
-const blockSentinel = "#--- focim block "
+const blockSentinel = "#--- wkbenchless block "
 
 proc srcEditEnter(app: var App; sessionWide: bool) =
   let cb = findBlockAt(app, app.ed.currentLine)
@@ -346,7 +346,7 @@ proc srcEditEnter(app: var App; sessionWide: bool) =
   let text = tang.join("\n")
 
   let ext = langToExt(lang)
-  let tmp = getTempDir() / ("focim-edit" & ext)
+  let tmp = getTempDir() / ("wkbenchless-edit" & ext)
   try: writeFile(tmp, text) except CatchableError: discard
   app.filePath = tmp
   app.ed.lang = fileExtToLanguage(ext)   # before setText, so it highlights right
@@ -496,12 +496,12 @@ proc babelExecute*(app: var App) =
   app.runHooks("after-babel")
 
 proc detectRebuildCmd*(): string =
-  ## The command C-c r runs to rebuild focim. Prefer a toolchain bundled under
+  ## The command C-c r runs to rebuild wkbenchless. Prefer a toolchain bundled under
   ## <appdir>/toolchain so hot-reload needs no system compiler: a Nim under
   ## toolchain/nim/bin (it finds its own stdlib beside it) and, if present, zig
   ## as the hermetic C backend (single binary, ships its own libc, cross-
   ## compiles -- the user's pick over tcc). Falls back to the system `nim`.
-  let base = "c --hints:off -o:focim src/focim.nim"
+  let base = "c --hints:off -o:wkbenchless src/wkbenchless.nim"
   let dir = getAppDir()
   let bnim = dir / "toolchain" / "nim" / "bin" / "nim"
   let bzig = dir / "toolchain" / "zig" / "zig"
@@ -515,7 +515,7 @@ proc detectRebuildCmd*(): string =
 
 proc recompileConfig*(app: var App) =
   ## Hot-reload the config the honest way for compiled Nim (the xmonad model):
-  ## rebuild the binary -- which recompiles focimconfig.nim with it -- and, on
+  ## rebuild the binary -- which recompiles wkbconfig.nim with it -- and, on
   ## success, re-exec ourselves, handing off the current file and cursor line.
   ## A compile error is shown in the session pane and nothing is replaced.
   when not defined(posix):
@@ -534,7 +534,7 @@ proc recompileConfig*(app: var App) =
     # persist the buffer so edits survive the exec
     var fileArg = app.filePath
     if fileArg.len == 0:
-      fileArg = getTempDir() / "focim-scratch.txt"
+      fileArg = getTempDir() / "wkbenchless-scratch.txt"
       writeFile(fileArg, app.ed.fullText())
     elif app.ed.changed:
       app.ed.saveToFile(app.filePath); app.ed.markSaved()
@@ -542,9 +542,9 @@ proc recompileConfig*(app: var App) =
     for s in app.sessions.values: closeSession(s)   # reap child REPLs first
     # Exec the freshly built binary by its known path, NOT getAppFilename():
     # the rebuild replaced our on-disk file, so /proc/self/exe now reads
-    # ".../focim (deleted)", which would make execv fail with ENOENT. `dir` was
-    # captured before the build, and the rebuild writes `-o:focim` into it.
-    let bin = dir / "focim"
+    # ".../wkbenchless (deleted)", which would make execv fail with ENOENT. `dir` was
+    # captured before the build, and the rebuild writes `-o:wkbenchless` into it.
+    let bin = dir / "wkbenchless"
     if not fileExists(bin):
       app.msg = "recompile: built binary not found at " & bin; return
     let argv = allocCStringArray(@[bin, fileArg, "--goto", $line])
@@ -552,9 +552,9 @@ proc recompileConfig*(app: var App) =
     app.msg = "recompile: exec failed (" & bin & ")"   # only if execv failed
 
 proc editConfig*(app: var App) =
-  ## Open src/focimconfig.nim in the editor (edit, then reload-config / C-c r).
+  ## Open src/wkbconfig.nim in the editor (edit, then reload-config / C-c r).
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
-  let p = getAppDir() / "src" / "focimconfig.nim"
+  let p = getAppDir() / "src" / "wkbconfig.nim"
   if not fileExists(p): app.msg = "config not found: " & p; return
   app.filePath = p
   app.ed.lang = fileExtToLanguage(".nim")
@@ -563,7 +563,7 @@ proc editConfig*(app: var App) =
   app.msg = "editing config -- reload with C-c r (or M-x reload-config)"
 
 proc reloadConfig*(app: var App) =
-  ## Rebuild (recompiling focimconfig.nim into the binary) and restart.
+  ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
 
 proc registerBuiltins*() =
@@ -613,7 +613,7 @@ proc registerBuiltins*() =
   defcommand("new-terminal", "New bash terminal session", newTerminal)
   defcommand("edit-config", "Edit config file", editConfig)
   defcommand("reload-config", "Reload config (recompile & restart)", reloadConfig)
-  # The full keymap lives in focimconfig.nim so every binding is visible and
+  # The full keymap lives in wkbconfig.nim so every binding is visible and
   # editable in one place (M-x edit-config, then C-c r). These two are a
   # recovery net kept here: a config that removes its binds can still open the
   # palette (and from there reload-config/edit-config) and quit.

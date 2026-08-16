@@ -57,7 +57,7 @@ type
   SourceLanguage* = enum
     langNone, langNim, langCpp, langCsharp, langC, langJava, langJs,
     langXml, langHtml, langConsole, langPython, langRust, langMarkdown,
-    langR, langOrg          ## added for focim (nimacs)
+    langR, langOrg          ## added for wkbenchless (nimacs)
 
   RenderFlag* = enum
     rfMarkdownImages,   ## Render Markdown image lines: ![alt](path)
@@ -782,7 +782,7 @@ proc rustNextToken(g: var GeneralTokenizer) =
   g.length = pos - g.pos
   g.pos = pos
 
-# --- focim additions: R and org-mode -------------------------------------
+# --- wkbenchless additions: R and org-mode -------------------------------------
 const rKeywords = ["if", "else", "for", "while", "repeat", "function",
   "return", "break", "next", "in", "TRUE", "FALSE", "NULL", "NA", "Inf",
   "NaN", "T", "F", "NA_integer_", "NA_real_", "NA_character_"]
@@ -2815,7 +2815,7 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
     s.mouseDragging = false
 
   of MouseMoveEvent:
-    # focim fix: extend the selection on a PLAIN left-drag. Upstream only
+    # wkbenchless fix: extend the selection on a PLAIN left-drag. Upstream only
     # updated mouseX/mouseY while LinkMod (Ctrl) was held and cancelled the drag
     # on every other move, so a normal drag never marked anything. The drag now
     # ends on MouseUp, as it should.

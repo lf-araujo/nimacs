@@ -106,7 +106,7 @@ proc startSession*(spec: ReplSpec): Session =
 
 proc runBlock*(s: Session; code: string): string =
   ## Run `code` in the session, returning the captured output.
-  let path = genTempPath("focim-", ".src")
+  let path = genTempPath("wkbenchless-", ".src")
   writeFile(path, code)
   ptyWrite(s.master, s.spec.run.replace("{file}", path))
   let acc = readUntil(s.master, markerEnd)

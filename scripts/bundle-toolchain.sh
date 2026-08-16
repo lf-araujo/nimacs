@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Assemble a self-contained toolchain next to the focim binary so config
+# Assemble a self-contained toolchain next to the wkbenchless binary so config
 # hot-reload (C-c r) works without a system Nim/C compiler.
 #
-# Layout it produces (focim's detectRebuildCmd looks here):
+# Layout it produces (wkbenchless's detectRebuildCmd looks here):
 #   ./toolchain/nim/bin/nim   + ./toolchain/nim/lib + config  (Nim finds its
 #                                                              stdlib beside it)
 #   ./toolchain/zig/zig                                        (hermetic C backend)
@@ -43,4 +43,4 @@ else
 fi
 
 echo "done. toolchain assembled at $dest"
-echo "focim's C-c r will now prefer it (see detectRebuildCmd)."
+echo "wkbenchless's C-c r will now prefer it (see detectRebuildCmd)."
