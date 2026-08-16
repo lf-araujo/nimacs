@@ -6,13 +6,14 @@
 ## data; hooks fire at editor events.
 
 import uirelays
-import widgets/synedit
+import vendor/synedit          # our patched copy of uirelays' SynEdit (adds langR/langOrg)
 import focimsession
 import nimacs/lsp                    # pure std/json LSP client -- portable, no GTK
 import std/[tables, strutils, os, osproc]
 when defined(posix): import std/posix
 
 export uirelays, synedit, focimsession, lsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
+  # `synedit` above is src/vendor/synedit
 
 type
   App* = object
