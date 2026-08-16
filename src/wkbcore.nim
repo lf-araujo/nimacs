@@ -23,6 +23,7 @@ type
     docLang*: string                      ## the buffer's LSP languageId ("" = none)
     lsp*: Table[string, LspClient]        ## langId -> language server
     font*: Font
+    fontSize*: int                        ## desired editor font size (host applies)
     filePath*, msg*: string
     running*: bool
     srcEdit*: bool                        ## 4-quadrant (objects+help) vs plain
@@ -329,6 +330,13 @@ proc saveCmd*(app: var App) =
   else: app.msg = "no file (pass a path on the command line)"
 
 proc quitCmd*(app: var App) = app.running = false
+
+proc zoomIn*(app: var App) =
+  app.fontSize = min(48, app.fontSize + 1); app.msg = "font " & $app.fontSize
+proc zoomOut*(app: var App) =
+  app.fontSize = max(8, app.fontSize - 1); app.msg = "font " & $app.fontSize
+proc zoomReset*(app: var App) =
+  app.fontSize = 15; app.msg = "font " & $app.fontSize
 
 proc openPalette(app: var App; mode: PaletteMode) =
   app.paletteMode = mode
@@ -712,6 +720,9 @@ proc registerBuiltins*() =
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)
+  defcommand("zoom-in", "Increase font size", zoomIn)
+  defcommand("zoom-out", "Decrease font size", zoomOut)
+  defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)

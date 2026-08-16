@@ -157,14 +157,15 @@ proc main() =
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
   var metrics: FontMetrics
-  let font = openFont(fontPath, 15, metrics)
-  let lineH = metrics.lineHeight
+  var fontSize = 15
+  var font = openFont(fontPath, fontSize, metrics)
+  var lineH = metrics.lineHeight
 
   registerBuiltins()
   var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
                 objects: createSynEdit(font), help: createSynEdit(font),
                 curLang: "r", curSession: "default", focus: "editor",
-                font: font, running: true, msg: "ready")
+                font: font, fontSize: fontSize, running: true, msg: "ready")
   app.ed.showLineNumbers = true
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
@@ -241,6 +242,15 @@ proc main() =
 
     if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
+
+    if app.fontSize != fontSize:                 # zoom: re-open the font
+      fontSize = app.fontSize
+      font = openFont(fontPath, fontSize, metrics)
+      lineH = metrics.lineHeight
+      app.font = font
+      app.ed.setFont(font); app.sess.setFont(font)
+      app.objects.setFont(font); app.help.setFont(font)
+      for b in app.buffers.mitems: b.ed.setFont(font)
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc

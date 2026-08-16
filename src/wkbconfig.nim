@@ -40,6 +40,9 @@ proc configure*(app: var App) =
   bindkey("C-x C-f", "open-file")       # browse & open a file (palette)
   bindkey("C-x b", "list-buffers")      # switch buffers (palette)
   bindkey("C-x k", "kill-buffer")       # close the current buffer
+  bindkey("C-=", "zoom-in")             # font size
+  bindkey("C--", "zoom-out")
+  bindkey("C-0", "zoom-reset")
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.
