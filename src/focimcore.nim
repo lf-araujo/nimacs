@@ -25,6 +25,7 @@ type
     font*: Font
     filePath*, msg*: string
     running*: bool
+    srcEdit*: bool                        ## 4-quadrant (objects+help) vs plain
     pendingPrefix*: string
     paletteActive*: bool
     paletteQuery*: string
@@ -230,6 +231,12 @@ proc quitCmd*(app: var App) = app.running = false
 proc paletteCmd*(app: var App) =
   app.paletteActive = true; app.paletteQuery = ""; app.paletteSel = 0
 
+proc toggleSrcEdit*(app: var App) =
+  ## Show/hide the objects+help right column (the "src-edit environment").
+  app.srcEdit = not app.srcEdit
+  if app.srcEdit: refreshObjects(app)
+  app.msg = "src-edit: " & (if app.srcEdit: "on" else: "off")
+
 proc babelExecute*(app: var App) =
   let total = app.ed.getLineCount()
   let cur = app.ed.currentLine
@@ -374,9 +381,11 @@ proc registerBuiltins*() =
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
   defcommand("complete", "LSP: complete at cursor", lspComplete)
+  defcommand("toggle-src-edit", "Toggle objects/help (src-edit)", toggleSrcEdit)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
+  bindkey("C-c e", "toggle-src-edit")
   bindkey("F1", "show-help")
   bindkey("C-Space", "complete")
   bindkey("C-q", "quit")

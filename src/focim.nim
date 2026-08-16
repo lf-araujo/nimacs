@@ -16,7 +16,9 @@ const fontPath =
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
-const layoutSrc =
+const layoutPlain =
+  "(layout (editor) (session (lines 12)) (status (lines 1)))"
+const layoutSrc =                          # C-c e: the 4-quadrant src-edit env
   "(layout" &
   "  (cols" &
   "    (rows (editor (stretch 3)) (session (stretch 2)))" &
@@ -107,6 +109,10 @@ proc dispatch(app: var App; e: Event): bool =
   ## true if the event was consumed by a command/prefix.
   let chord = chordOf(e)
   if chord.len == 0: return false
+  # Let Ctrl+C copy a selection (SynEdit handles it) rather than starting the
+  # org-babel prefix -- otherwise standard copy is shadowed by C-c C-c.
+  if chord == "C-c" and app.pendingPrefix.len == 0 and app.ed.getSelectedText().len > 0:
+    return false
   if app.pendingPrefix.len > 0:
     let full = app.pendingPrefix & " " & chord
     app.pendingPrefix = ""
@@ -154,7 +160,9 @@ proc main() =
   configure(app)            # user config (focimconfig.nim) -- full-typed, no ABI
   app.runHooks("startup")
 
-  let lay = parseLayout(layoutSrc)
+  let layPlain = parseLayout(layoutPlain)
+  let laySrc = parseLayout(layoutSrc)
+  var lastMouse = (x: 0, y: 0)
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
   let statusBg = color(32, 35, 42)
@@ -174,7 +182,11 @@ proc main() =
     if not consumed and not app.paletteActive:
       consumed = dispatch(app, e)
 
+    if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
+      lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
+
     screen = getWindowLayout()
+    let lay = if app.srcEdit: laySrc else: layPlain
     let cells = resolve(lay, screen.width, screen.height, lineH)
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
@@ -198,7 +210,8 @@ proc main() =
       let dirty = if app.ed.changed: " [+]" else: ""
       discard drawText(app.font, sr.x + 6, sr.y,
         "  focim   " & name & dirty & "   " &
-        $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) & "   " & app.msg,
+        $(app.ed.currentLine + 1) & ":" & $(app.ed.currentCol + 1) &
+        "   m:" & $lastMouse.x & "," & $lastMouse.y & "   " & app.msg,
         statusFg, statusBg)
 
     if app.completionActive:
