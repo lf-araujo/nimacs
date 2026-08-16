@@ -910,6 +910,7 @@ proc strToLanguage*(s: string): SourceLanguage =
   of "xml": langXml
   of "html", "htm": langHtml
   of "md", "markdown": langMarkdown
+  of "r", "rscript": langR
   else: langNone
 
 proc highlightMarkdown(s: var SynEdit; first, last: int) =
@@ -989,10 +990,64 @@ proc highlightLine(s: var SynEdit; oldCursor: Natural) =
   let initialState = if first == 0: TokenClass.None else: s.getCell(first-1).s
   s.highlight(first, last, initialState)
 
+proc highlightOrg(s: var SynEdit; first, last: int) =
+  ## Org-mode, fontified natively: #+directives / * headings / # and : lines
+  ## get their own colour, and the body of a #+begin_src <lang> ... #+end_src
+  ## block is tokenized in <lang> (like Markdown fenced code). Line-based, so it
+  ## carries the in-block state that a per-token tokenizer cannot.
+  var insideBlock = false
+  var blockLang = langNone
+  var pos = first
+  while pos > 0 and s[pos-1] != '\L': dec pos
+  while pos <= last:
+    let lineStart = pos
+    var lineEnd = pos
+    while lineEnd <= last and s[lineEnd] != '\L': inc lineEnd
+    var lineText = ""
+    for j in lineStart ..< lineEnd: lineText.add s[j]
+    let stripped = lineText.strip(leading = true, trailing = false)
+    let ls = stripped.toLowerAscii
+    if ls.startsWith("#+begin_src"):
+      for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, TokenClass.Directive)
+      let parts = stripped.splitWhitespace()
+      blockLang = if parts.len >= 2: strToLanguage(parts[1]) else: langNone
+      insideBlock = true
+    elif ls.startsWith("#+end_src"):
+      for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, TokenClass.Directive)
+      insideBlock = false; blockLang = langNone
+    elif insideBlock and blockLang != langNone:
+      var g: GeneralTokenizer
+      g.buf = addr s
+      g.kind = low(TokenClass)
+      g.start = lineStart
+      g.length = 0
+      g.state = TokenClass.None
+      g.pos = lineStart
+      while g.pos < lineEnd and g.pos <= last:
+        getNextToken(g, blockLang)
+        if g.length == 0: break
+        for k in 0 ..< g.length:
+          if g.start + k <= last: s.setCellStyle(g.start + k, g.kind)
+      if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.None)
+    else:
+      var tc = TokenClass.Text
+      if stripped.len > 0:
+        case stripped[0]
+        of '#': tc = if stripped.len > 1 and stripped[1] == '+': TokenClass.Directive
+                     else: TokenClass.Comment
+        of '*': tc = TokenClass.Keyword
+        of ':': tc = TokenClass.Comment
+        else: discard
+      for j in lineStart ..< min(lineEnd, last + 1): s.setCellStyle(j, tc)
+      if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.Whitespace)
+    pos = lineEnd + 1
+
 proc highlightEverything(s: var SynEdit) =
   if s.lang == langNone: return
   if s.lang == langMarkdown:
     s.highlightMarkdown(0, s.len - 1)
+  elif s.lang == langOrg:
+    s.highlightOrg(0, s.len - 1)
   else:
     s.highlight(0, s.len - 1, TokenClass.None)
 
@@ -1000,6 +1055,10 @@ proc highlightIncrementally(s: var SynEdit) =
   if s.lang == langNone or s.highlighter.version == s.version: return
   if s.lang == langMarkdown:
     s.highlightMarkdown(0, s.len - 1)
+    s.highlighter.version = s.version
+    return
+  if s.lang == langOrg:
+    s.highlightOrg(0, s.len - 1)
     s.highlighter.version = s.version
     return
   const charsToIndex = 40 * 40
