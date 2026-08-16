@@ -31,6 +31,7 @@ const layoutSrc =                          # the 4-quadrant src-edit env
   "  (status (lines 1)))"
 
 const dividerNames = ["divH1", "divH2", "divV", "divS"]
+const welcomeOrg = staticRead("../examples/welcome.org")
 
 proc langIdOf(ext: string): string =
   ## The LSP languageId for a file extension ("" = none).
@@ -155,7 +156,7 @@ proc main() =
   else:
     app.ed.lang = langOrg                  # before setText, so org highlights now
     app.docLang = ""
-    app.ed.setText(staticRead("../examples/welcome.org"))
+    app.ed.setText(welcomeOrg)
   app.sess.setText("session output\n")
 
   # `--goto N`: restore the cursor line after a recompile re-exec.
