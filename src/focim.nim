@@ -17,13 +17,17 @@ const fontPath =
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
 const layoutPlain =
-  "(layout (editor) (session (lines 12)) (status (lines 1)))"
-const layoutSrc =                          # C-c e: the 4-quadrant src-edit env
+  "(layout (editor) (divH1 (px 2)) (session (lines 12)) (divS (px 2)) (status (lines 1)))"
+const layoutSrc =                          # the 4-quadrant src-edit env
   "(layout" &
   "  (cols" &
-  "    (rows (editor (stretch 3)) (session (stretch 2)))" &
-  "    (rows (px 340) (objects (stretch 1)) (help (stretch 1))))" &
+  "    (rows (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
+  "    (divV (px 2))" &
+  "    (rows (px 340) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
+  "  (divS (px 2))" &
   "  (status (lines 1)))"
+
+const dividerNames = ["divH1", "divH2", "divV", "divS"]
 
 proc langIdOf(ext: string): string =
   ## The LSP languageId for a file extension ("" = none).
@@ -135,7 +139,7 @@ proc main() =
   registerBuiltins()
   var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
                 objects: createSynEdit(font), help: createSynEdit(font),
-                curLang: "r", curSession: "default",
+                curLang: "r", curSession: "default", focus: "editor",
                 font: font, running: true, msg: "ready")
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
@@ -191,18 +195,34 @@ proc main() =
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
     var editorRect = rect(0, 0, screen.width, screen.height)
+    # Route: a wheel goes to the pane under the pointer; other unconsumed input
+    # goes to the focused pane. Everything else gets noEvent.
+    let overlay = app.paletteActive or app.completionActive
+    proc evFor(name: string): Event =
+      if overlay: return noEvent
+      if e.kind == MouseWheelEvent:
+        if cells.hasKey(name):
+          let r = cells[name]
+          if lastMouse.x >= r.x and lastMouse.x < r.x + r.w and
+             lastMouse.y >= r.y and lastMouse.y < r.y + r.h: return e
+        return noEvent
+      if not consumed and name == app.focus: return e
+      return noEvent
+
     if cells.hasKey("editor"):
       editorRect = cells["editor"]
-      discard app.ed.draw((if consumed: noEvent else: e), editorRect, focused = not app.paletteActive)
+      discard app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
     if cells.hasKey("session"):
       fillRect(cells["session"], sessBg)
-      discard app.sess.draw(noEvent, cells["session"], focused = false)
+      discard app.sess.draw(evFor("session"), cells["session"], focused = app.focus == "session")
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
-      discard app.objects.draw(noEvent, cells["objects"], focused = false)
+      discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
     if cells.hasKey("help"):
       fillRect(cells["help"], sessBg)
-      discard app.help.draw(noEvent, cells["help"], focused = false)
+      discard app.help.draw(evFor("help"), cells["help"], focused = app.focus == "help")
+    for dn in dividerNames:
+      if cells.hasKey(dn): fillRect(cells[dn], color(70, 78, 92))
     if cells.hasKey("status"):
       let sr = cells["status"]
       fillRect(sr, statusBg)

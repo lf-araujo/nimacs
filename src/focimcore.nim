@@ -34,10 +34,18 @@ type
     completionItems*: seq[string]
     completionSel*: int
     completionPrefix*: string
+    focus*: string                        ## which pane gets keyboard events
+    # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
+    # extracted code; on exit it is spliced/detangled back into the org doc.
+    editMode*: EditMode
+    orgSaved*: seq[string]                ## the org document, by line
+    orgFilePath*: string
+    editRanges*: seq[tuple[a, b, indent: int]]  ## body ranges [a,b) in orgSaved
   Command* = object
     label*: string
     run*: proc(app: var App)
   Hook* = proc(app: var App)
+  EditMode* = enum emNone, emBlock, emSession
 
 var
   gCommands*: OrderedTable[string, Command]
@@ -237,6 +245,155 @@ proc toggleSrcEdit*(app: var App) =
   if app.srcEdit: refreshObjects(app)
   app.msg = "src-edit: " & (if app.srcEdit: "on" else: "off")
 
+# -- src-edit: org-edit-special + session tangle ---------------------------
+proc commonIndent(lines: seq[string]): int =
+  result = high(int)
+  for ln in lines:
+    if strutils.strip(ln).len == 0: continue
+    var n = 0
+    while n < ln.len and ln[n] in {' ', '\t'}: inc n
+    result = min(result, n)
+  if result == high(int): result = 0
+
+proc langToExt(lang: string): string =
+  case lang.toLowerAscii
+  of "r": ".R"
+  of "python": ".py"
+  of "nim": ".nim"
+  of "julia": ".jl"
+  of "bash", "sh": ".sh"
+  else: ".txt"
+
+proc headerLangSession(header: string): (string, string) =
+  let hdr = strutils.splitWhitespace(header)
+  let lang = if hdr.len >= 2: hdr[1] else: ""
+  var sess = "default"
+  var k = 2
+  while k < hdr.len:
+    if hdr[k] == ":session" and k + 1 < hdr.len: sess = hdr[k + 1]
+    inc k
+  (lang, sess)
+
+proc findBlockAt(app: App; cur: int): tuple[b, e: int; header: string] =
+  result = (-1, -1, "")
+  let total = app.ed.getLineCount()
+  for i in countdown(cur, 0):
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if low.startsWith("#+begin_src"):
+      result.b = i; result.header = strutils.strip(app.ed.getLineText(i)); break
+    if low.startsWith("#+end_src") and i < cur: return
+  if result.b < 0: return
+  for i in result.b + 1 ..< total:
+    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+end_src"):
+      result.e = i; break
+  if result.e < 0 or cur > result.e: result = (-1, -1, "")
+
+const blockSentinel = "#--- focim block "
+
+proc srcEditEnter(app: var App; sessionWide: bool) =
+  let cb = findBlockAt(app, app.ed.currentLine)
+  if cb.b < 0: app.msg = "not in a src block"; return
+  let (lang, sess) = headerLangSession(cb.header)
+  let total = app.ed.getLineCount()
+  app.editRanges = @[]
+  if not sessionWide:
+    var body: seq[string]
+    for i in cb.b + 1 ..< cb.e: body.add app.ed.getLineText(i)
+    app.editRanges.add (a: cb.b + 1, b: cb.e, indent: commonIndent(body))
+  else:
+    var i = 0
+    while i < total:
+      if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+        let (l2, s2) = headerLangSession(strutils.strip(app.ed.getLineText(i)))
+        var e2 = -1
+        for j in i + 1 ..< total:
+          if strutils.strip(app.ed.getLineText(j)).toLowerAscii.startsWith("#+end_src"):
+            e2 = j; break
+        if e2 < 0: break
+        if l2.toLowerAscii == lang.toLowerAscii and s2 == sess:
+          var body: seq[string]
+          for k in i + 1 ..< e2: body.add app.ed.getLineText(k)
+          app.editRanges.add (a: i + 1, b: e2, indent: commonIndent(body))
+        i = e2 + 1
+      else: inc i
+  if app.editRanges.len == 0: app.msg = "no blocks for that session"; return
+
+  app.orgSaved = @[]
+  for i in 0 ..< total: app.orgSaved.add app.ed.getLineText(i)
+  app.orgFilePath = app.filePath
+
+  var tang: seq[string]
+  for idx, r in app.editRanges:
+    if sessionWide: tang.add blockSentinel & $idx & " ---"
+    var body: seq[string]
+    for i in r.a ..< r.b: body.add app.orgSaved[i]
+    tang.add dedentBody(body)
+  let text = tang.join("\n")
+
+  let ext = langToExt(lang)
+  let tmp = getTempDir() / ("focim-edit" & ext)
+  try: writeFile(tmp, text) except CatchableError: discard
+  app.ed.setText(text)
+  app.filePath = tmp
+  app.ed.lang = fileExtToLanguage(ext)
+  app.docLang = lang.toLowerAscii
+  app.curLang = lang.toLowerAscii; app.curSession = sess
+  app.editMode = if sessionWide: emSession else: emBlock
+  app.srcEdit = true
+  refreshObjects(app)
+  app.msg = (if sessionWide: "src-edit session '" & sess & "'" else: "src-edit block") &
+            " (" & $app.editRanges.len & ")"
+
+proc srcEditExit*(app: var App) =
+  if app.editMode == emNone: return
+  let edLines = app.ed.fullText().split('\n')
+  var bodies: seq[seq[string]]
+  if app.editMode == emBlock:
+    bodies.add edLines
+  else:
+    var cur: seq[string]
+    var started = false
+    for ln in edLines:
+      if strutils.strip(ln).startsWith(blockSentinel):
+        if started: bodies.add cur
+        cur = @[]; started = true
+      elif started: cur.add ln
+    if started: bodies.add cur
+  # trim a trailing blank line off each body (fullText ends with \n)
+  for b in bodies.mitems:
+    while b.len > 0 and strutils.strip(b[^1]).len == 0: b.setLen(b.len - 1)
+
+  var org = app.orgSaved
+  for idx in countdown(app.editRanges.high, 0):
+    if idx >= bodies.len: continue
+    let r = app.editRanges[idx]
+    var reindented: seq[string]
+    for ln in bodies[idx]:
+      reindented.add (if strutils.strip(ln).len == 0: "" else: spaces(r.indent) & ln)
+    org[r.a ..< r.b] = reindented
+
+  app.filePath = app.orgFilePath
+  app.ed.setText(org.join("\n"))
+  app.ed.lang = langOrg
+  app.docLang = ""
+  app.editMode = emNone
+  app.srcEdit = false
+  app.editRanges = @[]
+  app.msg = "src-edit: spliced back"
+
+proc srcEditBlock*(app: var App) =
+  if app.editMode != emNone: srcEditExit(app) else: srcEditEnter(app, false)
+proc srcEditSession*(app: var App) =
+  if app.editMode != emNone: srcEditExit(app) else: srcEditEnter(app, true)
+
+proc focusNext*(app: var App) =
+  const order = ["editor", "session", "objects", "help"]
+  var i = 0
+  for k, name in order:
+    if name == app.focus: i = k
+  app.focus = order[(i + 1) mod order.len]
+  app.msg = "focus: " & app.focus
+
 proc babelExecute*(app: var App) =
   let total = app.ed.getLineCount()
   let cur = app.ed.currentLine
@@ -382,10 +539,16 @@ proc registerBuiltins*() =
   defcommand("show-help", "Help: for word at cursor", showHelp)
   defcommand("complete", "LSP: complete at cursor", lspComplete)
   defcommand("toggle-src-edit", "Toggle objects/help (src-edit)", toggleSrcEdit)
+  defcommand("src-edit-block", "Src-edit: this block (org-edit-special)", srcEditBlock)
+  defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
+  defcommand("focus-next", "Focus next pane", focusNext)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
   bindkey("C-c e", "toggle-src-edit")
+  bindkey("C-c b", "src-edit-block")
+  bindkey("C-c t", "src-edit-session")
+  bindkey("C-c n", "focus-next")
   bindkey("F1", "show-help")
   bindkey("C-Space", "complete")
   bindkey("C-q", "quit")
