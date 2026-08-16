@@ -17,6 +17,7 @@ proc configure*(app: var App) =
   # also set in core as a recovery net.) Note: Shift+letter chords don't reach
   # the X11 driver, so the palette is M-x, not C-S-p.
   bindkey("M-x", "palette")
+  bindkey("C-p", "palette")             # alternative to M-x
   bindkey("C-S-p", "palette")           # harmless alias where it works
   bindkey("C-s", "save")
   bindkey("C-q", "quit")

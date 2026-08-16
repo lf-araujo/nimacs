@@ -348,9 +348,9 @@ proc srcEditEnter(app: var App; sessionWide: bool) =
   let ext = langToExt(lang)
   let tmp = getTempDir() / ("focim-edit" & ext)
   try: writeFile(tmp, text) except CatchableError: discard
-  app.ed.setText(text)
   app.filePath = tmp
-  app.ed.lang = fileExtToLanguage(ext)
+  app.ed.lang = fileExtToLanguage(ext)   # before setText, so it highlights right
+  app.ed.setText(text)
   app.docLang = lang.toLowerAscii
   app.curLang = lang.toLowerAscii; app.curSession = sess
   app.editMode = if sessionWide: emSession else: emBlock
@@ -388,8 +388,8 @@ proc srcEditExit*(app: var App) =
     org[r.a ..< r.b] = reindented
 
   app.filePath = app.orgFilePath
+  app.ed.lang = langOrg           # set lang BEFORE setText: setText highlights now
   app.ed.setText(org.join("\n"))
-  app.ed.lang = langOrg
   app.docLang = ""
   app.editMode = emNone
   app.srcEdit = false
@@ -557,8 +557,8 @@ proc editConfig*(app: var App) =
   let p = getAppDir() / "src" / "focimconfig.nim"
   if not fileExists(p): app.msg = "config not found: " & p; return
   app.filePath = p
-  app.ed.loadFromFile(p)
   app.ed.lang = fileExtToLanguage(".nim")
+  app.ed.loadFromFile(p)
   app.docLang = "nim"
   app.msg = "editing config -- reload with C-c r (or M-x reload-config)"
 

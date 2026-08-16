@@ -146,10 +146,11 @@ proc main() =
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
-    app.filePath = paramStr(1); app.ed.loadFromFile(app.filePath)
+    app.filePath = paramStr(1)
     let ext = splitFile(app.filePath).ext
-    app.ed.lang = fileExtToLanguage(ext)   # SynEdit's built-in highlighter
+    app.ed.lang = fileExtToLanguage(ext)   # set before load: setText highlights now
     app.docLang = langIdOf(ext)            # for LSP
+    app.ed.loadFromFile(app.filePath)
   else:
     app.ed.setText("#+TITLE: focim scratch\n\n" &
                    "C-c C-c runs the block; C-Enter runs a line; M-x opens the palette.\n" &
@@ -192,11 +193,12 @@ proc main() =
         handlePalette(app, e); consumed = true
       elif app.completionActive:
         consumed = handleCompletion(app, e)
-    let hadPrefix = app.pendingPrefix.len > 0
     if not consumed and not app.paletteActive:
-      consumed = dispatch(app, e)
-    if hadPrefix and consumed and e.kind == KeyDownEvent:
-      suppressText = true          # its TextInput would otherwise be inserted
+      if dispatch(app, e):
+        consumed = true
+        # A command/prefix ran from this keystroke; swallow the TextInput it may
+        # also emit (e.g. M-x -> 'x', C-c e -> 'e') so it isn't typed anywhere.
+        if e.kind == KeyDownEvent: suppressText = true
 
     # Session pane as a live REPL: when it has focus, type at the prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
