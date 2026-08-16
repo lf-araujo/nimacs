@@ -10,19 +10,12 @@ import uirelays
 import uirelays/layout
 import wkbcore
 import wkbconfig
-import wkbterm
 import std/[os, tables, strutils]
 
 const fontPath =
   when defined(windows): "C:/Windows/Fonts/consola.ttf"
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
-
-when defined(linux):
-  # We're multithreaded (the terminal widget starts a background thread), but
-  # uirelays opens Xlib without XInitThreads(). Under X11/XWayland that wedges
-  # input. Call it before any Xlib use (i.e. before createWindow).
-  proc XInitThreads(): cint {.importc, dynlib: "libX11.so.6".}
 
 const layoutBare =                         # no session yet: just the editor
   "(layout (editor) (divS (px 2)) (status (lines 1)))"
@@ -161,7 +154,6 @@ proc dispatch(app: var App; e: Event): bool =
   false
 
 proc main() =
-  when defined(linux): discard XInitThreads()   # before any Xlib call
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
   var metrics, bigMetrics: FontMetrics
@@ -208,8 +200,6 @@ proc main() =
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
-  var terminal: Terminal
-  var termCreated = false
   var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
@@ -219,19 +209,8 @@ proc main() =
 
   var e: Event
   while app.running:
-    let liveTerm = app.terminalActive and not app.sessionHidden
-    if not waitEvent(e, if liveTerm: 30 else: -1):
-      if liveTerm: e = Event(kind: NoEvent)   # tick: refresh the live terminal
-      else: continue
+    if not waitEvent(e): continue
     if e.kind in {WindowCloseEvent, QuitEvent}: break
-
-    if app.terminalRequest.len > 0:           # host runs the requested command
-      if not termCreated:
-        terminal = createTerminal(font); termCreated = true
-      terminal.cwd = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
-      var cmd = app.terminalRequest
-      discard terminal.runCommand(cmd)
-      app.terminalRequest = ""
 
     var consumed = false
     if suppressText:
@@ -254,16 +233,9 @@ proc main() =
        not app.paletteActive and not app.completionActive:
       consumed = vimHandle(app, e)
 
-    # Terminal widget gets session-focused input (after commands, so M-x/C-x work).
-    var termGetsEvent = false
-    if not consumed and app.terminalActive and app.focus == "session" and
-       not app.paletteActive and not app.completionActive:
-      termGetsEvent = true
-      consumed = true
-
     # Session pane as a live REPL: when it has focus, type at the prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
-       app.focus == "session" and not app.terminalActive:
+       app.focus == "session":
       case e.kind
       of KeyDownEvent:
         if e.key == KeyEnter: replSubmit(app); consumed = true
@@ -293,7 +265,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif (app.sessions.len > 0 or app.terminalActive) and not app.sessionHidden: layPlain
+              elif app.sessions.len > 0 and not app.sessionHidden: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
@@ -347,35 +319,24 @@ proc main() =
       var cx = r.x + 4
       let curKey = app.curLang & "/" & app.curSession
       for k in app.sessionKeys():
-        let chipBg = if k == curKey and not app.terminalActive: color(70, 100, 70)
-                     else: color(40, 44, 52)
+        let chipBg = if k == curKey: color(70, 100, 70) else: color(40, 44, 52)
         let label = " " & k & " "
         let w = label.len * (lineH div 2) + 4
         fillRect(rect(cx, r.y, w, bh), chipBg)
         discard drawText(app.font, cx + 2, r.y, label, color(220, 224, 210), chipBg)
         cx += w + 4
-      if app.terminalActive:
-        let tchBg = color(70, 90, 110)
-        fillRect(rect(cx, r.y, 9 * (lineH div 2), bh), tchBg)
-        discard drawText(app.font, cx + 2, r.y, " terminal ", color(220, 224, 230), tchBg)
       let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
       fillRect(xr, color(70, 40, 40))
       discard drawText(app.font, xr.x + bh div 3, r.y, "x", color(230, 190, 190), color(70, 40, 40))
-      # body: terminal widget, or the session REPL
-      let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
-      if app.terminalActive:
-        discard terminal.draw((if termGetsEvent: e else: noEvent), body,
-                              focused = app.focus == "session")
-      else:
-        let ph = lineH                     # bottom row = live REPL prompt
-        discard app.sess.draw(evFor("session"),
-          rect(body.x, body.y, body.w, max(lineH, body.h - ph)), focused = app.focus == "session")
-        let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
-        let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
-        fillRect(pr, pbg)
-        let caret = if app.focus == "session": "_" else: ""
-        discard drawText(app.font, pr.x + 4, pr.y,
-          app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
+      let ph = lineH                       # bottom row = live REPL prompt
+      discard app.sess.draw(evFor("session"),
+        rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh - ph)), focused = app.focus == "session")
+      let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
+      let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
+      fillRect(pr, pbg)
+      let caret = if app.focus == "session": "_" else: ""
+      discard drawText(app.font, pr.x + 4, pr.y,
+        app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")

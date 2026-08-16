@@ -47,8 +47,6 @@ type
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
     sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
-    terminalActive*: bool                 ## bottom panel shows the terminal widget
-    terminalRequest*: string              ## command for the host to run in the terminal
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -736,21 +734,25 @@ proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
 
-# -- terminal / panel ------------------------------------------------------
-proc openTerminalWith*(app: var App; cmd: string) =
-  ## Ask the host to run `cmd` in the terminal widget in the bottom panel.
-  app.terminalActive = true
-  app.sessionHidden = false
-  app.terminalRequest = cmd
-  app.focus = "session"
-  app.msg = "terminal: " & cmd
-
-proc claudeIde*(app: var App) =
-  ## Open a terminal in the bottom panel. NOTE: the widget is pipe-based (no
-  ## PTY), so claude's full-screen TUI floods/locks it -- we open bash for now.
-  ## Running claude's TUI in-pane needs the PTY/VT work (the real claude-code-ide).
-  openTerminalWith(app, "bash")
-  app.msg = "terminal (bash) -- claude's TUI needs a real PTY; that's future work"
+# -- claude launcher / panel -----------------------------------------------
+proc launchClaude*(app: var App) =
+  ## Open claude in a terminal emulator, in the file's dir. (An in-pane terminal
+  ## needs a thread-free PTY implementation -- future claude-code-ide work; the
+  ## uirelays Terminal widget's background thread wedges input under XWayland.)
+  let dir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+  var term = ""
+  for t in ["xfce4-terminal", "x-terminal-emulator", "alacritty", "kitty",
+            "foot", "gnome-terminal", "konsole", "xterm"]:
+    if findExe(t).len > 0: term = t; break
+  if term.len == 0: app.msg = "no terminal emulator found on PATH"; return
+  let run = "bash -c 'claude; exec bash'"
+  let inv = case term
+    of "xfce4-terminal": " -x " & run
+    of "gnome-terminal": " -- " & run
+    of "kitty", "foot": " " & run
+    else: " -e " & run
+  discard execShellCmd("cd " & quoteShell(dir) & " && " & term & inv & " >/dev/null 2>&1 &")
+  app.msg = "launched claude in " & term
 
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
@@ -940,9 +942,7 @@ proc registerBuiltins*() =
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
-  defcommand("claude", "Claude IDE: terminal in the bottom panel", claudeIde)
-  defcommand("terminal", "Open a bash terminal in the bottom panel",
-             proc(app: var App) = openTerminalWith(app, "bash"))
+  defcommand("claude", "Launch claude in a terminal", launchClaude)
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
