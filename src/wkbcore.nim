@@ -46,6 +46,9 @@ type
     vimEnabled*: bool                     ## modal (vim) editing
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
+    sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
+    terminalActive*: bool                 ## bottom panel shows the terminal widget
+    terminalRequest*: string              ## command for the host to run in the terminal
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -733,25 +736,27 @@ proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
 
-# -- claude launcher -------------------------------------------------------
-proc launchClaude*(app: var App) =
-  ## Open a terminal running claude in the file's directory. (A proper in-app
-  ## claude-code-ide integration is future work.)
-  let dir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
-  var term = ""
-  for t in ["xfce4-terminal", "x-terminal-emulator", "alacritty", "kitty",
-            "foot", "gnome-terminal", "konsole", "xterm"]:
-    if findExe(t).len > 0: term = t; break
-  if term.len == 0: app.msg = "no terminal emulator found on PATH"; return
-  let run = "bash -c 'claude; exec bash'"           # keep the shell after claude
-  let inv = case term
-    of "xfce4-terminal": " -x " & run
-    of "gnome-terminal": " -- " & run
-    of "kitty", "foot": " " & run
-    else: " -e " & run
-  discard execShellCmd("cd " & quoteShell(dir) & " && " & term & inv &
-                       " >/dev/null 2>&1 &")
-  app.msg = "launched claude in " & term
+# -- terminal / panel ------------------------------------------------------
+proc openTerminalWith*(app: var App; cmd: string) =
+  ## Ask the host to run `cmd` in the terminal widget in the bottom panel.
+  app.terminalActive = true
+  app.sessionHidden = false
+  app.terminalRequest = cmd
+  app.focus = "session"
+  app.msg = "terminal: " & cmd
+
+proc claudeIde*(app: var App) =
+  ## Open a terminal in the bottom panel and run claude in it. (Full claude-code-
+  ## ide integration -- inline diffs, etc. -- is future work.)
+  openTerminalWith(app, "claude")
+
+proc showPanel*(app: var App) =
+  app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
+
+proc togglePanel*(app: var App) =
+  app.sessionHidden = not app.sessionHidden
+  if not app.sessionHidden: app.focus = "session"
+  app.msg = "panel " & (if app.sessionHidden: "hidden" else: "shown")
 
 # -- vim mode --------------------------------------------------------------
 proc vimGoto(app: var App; line, col: int) =
@@ -933,7 +938,11 @@ proc registerBuiltins*() =
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
-  defcommand("claude", "Launch claude in a terminal", launchClaude)
+  defcommand("claude", "Claude IDE: terminal in the bottom panel", claudeIde)
+  defcommand("terminal", "Open a bash terminal in the bottom panel",
+             proc(app: var App) = openTerminalWith(app, "bash"))
+  defcommand("show-panel", "Show the bottom panel", showPanel)
+  defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)

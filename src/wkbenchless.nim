@@ -10,6 +10,7 @@ import uirelays
 import uirelays/layout
 import wkbcore
 import wkbconfig
+import wkbterm
 import std/[os, tables, strutils]
 
 const fontPath =
@@ -24,9 +25,9 @@ const layoutPlain =                        # a session exists
 const layoutSrc =                          # the 4-quadrant src-edit env
   "(layout" &
   "  (cols" &
-  "    (rows (stretch 3) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
+  "    (rows (stretch 7) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
   "    (divV (px 2))" &
-  "    (rows (stretch 7) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
+  "    (rows (stretch 3) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
   "  (divS (px 2))" &
   "  (status (lines 1)))"
 
@@ -200,6 +201,8 @@ proc main() =
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
+  var terminal: Terminal
+  var termCreated = false
   var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
@@ -209,8 +212,19 @@ proc main() =
 
   var e: Event
   while app.running:
-    if not waitEvent(e): continue
+    let liveTerm = app.terminalActive and not app.sessionHidden
+    if not waitEvent(e, if liveTerm: 30 else: -1):
+      if liveTerm: e = Event(kind: NoEvent)   # tick: refresh the live terminal
+      else: continue
     if e.kind in {WindowCloseEvent, QuitEvent}: break
+
+    if app.terminalRequest.len > 0:           # host runs the requested command
+      if not termCreated:
+        terminal = createTerminal(font); termCreated = true
+      terminal.cwd = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+      var cmd = app.terminalRequest
+      discard terminal.runCommand(cmd)
+      app.terminalRequest = ""
 
     var consumed = false
     if suppressText:
@@ -233,9 +247,16 @@ proc main() =
        not app.paletteActive and not app.completionActive:
       consumed = vimHandle(app, e)
 
+    # Terminal widget gets session-focused input (after commands, so M-x/C-x work).
+    var termGetsEvent = false
+    if not consumed and app.terminalActive and app.focus == "session" and
+       not app.paletteActive and not app.completionActive:
+      termGetsEvent = true
+      consumed = true
+
     # Session pane as a live REPL: when it has focus, type at the prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
-       app.focus == "session":
+       app.focus == "session" and not app.terminalActive:
       case e.kind
       of KeyDownEvent:
         if e.key == KeyEnter: replSubmit(app); consumed = true
@@ -265,7 +286,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif app.sessions.len > 0: layPlain
+              elif (app.sessions.len > 0 or app.terminalActive) and not app.sessionHidden: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
@@ -275,15 +296,18 @@ proc main() =
           let r = cells[nm]
           if e.x >= r.x and e.x < r.x + r.w and e.y >= r.y and e.y < r.y + r.h:
             app.focus = nm
-      # click a session tab (top bar of the session pane) to select it
+      # click on the session tab bar: [x] to hide, or a chip to select
       if cells.hasKey("session"):
         let r = cells["session"]
         if e.y >= r.y and e.y < r.y + lineH:
-          var cx = r.x + 4
-          for k in app.sessionKeys():
-            let w = (" " & k & " ").len * (lineH div 2) + 4
-            if e.x >= cx and e.x < cx + w: setSession(app, k); break
-            cx += w + 4
+          if e.x >= r.x + r.w - lineH:          # [x] hide the panel
+            app.sessionHidden = true; app.focus = "editor"
+          else:
+            var cx = r.x + 4
+            for k in app.sessionKeys():
+              let w = (" " & k & " ").len * (lineH div 2) + 4
+              if e.x >= cx and e.x < cx + w: setSession(app, k); break
+              cx += w + 4
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
     var editorRect = rect(0, 0, screen.width, screen.height)
@@ -310,30 +334,41 @@ proc main() =
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)
-      let bh = lineH                       # top row = session switcher bar
-      let ph = lineH                       # bottom row = live REPL prompt
-      # switcher bar: one chip per open session, current highlighted
-      let barRect = rect(r.x, r.y, r.w, bh)
-      fillRect(barRect, color(26, 30, 38))
+      let bh = lineH                       # top row = session tab bar
+      # tab bar: session chips + an [x] at the far right to hide the panel
+      fillRect(rect(r.x, r.y, r.w, bh), color(26, 30, 38))
       var cx = r.x + 4
       let curKey = app.curLang & "/" & app.curSession
       for k in app.sessionKeys():
-        let chipBg = if k == curKey: color(70, 100, 70) else: color(40, 44, 52)
+        let chipBg = if k == curKey and not app.terminalActive: color(70, 100, 70)
+                     else: color(40, 44, 52)
         let label = " " & k & " "
-        let w = label.len * (metrics.lineHeight div 2) + 4
+        let w = label.len * (lineH div 2) + 4
         fillRect(rect(cx, r.y, w, bh), chipBg)
         discard drawText(app.font, cx + 2, r.y, label, color(220, 224, 210), chipBg)
         cx += w + 4
-      # transcript
-      discard app.sess.draw(evFor("session"),
-        rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh - ph)), focused = app.focus == "session")
-      # prompt
-      let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
-      let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
-      fillRect(pr, pbg)
-      let caret = if app.focus == "session": "_" else: ""
-      discard drawText(app.font, pr.x + 4, pr.y,
-        app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
+      if app.terminalActive:
+        let tchBg = color(70, 90, 110)
+        fillRect(rect(cx, r.y, 9 * (lineH div 2), bh), tchBg)
+        discard drawText(app.font, cx + 2, r.y, " terminal ", color(220, 224, 230), tchBg)
+      let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
+      fillRect(xr, color(70, 40, 40))
+      discard drawText(app.font, xr.x + bh div 3, r.y, "x", color(230, 190, 190), color(70, 40, 40))
+      # body: terminal widget, or the session REPL
+      let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
+      if app.terminalActive:
+        discard terminal.draw((if termGetsEvent: e else: noEvent), body,
+                              focused = app.focus == "session")
+      else:
+        let ph = lineH                     # bottom row = live REPL prompt
+        discard app.sess.draw(evFor("session"),
+          rect(body.x, body.y, body.w, max(lineH, body.h - ph)), focused = app.focus == "session")
+        let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
+        let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
+        fillRect(pr, pbg)
+        let caret = if app.focus == "session": "_" else: ""
+        discard drawText(app.font, pr.x + 4, pr.y,
+          app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
