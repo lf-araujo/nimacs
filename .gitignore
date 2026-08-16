@@ -8,3 +8,7 @@ toolchain/
 /wkbenchless
 *.insyncdl
 .~*
+debug/test1_baseline
+debug/test2_thread
+debug/test3_xinit_thread
+debug/test4_terminal_import
