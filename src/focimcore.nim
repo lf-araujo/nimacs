@@ -540,10 +540,16 @@ proc recompileConfig*(app: var App) =
       app.ed.saveToFile(app.filePath); app.ed.markSaved()
     let line = app.ed.currentLine
     for s in app.sessions.values: closeSession(s)   # reap child REPLs first
-    let bin = getAppFilename()
+    # Exec the freshly built binary by its known path, NOT getAppFilename():
+    # the rebuild replaced our on-disk file, so /proc/self/exe now reads
+    # ".../focim (deleted)", which would make execv fail with ENOENT. `dir` was
+    # captured before the build, and the rebuild writes `-o:focim` into it.
+    let bin = dir / "focim"
+    if not fileExists(bin):
+      app.msg = "recompile: built binary not found at " & bin; return
     let argv = allocCStringArray(@[bin, fileArg, "--goto", $line])
     discard execv(bin.cstring, argv)
-    app.msg = "recompile: exec failed"   # only reached if execv failed
+    app.msg = "recompile: exec failed (" & bin & ")"   # only if execv failed
 
 proc editConfig*(app: var App) =
   ## Open src/focimconfig.nim in the editor (edit, then reload-config / C-c r).
@@ -607,25 +613,9 @@ proc registerBuiltins*() =
   defcommand("new-terminal", "New bash terminal session", newTerminal)
   defcommand("edit-config", "Edit config file", editConfig)
   defcommand("reload-config", "Reload config (recompile & restart)", reloadConfig)
-  bindkey("C-s", "save")
-  bindkey("C-c r", "recompile")
-  bindkey("C-c o", "refresh-objects")
-  bindkey("C-c e", "src-edit-block")     # zoom into the block (org-edit-special)
-  bindkey("C-c b", "src-edit-block")
-  bindkey("C-c t", "src-edit-session")
-  bindkey("C-c n", "focus-next")
-  bindkey("C-c s", "switch-session")
-  bindkey("C-c k", "new-terminal")
-  bindkey("C-c f", "edit-config")
-  bindkey("F1", "show-help")
-  bindkey("C-Space", "complete")
-  bindkey("C-q", "quit")
-  bindkey("C-Enter", "run-line")
-  bindkey("C-c C-c", "babel-execute")
-  bindkey("C-/", "comment-toggle")
-  bindkey("C-z", "undo")
-  bindkey("C-y", "redo")
-  # Shift+letter chords don't reach the X11 driver (only unshifted keysyms are
-  # mapped), so the palette lives on M-x; C-S-p kept as a harmless alias.
+  # The full keymap lives in focimconfig.nim so every binding is visible and
+  # editable in one place (M-x edit-config, then C-c r). These two are a
+  # recovery net kept here: a config that removes its binds can still open the
+  # palette (and from there reload-config/edit-config) and quit.
   bindkey("M-x", "palette")
-  bindkey("C-S-p", "palette")
+  bindkey("C-q", "quit")

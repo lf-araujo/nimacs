@@ -10,16 +10,41 @@ import focimcore
 import std/times
 
 proc configure*(app: var App) =
-  # 1. A brand-new command, written in Nim, bound to a two-key sequence.
+  # ---- Keymap ---------------------------------------------------------------
+  # Every default binding lives here so you can see and change them all. The
+  # command names come from focimcore's registerBuiltins (run M-x to browse
+  # them). Rebind, remove, or add freely, then C-c r to apply. (M-x and C-q are
+  # also set in core as a recovery net.) Note: Shift+letter chords don't reach
+  # the X11 driver, so the palette is M-x, not C-S-p.
+  bindkey("M-x", "palette")
+  bindkey("C-S-p", "palette")           # harmless alias where it works
+  bindkey("C-s", "save")
+  bindkey("C-q", "quit")
+  bindkey("C-z", "undo")
+  bindkey("C-y", "redo")
+  bindkey("C-/", "comment-toggle")
+  bindkey("C-Space", "complete")        # LSP completion
+  bindkey("F1", "show-help")            # help for word at cursor
+  bindkey("C-Enter", "run-line")        # send the current line to the session
+  bindkey("C-c C-c", "babel-execute")   # run the org src block
+  bindkey("C-c e", "src-edit-block")    # zoom into the block (org-edit-special)
+  bindkey("C-c b", "src-edit-block")
+  bindkey("C-c t", "src-edit-session")  # tangle all same-session blocks
+  bindkey("C-c o", "refresh-objects")
+  bindkey("C-c n", "focus-next")        # cycle pane focus
+  bindkey("C-c s", "switch-session")    # cycle the current session
+  bindkey("C-c k", "new-terminal")      # bash terminal session
+  bindkey("C-c f", "edit-config")       # open this file
+  bindkey("C-c r", "reload-config")     # recompile & restart
+
+  # ---- Your customisations --------------------------------------------------
+  # A brand-new command, written in Nim, bound to a two-key sequence.
   defcommand("insert-date", "Insert today's date", proc(a: var App) =
     a.ed.insertText(now().format("yyyy-MM-dd"))
     a.msg = "inserted date")
   bindkey("C-c d", "insert-date")
 
-  # 2. Rebind an existing built-in (keys are just data).
-  bindkey("C-w", "quit")
-
-  # 3. Teach focim a new language: Python org-babel :session blocks.
+  # Teach focim a new language: Python org-babel :session blocks.
   registerRepl("python", pySpec)
 
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
