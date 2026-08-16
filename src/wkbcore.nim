@@ -746,9 +746,11 @@ proc openTerminalWith*(app: var App; cmd: string) =
   app.msg = "terminal: " & cmd
 
 proc claudeIde*(app: var App) =
-  ## Open a terminal in the bottom panel and run claude in it. (Full claude-code-
-  ## ide integration -- inline diffs, etc. -- is future work.)
-  openTerminalWith(app, "claude")
+  ## Open a terminal in the bottom panel. NOTE: the widget is pipe-based (no
+  ## PTY), so claude's full-screen TUI floods/locks it -- we open bash for now.
+  ## Running claude's TUI in-pane needs the PTY/VT work (the real claude-code-ide).
+  openTerminalWith(app, "bash")
+  app.msg = "terminal (bash) -- claude's TUI needs a real PTY; that's future work"
 
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
