@@ -545,6 +545,21 @@ proc recompileConfig*(app: var App) =
     discard execv(bin.cstring, argv)
     app.msg = "recompile: exec failed"   # only reached if execv failed
 
+proc editConfig*(app: var App) =
+  ## Open src/focimconfig.nim in the editor (edit, then reload-config / C-c r).
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  let p = getAppDir() / "src" / "focimconfig.nim"
+  if not fileExists(p): app.msg = "config not found: " & p; return
+  app.filePath = p
+  app.ed.loadFromFile(p)
+  app.ed.lang = fileExtToLanguage(".nim")
+  app.docLang = "nim"
+  app.msg = "editing config -- reload with C-c r (or M-x reload-config)"
+
+proc reloadConfig*(app: var App) =
+  ## Rebuild (recompiling focimconfig.nim into the binary) and restart.
+  recompileConfig(app)
+
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
   gRepls["python"] = pySpec
@@ -590,6 +605,8 @@ proc registerBuiltins*() =
   defcommand("focus-next", "Focus next pane", focusNext)
   defcommand("switch-session", "Switch to next session", switchSession)
   defcommand("new-terminal", "New bash terminal session", newTerminal)
+  defcommand("edit-config", "Edit config file", editConfig)
+  defcommand("reload-config", "Reload config (recompile & restart)", reloadConfig)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
@@ -599,6 +616,7 @@ proc registerBuiltins*() =
   bindkey("C-c n", "focus-next")
   bindkey("C-c s", "switch-session")
   bindkey("C-c k", "new-terminal")
+  bindkey("C-c f", "edit-config")
   bindkey("F1", "show-help")
   bindkey("C-Space", "complete")
   bindkey("C-q", "quit")

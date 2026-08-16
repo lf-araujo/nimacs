@@ -171,6 +171,7 @@ proc main() =
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
+  var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
   let statusBg = color(32, 35, 42)
@@ -183,12 +184,19 @@ proc main() =
     if e.kind in {WindowCloseEvent, QuitEvent}: break
 
     var consumed = false
-    if app.paletteActive:
-      handlePalette(app, e); consumed = true
-    elif app.completionActive:
-      consumed = handleCompletion(app, e)
+    if suppressText:
+      suppressText = false
+      if e.kind == TextInputEvent: consumed = true   # the char after e.g. "C-c e"
+    if not consumed:
+      if app.paletteActive:
+        handlePalette(app, e); consumed = true
+      elif app.completionActive:
+        consumed = handleCompletion(app, e)
+    let hadPrefix = app.pendingPrefix.len > 0
     if not consumed and not app.paletteActive:
       consumed = dispatch(app, e)
+    if hadPrefix and consumed and e.kind == KeyDownEvent:
+      suppressText = true          # its TextInput would otherwise be inserted
 
     # Session pane as a live REPL: when it has focus, type at the prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
