@@ -9,7 +9,7 @@ import uirelays
 import vendor/synedit          # our patched copy of uirelays' SynEdit (adds langR/langOrg)
 import focimsession
 import nimacs/lsp                    # pure std/json LSP client -- portable, no GTK
-import std/[tables, strutils, os, osproc]
+import std/[tables, strutils, os, osproc, algorithm]
 when defined(posix): import std/posix
 
 export uirelays, synedit, focimsession, lsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
@@ -401,6 +401,34 @@ proc srcEditBlock*(app: var App) =
 proc srcEditSession*(app: var App) =
   if app.editMode != emNone: srcEditExit(app) else: srcEditEnter(app, true)
 
+proc sessionKeys*(app: App): seq[string] =
+  for k in app.sessions.keys: result.add k
+  sort(result)
+
+proc switchSession*(app: var App) =
+  ## Cycle the current session (the one the pane/objects/help track).
+  let keys = app.sessionKeys()
+  if keys.len == 0: app.msg = "no sessions yet"; return
+  let curKey = app.curLang & "/" & app.curSession
+  var i = -1
+  for k, name in keys:
+    if name == curKey: i = k
+  let nk = keys[(i + 1) mod keys.len]
+  let parts = nk.split('/')
+  app.curLang = parts[0]
+  app.curSession = if parts.len > 1: parts[1] else: "default"
+  app.focus = "session"
+  refreshObjects(app)
+  app.msg = "session: " & nk
+
+proc newTerminal*(app: var App) =
+  ## Start (or reuse) a bash shell session and switch the pane to it.
+  discard getSession(app, "bash", "term")
+  app.curLang = "bash"; app.curSession = "term"
+  app.focus = "session"
+  app.sess.appendOutput("-- bash terminal --\n")
+  app.msg = "terminal: bash/term"
+
 proc focusNext*(app: var App) =
   const order = ["editor", "session", "objects", "help"]
   var i = 0
@@ -519,11 +547,14 @@ proc recompileConfig*(app: var App) =
 
 proc registerBuiltins*() =
   gRepls["r"] = rSpec
+  gRepls["python"] = pySpec
+  gRepls["bash"] = bashSpec
   gRebuildCmd = detectRebuildCmd()   # config may override before first C-c r
 
   gLspServers["nim"] = "nimlangserver"
   gLspServers["python"] = "pylsp"
   gLspServers["r"] = "R --no-echo -e languageserver::run()"
+  gObjectsQuery["bash"] = "compgen -v | sort | head -60\n"
 
   gObjectsQuery["r"] =
     "local({ ns <- ls(envir=.GlobalEnv); " &
@@ -557,6 +588,8 @@ proc registerBuiltins*() =
   defcommand("src-edit-block", "Src-edit: this block (org-edit-special)", srcEditBlock)
   defcommand("src-edit-session", "Src-edit: tangle this session's blocks", srcEditSession)
   defcommand("focus-next", "Focus next pane", focusNext)
+  defcommand("switch-session", "Switch to next session", switchSession)
+  defcommand("new-terminal", "New bash terminal session", newTerminal)
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
@@ -564,6 +597,8 @@ proc registerBuiltins*() =
   bindkey("C-c b", "src-edit-block")
   bindkey("C-c t", "src-edit-session")
   bindkey("C-c n", "focus-next")
+  bindkey("C-c s", "switch-session")
+  bindkey("C-c k", "new-terminal")
   bindkey("F1", "show-help")
   bindkey("C-Space", "complete")
   bindkey("C-q", "quit")
@@ -572,4 +607,7 @@ proc registerBuiltins*() =
   bindkey("C-/", "comment-toggle")
   bindkey("C-z", "undo")
   bindkey("C-y", "redo")
+  # Shift+letter chords don't reach the X11 driver (only unshifted keysyms are
+  # mapped), so the palette lives on M-x; C-S-p kept as a harmless alias.
+  bindkey("M-x", "palette")
   bindkey("C-S-p", "palette")

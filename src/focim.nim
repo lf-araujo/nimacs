@@ -16,7 +16,9 @@ const fontPath =
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
-const layoutPlain =
+const layoutBare =                         # no session yet: just the editor
+  "(layout (editor) (divS (px 2)) (status (lines 1)))"
+const layoutPlain =                        # a session exists
   "(layout (editor) (divH1 (px 2)) (session (lines 12)) (divS (px 2)) (status (lines 1)))"
 const layoutSrc =                          # the 4-quadrant src-edit env
   "(layout" &
@@ -150,7 +152,8 @@ proc main() =
     app.docLang = langIdOf(ext)            # for LSP
   else:
     app.ed.setText("#+TITLE: focim scratch\n\n" &
-                   "C-c C-c runs the block; C-Enter runs a line; C-S-p opens the palette.\n\n" &
+                   "C-c C-c runs the block; C-Enter runs a line; M-x opens the palette.\n" &
+                   "C-c k opens a terminal; C-c s switches session; C-c n cycles focus.\n\n" &
                    "#+begin_src r :session default\n" &
                    "x <- c(10, 20, 30)\nmean(x)\nsummary(x)\n#+end_src\n")
   app.sess.setText("session output\n")
@@ -164,6 +167,7 @@ proc main() =
   configure(app)            # user config (focimconfig.nim) -- full-typed, no ABI
   app.runHooks("startup")
 
+  let layBare = parseLayout(layoutBare)
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
@@ -206,7 +210,9 @@ proc main() =
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
 
     screen = getWindowLayout()
-    let lay = if app.srcEdit: laySrc else: layPlain
+    let lay = if app.srcEdit: laySrc
+              elif app.sessions.len > 0: layPlain
+              else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
     if e.kind == MouseDownEvent:          # click a pane to focus it
@@ -238,9 +244,24 @@ proc main() =
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)
+      let bh = lineH                       # top row = session switcher bar
       let ph = lineH                       # bottom row = live REPL prompt
+      # switcher bar: one chip per open session, current highlighted
+      let barRect = rect(r.x, r.y, r.w, bh)
+      fillRect(barRect, color(26, 30, 38))
+      var cx = r.x + 4
+      let curKey = app.curLang & "/" & app.curSession
+      for k in app.sessionKeys():
+        let chipBg = if k == curKey: color(70, 100, 70) else: color(40, 44, 52)
+        let label = " " & k & " "
+        let w = label.len * (metrics.lineHeight div 2) + 4
+        fillRect(rect(cx, r.y, w, bh), chipBg)
+        discard drawText(app.font, cx + 2, r.y, label, color(220, 224, 210), chipBg)
+        cx += w + 4
+      # transcript
       discard app.sess.draw(evFor("session"),
-        rect(r.x, r.y, r.w, max(lineH, r.h - ph)), focused = app.focus == "session")
+        rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh - ph)), focused = app.focus == "session")
+      # prompt
       let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
       let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
       fillRect(pr, pbg)

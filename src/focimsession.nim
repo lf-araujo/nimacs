@@ -57,6 +57,16 @@ let pySpec* = ReplSpec(
   run: "_nimacs_run('{file}')\n",
   quit: "exit()\n")
 
+let bashSpec* = ReplSpec(
+  argv: @["bash", "--norc", "--noprofile"],
+  env: @[("PS1", ""), ("PS2", "")],
+  # adjacent quoted strings are concatenated by bash, so the marker literal
+  # never appears contiguously in this function's definition.
+  prime: "nimacs_run() { echo \"__NIMACS\"\"_BOR__\"; source \"$1\" 2>&1; echo \"__NIMACS\"\"_END__\"; }\n",
+  ready: "echo \"NIMACS\"\"xREADY\"\n",
+  run: "nimacs_run '{file}'\n",
+  quit: "exit\n")
+
 proc ptyWrite(fd: cint; s: string) =
   var off = 0
   while off < s.len:
