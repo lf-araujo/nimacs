@@ -13,6 +13,10 @@ requires "https://github.com/nim-lang/uirelays"
 task run, "Build and run wkbenchless":
   exec "nim c -r -o:wkbenchless src/wkbenchless.nim"
 
+task release, "Build an optimized, stripped single binary to share":
+  # Runs standalone -- only needs system libX11/libXft at runtime, no compiler.
+  exec "nim c -d:release -d:danger --opt:size --passL:-s -o:wkbenchless src/wkbenchless.nim"
+
 task bundle, "Bundle a self-contained toolchain (Nim + zig) so C-c r needs no system compiler":
   # Pass the zig path after `--`, e.g.  nimble bundle -- /opt/zig/zig
   let zig = if paramCount() >= 3: paramStr(paramCount()) else: ""

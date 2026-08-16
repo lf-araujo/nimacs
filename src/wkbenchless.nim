@@ -153,11 +153,9 @@ proc main() =
     app.docLang = langIdOf(ext)            # for LSP
     app.ed.loadFromFile(app.filePath)
   else:
-    app.ed.setText("#+TITLE: wkbenchless scratch\n\n" &
-                   "C-c C-c runs the block; C-Enter runs a line; M-x opens the palette.\n" &
-                   "C-c k opens a terminal; C-c s switches session; C-c n cycles focus.\n\n" &
-                   "#+begin_src r :session default\n" &
-                   "x <- c(10, 20, 30)\nmean(x)\nsummary(x)\n#+end_src\n")
+    app.ed.lang = langOrg                  # before setText, so org highlights now
+    app.docLang = ""
+    app.ed.setText(staticRead("../examples/welcome.org"))
   app.sess.setText("session output\n")
 
   # `--goto N`: restore the cursor line after a recompile re-exec.

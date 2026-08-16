@@ -1,48 +1,43 @@
-#+TITLE: Welcome to nimacs
-#+AUTHOR: nimacs
+#+TITLE: Welcome to wkbenchless
+#+AUTHOR: wkbenchless
 
 * Getting started
 
 This is an example [[https://orgmode.org][Org]] document, opened by default when
-you start nimacs without a file. *Org babel mode* is already on, so this prose is
-set in a proportional font while the source block below switches to monospace.
+you start wkbenchless without a file. Code inside =#+begin_src= blocks is
+syntax-highlighted in its own language, right here in the org buffer.
 
 * An R source block
 
-Put the cursor anywhere inside the block below and press =C-c C-c=. nimacs runs
-the code through Rscript, captures its output, and writes a =#+RESULTS:= block
-right after it (re-running updates the results in place).
+Put the cursor anywhere inside the block below and press =C-c C-c=. wkbenchless
+runs the code in a persistent R session, captures its output, and writes a
+=#+RESULTS:= block right after it (re-running updates the results in place).
 
-#+begin_src R :results output
+#+begin_src R :session demo
   # Fit a simple model on a built-in dataset
   data(mtcars)
   fit <- lm(mpg ~ wt + hp, data = mtcars)
-  summary(fit)
+  coef(fit)
 #+end_src
 
 * Sessions: state that persists across blocks
 
-Add a =:session name= header and the block runs in a long-lived R process, so
-variables, loaded packages, and options carry over to later blocks with the same
-session name. Run the two blocks below in order (=C-c C-c= in each):
+The =:session name= header runs the block in a long-lived process, so variables,
+loaded packages, and options carry over to later blocks with the same session
+name. =fit= below still exists from the block above:
 
 #+begin_src R :session demo
-  df <- mtcars
-  fit <- lm(mpg ~ wt + hp, data = df)
-  coef(fit)
-#+end_src
-
-#+begin_src R :session demo
-  # `fit` still exists here -- it came from the previous block
   round(summary(fit)$r.squared, 3)
 #+end_src
 
-* Other languages and shared sessions
+The bottom pane is that session, live. Focus it (=C-c n= to cycle panes, or
+click it) and type at the =r>= prompt to poke at =fit= directly -- same process.
+=C-c s= switches between open sessions; =C-c k= opens a bash terminal.
 
-R, Python, and bash all support persistent =:session= interpreters -- the same
-process the terminal pane (⌨ in the header) displays. Run these Python blocks in
-order; the second sees =xs= from the first, and it's the very R/Python/bash you
-can poke at live in the terminal:
+* Other languages
+
+R, Python, and bash all support persistent =:session= interpreters. Run these
+Python blocks in order; the second sees =xs= from the first:
 
 #+begin_src python :session py
   xs = [1, 2, 3, 4]
@@ -50,30 +45,23 @@ can poke at live in the terminal:
 #+end_src
 
 #+begin_src python :session py
-  # xs persists from the previous block
-  print("max:", max(xs))
+  print("max:", max(xs))   # xs persists from the previous block
 #+end_src
 
-* Ask Claude, inline
+* Editing code with LSP
 
-The stock config also wires Claude as a babel language: write a prompt in a
-=claude= block and =C-c C-c= sends it to =claude -p=, writing the reply to
-=#+RESULTS= (needs the =claude= CLI on your PATH).
-
-#+begin_src claude
-In one sentence, what is a mixed-effects model?
-#+end_src
+Press =C-c e= inside a block to zoom into it as a real code file: full LSP
+completion (=C-Space=), help on the word at the cursor (=F1=), and the
+objects/environment pane on the right. =C-c e= again splices it back into the
+org document.
 
 * Next steps
 
-- Run any =#+begin_src= block with =C-c C-c=. Add =:session name= for a
-  persistent interpreter shared with the terminal pane; omit it for a fresh
-  one-shot run.
-- Open the ⌨ terminal to interact with the latest =:session= directly -- set a
-  variable in a block, then inspect it live (same process).
-- Register one-shot runners / highlighting for more languages in =config.nim=
-  with =bindLang=.
-- Press =C-s= to save. This is a scratch buffer, so pass a path on the command
-  line (=nimacs file.org=) to enable saving to a real file.
-- Edit =config.nim= from the header bar, then Reload Config (=C-S-r=) to
-  hot-swap your keybindings while the app keeps running.
+- Run any =#+begin_src= block with =C-c C-c=; =C-Enter= sends just the current
+  line. Add =:session name= for a shared, persistent interpreter.
+- =M-x= (or =C-p=) opens the command palette -- every command is there.
+- =C-s= saves. This is a scratch buffer, so pass a path on the command line
+  (=wkbenchless file.org=) to save to a real file.
+- Your whole configuration is plain Nim in =src/wkbconfig.nim= -- open it with
+  =C-c f=, add a =bindkey=, =defcommand=, or =registerRepl=, then =C-c r= to
+  recompile and restart in place. The full keymap lives there.
