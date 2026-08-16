@@ -560,7 +560,7 @@ proc registerBuiltins*() =
   bindkey("C-s", "save")
   bindkey("C-c r", "recompile")
   bindkey("C-c o", "refresh-objects")
-  bindkey("C-c e", "toggle-src-edit")
+  bindkey("C-c e", "src-edit-block")     # zoom into the block (org-edit-special)
   bindkey("C-c b", "src-edit-block")
   bindkey("C-c t", "src-edit-session")
   bindkey("C-c n", "focus-next")

@@ -2756,20 +2756,22 @@ proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
     s.mouseDragging = false
 
   of MouseMoveEvent:
+    # focim fix: extend the selection on a PLAIN left-drag. Upstream only
+    # updated mouseX/mouseY while LinkMod (Ctrl) was held and cancelled the drag
+    # on every other move, so a normal drag never marked anything. The drag now
+    # ends on MouseUp, as it should.
+    if s.mouseDragging:
+      s.mouseX = e.x
+      s.mouseY = e.y
+      s.clicks = 1
     if (LinkMod in e.mods) and area.contains(point(e.x, e.y)):
       s.probeX = e.x
       s.probeY = e.y
       s.probeActive = true
       s.probeResult = -1
-      if s.mouseDragging:
-        s.mouseX = e.x
-        s.mouseY = e.y
-        s.clicks = 1
     else:
       s.probeActive = false
       s.probeResult = -1
-      if s.mouseDragging:
-        s.mouseDragging = false
     if s.scrollGrabbed and hasScrollBar:
       let trackH = float(area.h - 2)
       let totalLines = s.numberOfLines.int + s.span
