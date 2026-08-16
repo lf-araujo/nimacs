@@ -12,6 +12,16 @@ when not declared(posix_openpt):
   proc unlockpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
   proc ptsname(fd: cint): cstring {.importc, header: "<stdlib.h>".}
 
+type WinSz = object
+  ws_row, ws_col, ws_xpixel, ws_ypixel: cushort
+proc ioctl(fd, request: cint; argp: pointer): cint {.importc, header: "<sys/ioctl.h>", varargs.}
+const TIOCSWINSZ = 0x5414   # Linux
+
+proc setSize(master: cint; rows, cols: int) =
+  if master < 0: return
+  var ws = WinSz(ws_row: cushort(max(1, rows)), ws_col: cushort(max(1, cols)))
+  discard ioctl(master, TIOCSWINSZ.cint, addr ws)
+
 type
   PtyTerm* = object
     master*: cint         ## -1 when not running
@@ -41,9 +51,13 @@ proc startPty*(cmd, dir: string): PtyTerm =
     discard execv(exe.cstring, argv)
     quit(127)
   discard fcntl(master, F_SETFL, O_NONBLOCK)
+  setSize(master, 24, 80)          # give the child a sane terminal size
   result.master = master
   result.pid = pid
   result.outbuf = ""
+
+proc setPtySize*(t: PtyTerm; rows, cols: int) =
+  setSize(t.master, rows, cols)
 
 proc pump*(t: var PtyTerm) =
   ## Drain whatever the pty has (non-blocking). Also reaps: if the child closed

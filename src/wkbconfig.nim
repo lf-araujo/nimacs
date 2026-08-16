@@ -57,6 +57,11 @@ proc configure*(app: var App) =
   # Teach wkbenchless a new language: Python org-babel :session blocks.
   registerRepl("python", pySpec)
 
+  # Where terminals (M-t / C-c a) start. Empty = auto: the current file's git
+  # project root (falling back to its directory). Set an absolute or ~ path to
+  # override, e.g.  gTerminalDir = "~/projects/analysis"
+  gTerminalDir = ""
+
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
   #    note after every babel run.
   addHook("startup", proc(a: var App) =

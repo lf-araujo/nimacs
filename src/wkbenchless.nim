@@ -219,8 +219,7 @@ proc main() =
 
     if app.termRequest.len > 0:               # (re)start the terminal process
       closePty(pty)
-      let dir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
-      pty = startPty(app.termRequest, dir)
+      pty = startPty(app.termRequest, terminalDir(app))
       if not pty.alive: app.msg = "could not start " & app.termRequest
       app.termRequest = ""
     if app.termActive: pump(pty)
@@ -370,6 +369,8 @@ proc main() =
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
       if app.termActive:
         # scrolling, ANSI-stripped terminal output (v1: no cursor/VT emulation)
+        if pty.alive:
+          setPtySize(pty, max(1, body.h div lineH), max(1, body.w div max(1, lineH div 2)))
         let lines = stripAnsi(pty.outbuf).splitLines()
         let rows = max(1, body.h div lineH)
         let start = max(0, lines.len - rows)

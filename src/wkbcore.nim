@@ -737,6 +737,24 @@ proc reloadConfig*(app: var App) =
   recompileConfig(app)
 
 # -- terminal / panel ------------------------------------------------------
+var gTerminalDir*: string   ## config override for the terminal cwd ("" = auto)
+
+proc projectRoot*(app: App): string =
+  ## The nearest ancestor of the current file that contains .git (else the
+  ## file's dir, else the cwd).
+  var cur = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+  let startDir = cur
+  while cur.len > 1:
+    if dirExists(cur / ".git"): return cur
+    let up = parentDir(cur)
+    if up == cur: break
+    cur = up
+  startDir
+
+proc terminalDir*(app: App): string =
+  ## Where a new terminal starts: config gTerminalDir if set, else project root.
+  if gTerminalDir.len > 0: expandTilde(gTerminalDir) else: projectRoot(app)
+
 proc openTerminal*(app: var App; cmd: string) =
   ## Ask the host to run `cmd` in the thread-free PTY terminal (bottom panel).
   app.termActive = true
