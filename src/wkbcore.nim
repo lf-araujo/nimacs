@@ -47,6 +47,8 @@ type
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
     sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
+    termActive*: bool                     ## bottom panel shows the PTY terminal
+    termRequest*: string                  ## command the host should run in the PTY
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -734,25 +736,14 @@ proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
 
-# -- claude launcher / panel -----------------------------------------------
-proc launchClaude*(app: var App) =
-  ## Open claude in a terminal emulator, in the file's dir. (An in-pane terminal
-  ## needs a thread-free PTY implementation -- future claude-code-ide work; the
-  ## uirelays Terminal widget's background thread wedges input under XWayland.)
-  let dir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
-  var term = ""
-  for t in ["xfce4-terminal", "x-terminal-emulator", "alacritty", "kitty",
-            "foot", "gnome-terminal", "konsole", "xterm"]:
-    if findExe(t).len > 0: term = t; break
-  if term.len == 0: app.msg = "no terminal emulator found on PATH"; return
-  let run = "bash -c 'claude; exec bash'"
-  let inv = case term
-    of "xfce4-terminal": " -x " & run
-    of "gnome-terminal": " -- " & run
-    of "kitty", "foot": " " & run
-    else: " -e " & run
-  discard execShellCmd("cd " & quoteShell(dir) & " && " & term & inv & " >/dev/null 2>&1 &")
-  app.msg = "launched claude in " & term
+# -- terminal / panel ------------------------------------------------------
+proc openTerminal*(app: var App; cmd: string) =
+  ## Ask the host to run `cmd` in the thread-free PTY terminal (bottom panel).
+  app.termActive = true
+  app.sessionHidden = false
+  app.termRequest = cmd
+  app.focus = "session"
+  app.msg = "terminal: " & cmd
 
 proc showPanel*(app: var App) =
   app.sessionHidden = false; app.focus = "session"; app.msg = "panel shown"
@@ -942,7 +933,10 @@ proc registerBuiltins*() =
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
-  defcommand("claude", "Launch claude in a terminal", launchClaude)
+  defcommand("terminal", "Open a bash terminal in the bottom panel",
+             proc(app: var App) = openTerminal(app, "bash --norc"))
+  defcommand("claude", "Open claude in the bottom panel (best-effort)",
+             proc(app: var App) = openTerminal(app, "claude"))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)

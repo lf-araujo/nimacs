@@ -10,6 +10,7 @@ import uirelays
 import uirelays/layout
 import wkbcore
 import wkbconfig
+import wkbpty
 import std/[os, tables, strutils]
 
 const fontPath =
@@ -200,6 +201,7 @@ proc main() =
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
+  var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
   var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
@@ -209,8 +211,19 @@ proc main() =
 
   var e: Event
   while app.running:
-    if not waitEvent(e): continue
+    let liveTerm = app.termActive and not app.sessionHidden
+    if not waitEvent(e, if liveTerm: 30 else: -1):
+      if liveTerm: e = Event(kind: NoEvent)   # tick to poll the pty
+      else: continue
     if e.kind in {WindowCloseEvent, QuitEvent}: break
+
+    if app.termRequest.len > 0:               # (re)start the terminal process
+      closePty(pty)
+      let dir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+      pty = startPty(app.termRequest, dir)
+      if not pty.alive: app.msg = "could not start " & app.termRequest
+      app.termRequest = ""
+    if app.termActive: pump(pty)
 
     var consumed = false
     if suppressText:
@@ -233,21 +246,43 @@ proc main() =
        not app.paletteActive and not app.completionActive:
       consumed = vimHandle(app, e)
 
-    # Session pane as a live REPL: when it has focus, type at the prompt.
+    # Terminal (PTY) gets session-focused input; else the session REPL prompt.
     if not consumed and not app.paletteActive and not app.completionActive and
        app.focus == "session":
-      case e.kind
-      of KeyDownEvent:
-        if e.key == KeyEnter: replSubmit(app); consumed = true
-        elif e.key == KeyBackspace:
-          if app.replInput.len > 0: app.replInput.setLen(app.replInput.len - 1)
+      if app.termActive:
+        case e.kind
+        of TextInputEvent:
+          for ch in e.text:
+            if ch != '\0': pty.feed($ch)
           consumed = true
-      of TextInputEvent:
-        for ch in e.text:
-          if ch == '\0': break
-          app.replInput.add ch
-        consumed = true
-      else: discard
+        of KeyDownEvent:
+          case e.key
+          of KeyEnter: pty.feed("\r"); consumed = true
+          of KeyBackspace: pty.feed("\x7f"); consumed = true
+          of KeyTab: pty.feed("\t"); consumed = true
+          of KeyEsc: pty.feed("\e"); consumed = true
+          of KeyUp: pty.feed("\e[A"); consumed = true
+          of KeyDown: pty.feed("\e[B"); consumed = true
+          of KeyRight: pty.feed("\e[C"); consumed = true
+          of KeyLeft: pty.feed("\e[D"); consumed = true
+          else:
+            if CtrlPressed in e.mods and e.key in {KeyA..KeyZ}:
+              pty.feed($chr(ord(e.key) - ord(KeyA) + 1))   # Ctrl-A..Ctrl-Z
+              consumed = true
+        else: discard
+      else:
+        case e.kind
+        of KeyDownEvent:
+          if e.key == KeyEnter: replSubmit(app); consumed = true
+          elif e.key == KeyBackspace:
+            if app.replInput.len > 0: app.replInput.setLen(app.replInput.len - 1)
+            consumed = true
+        of TextInputEvent:
+          for ch in e.text:
+            if ch == '\0': break
+            app.replInput.add ch
+          consumed = true
+        else: discard
 
     if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
@@ -265,7 +300,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif app.sessions.len > 0 and not app.sessionHidden: layPlain
+              elif (app.sessions.len > 0 or app.termActive) and not app.sessionHidden: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
@@ -325,18 +360,36 @@ proc main() =
         fillRect(rect(cx, r.y, w, bh), chipBg)
         discard drawText(app.font, cx + 2, r.y, label, color(220, 224, 210), chipBg)
         cx += w + 4
+      if app.termActive:                   # a "terminal" chip
+        let tbg = color(70, 90, 110)
+        fillRect(rect(cx, r.y, 10 * (lineH div 2), bh), tbg)
+        discard drawText(app.font, cx + 2, r.y, " terminal ", color(224, 228, 234), tbg)
       let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
       fillRect(xr, color(70, 40, 40))
       discard drawText(app.font, xr.x + bh div 3, r.y, "x", color(230, 190, 190), color(70, 40, 40))
-      let ph = lineH                       # bottom row = live REPL prompt
-      discard app.sess.draw(evFor("session"),
-        rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh - ph)), focused = app.focus == "session")
-      let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
-      let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
-      fillRect(pr, pbg)
-      let caret = if app.focus == "session": "_" else: ""
-      discard drawText(app.font, pr.x + 4, pr.y,
-        app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
+      let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
+      if app.termActive:
+        # scrolling, ANSI-stripped terminal output (v1: no cursor/VT emulation)
+        let lines = stripAnsi(pty.outbuf).splitLines()
+        let rows = max(1, body.h div lineH)
+        let start = max(0, lines.len - rows)
+        var y = body.y
+        for i in start ..< lines.len:
+          discard drawText(app.font, body.x + 4, y, lines[i], color(200, 210, 200), sessBg)
+          y += lineH
+        if not pty.alive:
+          discard drawText(app.font, body.x + 4, y, "[process ended -- Esc-hide, reopen with M-x terminal]",
+                           color(150, 150, 160), sessBg)
+      else:
+        let ph = lineH                     # bottom row = live REPL prompt
+        discard app.sess.draw(evFor("session"),
+          rect(body.x, body.y, body.w, max(lineH, body.h - ph)), focused = app.focus == "session")
+        let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
+        let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
+        fillRect(pr, pbg)
+        let caret = if app.focus == "session": "_" else: ""
+        discard drawText(app.font, pr.x + 4, pr.y,
+          app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
@@ -367,6 +420,7 @@ proc main() =
 
     refresh()
 
+  closePty(pty)
   for s in app.sessions.values: closeSession(s)
   for c in app.lsp.values: shutdownLsp(c)
   closeFont(font)
