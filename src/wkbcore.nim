@@ -29,6 +29,7 @@ type
     pendingPrefix*: string
     buffers*: seq[BufferState]            ## all open buffers (snapshots)
     curBuf*: int                          ## index of the active buffer
+    pendingKill*: bool                    ## a kill-buffer of a dirty buffer awaits confirm
     paletteActive*: bool
     paletteMode*: PaletteMode
     paletteQuery*: string
@@ -174,7 +175,8 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
     for i, b in app.buffers:
       let nm = bufName(b)
       if q.len == 0 or q in nm.toLowerAscii:
-        result.add ($i, nm & (if i == app.curBuf: "  (current)" else: ""))
+        let dirty = if b.ed.changed: " [+]" else: ""
+        result.add ($i, nm & dirty & (if i == app.curBuf: "  (current)" else: ""))
   of pmFiles:
     result.add ("..", "../")
     var dirs, files: seq[tuple[id, label: string]]
@@ -344,6 +346,20 @@ proc openFileCmd*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   app.paletteDir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
   openPalette(app, pmFiles)
+
+proc killBuffer*(app: var App) =
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  if app.buffers.len <= 1: app.msg = "can't kill the last buffer"; return
+  app.syncActive()
+  if app.ed.changed and not app.pendingKill:   # guard unsaved work
+    app.pendingKill = true
+    app.msg = "unsaved -- kill-buffer again to discard, or C-s to save"
+    return
+  app.pendingKill = false
+  let killed = bufName(app.buffers[app.curBuf])
+  app.buffers.delete(app.curBuf)
+  app.activate(max(0, app.curBuf - 1))
+  app.msg = "killed " & killed
 
 proc toggleSrcEdit*(app: var App) =
   ## Show/hide the objects+help right column (the "src-edit environment").
@@ -694,6 +710,7 @@ proc registerBuiltins*() =
   defcommand("palette", "Command palette", paletteCmd)
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
+  defcommand("kill-buffer", "Kill the current buffer", killBuffer)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
