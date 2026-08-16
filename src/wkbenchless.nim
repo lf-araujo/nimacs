@@ -265,7 +265,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif app.sessions.len > 0: layPlain
+              elif app.sessions.len > 0 or app.claudeMode: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
@@ -275,6 +275,15 @@ proc main() =
           let r = cells[nm]
           if e.x >= r.x and e.x < r.x + r.w and e.y >= r.y and e.y < r.y + r.h:
             app.focus = nm
+      # click a session tab (top bar of the session pane) to select it
+      if cells.hasKey("session"):
+        let r = cells["session"]
+        if e.y >= r.y and e.y < r.y + lineH:
+          var cx = r.x + 4
+          for k in app.sessionKeys():
+            let w = (" " & k & " ").len * (lineH div 2) + 4
+            if e.x >= cx and e.x < cx + w: setSession(app, k); break
+            cx += w + 4
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
     var editorRect = rect(0, 0, screen.width, screen.height)

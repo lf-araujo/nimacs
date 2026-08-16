@@ -46,6 +46,8 @@ type
     vimEnabled*: bool                     ## modal (vim) editing
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
+    claudeMode*: bool                     ## Claude Code chat in the bottom pane
+    claudeStarted*: bool                  ## a conversation exists (use --continue)
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -315,12 +317,28 @@ proc runLine*(app: var App) =
   app.msg = "ran line"
   refreshObjects(app)
 
+proc claudeDir(app: App): string =
+  if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+
+proc claudeSend*(app: var App; prompt: string) =
+  ## Send a message to Claude Code (print mode), continuing the conversation.
+  ## Claude runs in the file's dir, so it has session access to the project.
+  app.claudeMode = true
+  app.sess.appendOutput("\nyou> " & prompt & "\n")
+  let cmd = "claude -p" & (if app.claudeStarted: " --continue" else: "")
+  app.claudeStarted = true
+  let (outp, code) = execCmdEx(cmd, input = prompt, workingDir = app.claudeDir)
+  app.sess.appendOutput("claude> " & outp.strip() & "\n")
+  if code != 0: app.msg = "claude exited " & $code
+  else: app.msg = "claude replied"
+
 proc replSubmit*(app: var App) =
   ## Run the session pane's prompt line in the current session (the same one the
   ## blocks use, so state is shared) and echo the result.
   let line = app.replInput
   app.replInput = ""
   if strutils.strip(line).len == 0: return
+  if app.curLang == "claude": claudeSend(app, line); return
   let lang = if app.curLang.len > 0: app.curLang else: "r"
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   app.sess.appendOutput(lang & "> " & line & "\n")
@@ -579,6 +597,15 @@ proc switchSession*(app: var App) =
   refreshObjects(app)
   app.msg = "session: " & nk
 
+proc setSession*(app: var App; key: string) =
+  ## Make `key` ("lang/name") the current session (e.g. clicking a session tab).
+  let parts = key.split('/')
+  app.curLang = parts[0]
+  app.curSession = if parts.len > 1: parts[1] else: "default"
+  app.focus = "session"
+  refreshObjects(app)
+  app.msg = "session: " & key
+
 proc newTerminal*(app: var App) =
   ## Start (or reuse) a bash shell session and switch the pane to it.
   discard getSession(app, "bash", "term")
@@ -723,6 +750,37 @@ proc editConfig*(app: var App) =
 proc reloadConfig*(app: var App) =
   ## Rebuild (recompiling wkbconfig.nim into the binary) and restart.
   recompileConfig(app)
+
+# -- Claude mode -----------------------------------------------------------
+proc claudeCmd*(app: var App) =
+  ## Open Claude Code in the bottom pane -- type messages at the prompt.
+  app.claudeMode = true
+  app.curLang = "claude"; app.curSession = "claude"; app.focus = "session"
+  if not app.claudeStarted:
+    app.sess.appendOutput("-- Claude Code (dir: " & app.claudeDir & ") --\n")
+  app.msg = "Claude mode"
+
+proc claudeSendBlock*(app: var App) =
+  ## Send the current src block (or the current line) to Claude as context.
+  var text = ""
+  let cb = findBlockAt(app, app.ed.currentLine)
+  if cb.b >= 0:
+    var body: seq[string]
+    for i in cb.b + 1 ..< cb.e: body.add app.ed.getLineText(i)
+    text = dedentBody(body)
+  else:
+    text = app.ed.getLineText(app.ed.currentLine)
+  if strutils.strip(text).len == 0: app.msg = "nothing to send to Claude"; return
+  app.curLang = "claude"; app.curSession = "claude"; app.focus = "session"
+  claudeSend(app, "```\n" & text & "\n```")
+
+proc claudeDiff*(app: var App) =
+  ## Show what changed (git diff) -- Claude Code edits files directly.
+  app.claudeMode = true; app.focus = "session"
+  let (outp, _) = execCmdEx("git diff", workingDir = app.claudeDir)
+  app.sess.appendOutput("--- git diff ---\n" &
+    (if strutils.strip(outp).len > 0: outp else: "(no changes)") & "\n")
+  app.msg = "git diff"
 
 # -- vim mode --------------------------------------------------------------
 proc vimGoto(app: var App; line, col: int) =
@@ -904,6 +962,9 @@ proc registerBuiltins*() =
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
+  defcommand("claude", "Claude Code: chat in the bottom pane", claudeCmd)
+  defcommand("claude-send-block", "Claude: send this block/line", claudeSendBlock)
+  defcommand("claude-diff", "Claude: show git diff of changes", claudeDiff)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
