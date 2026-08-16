@@ -44,9 +44,7 @@ proc configure*(app: var App) =
   bindkey("C--", "zoom-out")
   bindkey("C-0", "zoom-reset")
   bindkey("C-c C-o", "open-link")       # open org link at cursor
-  bindkey("C-c a", "claude")            # Claude Code chat in the bottom pane
-  bindkey("C-c C-a", "claude-send-block")  # send this block/line to Claude
-  bindkey("C-c C-d", "claude-diff")     # git diff of Claude's changes
+  bindkey("C-c a", "claude")            # launch claude in a terminal
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.

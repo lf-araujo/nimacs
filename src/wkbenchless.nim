@@ -24,9 +24,9 @@ const layoutPlain =                        # a session exists
 const layoutSrc =                          # the 4-quadrant src-edit env
   "(layout" &
   "  (cols" &
-  "    (rows (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
+  "    (rows (stretch 4) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
   "    (divV (px 2))" &
-  "    (rows (px 340) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
+  "    (rows (stretch 1) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
   "  (divS (px 2))" &
   "  (status (lines 1)))"
 
@@ -265,7 +265,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif app.sessions.len > 0 or app.claudeMode: layPlain
+              elif app.sessions.len > 0: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
