@@ -37,6 +37,8 @@ proc configure*(app: var App) =
   bindkey("C-c k", "new-terminal")      # bash terminal session
   bindkey("C-c f", "edit-config")       # open this file
   bindkey("C-c r", "reload-config")     # recompile & restart
+  bindkey("C-x C-f", "open-file")       # browse & open a file (palette)
+  bindkey("C-x b", "list-buffers")      # switch buffers (palette)
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.

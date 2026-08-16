@@ -48,11 +48,15 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
   let boxW = min(area.w - 80, 620)
   let bx = area.x + (area.w - boxW) div 2
   let by = area.y + 36
-  let items = paletteFiltered(app)
-  let rows = min(items.len, 10)
+  let items = paletteEntries(app)
+  let rows = min(items.len, 12)
   let boxBg = color(38, 42, 52)
   fillRect(rect(bx, by, boxW, (rows + 1) * lineH + 20), boxBg)
-  discard drawText(app.font, bx + 10, by + 8, "> " & app.paletteQuery,
+  let prompt = case app.paletteMode
+    of pmCommands: "> "
+    of pmBuffers: "buffer: "
+    of pmFiles: app.paletteDir & "/ "
+  discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery,
                    color(235, 235, 235), boxBg)
   var y = by + 8 + lineH + 4
   for i in 0 ..< rows:
@@ -61,18 +65,34 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     discard drawText(app.font, bx + 12, y, items[i][1], color(222, 222, 222), rowBg)
     y += lineH
 
+proc paletteAccept(app: var App) =
+  let items = paletteEntries(app)
+  if app.paletteSel < 0 or app.paletteSel >= items.len: return
+  let id = items[app.paletteSel].id
+  case app.paletteMode
+  of pmCommands:
+    app.paletteActive = false
+    gCommands[id].run(app)
+  of pmBuffers:
+    app.paletteActive = false
+    switchToBuffer(app, parseInt(id))
+  of pmFiles:
+    if id == "..":                          # navigate up, stay open
+      app.paletteDir = parentDir(app.paletteDir); app.paletteQuery = ""; app.paletteSel = 0
+    elif dirExists(id):                     # descend, stay open
+      app.paletteDir = id; app.paletteQuery = ""; app.paletteSel = 0
+    else:
+      app.paletteActive = false
+      openFile(app, id)
+
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
     case e.key
     of KeyEsc: app.paletteActive = false
-    of KeyEnter:
-      let items = paletteFiltered(app)
-      app.paletteActive = false
-      if app.paletteSel >= 0 and app.paletteSel < items.len:
-        gCommands[items[app.paletteSel][0]].run(app)
+    of KeyEnter: paletteAccept(app)
     of KeyUp: app.paletteSel = max(0, app.paletteSel - 1)
     of KeyDown:
-      app.paletteSel = min(max(0, paletteFiltered(app).len - 1), app.paletteSel + 1)
+      app.paletteSel = min(max(0, paletteEntries(app).len - 1), app.paletteSel + 1)
     of KeyBackspace:
       if app.paletteQuery.len > 0:
         app.paletteQuery.setLen(app.paletteQuery.len - 1); app.paletteSel = 0
@@ -157,6 +177,8 @@ proc main() =
     app.ed.lang = langOrg                  # before setText, so org highlights now
     app.docLang = ""
     app.ed.setText(welcomeOrg)
+  app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
+  app.curBuf = 0
   app.sess.setText("session output\n")
 
   # `--goto N`: restore the cursor line after a recompile re-exec.
