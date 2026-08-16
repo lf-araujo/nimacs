@@ -170,6 +170,7 @@ proc main() =
                 running: true, msg: "ready")
   app.ed.showLineNumbers = true
   app.ed.bigFont = bigFont
+  app.ed.theme.fg[TokenClass.Link] = color(96, 160, 255)   # org links in blue
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
@@ -288,7 +289,10 @@ proc main() =
 
     if cells.hasKey("editor"):
       editorRect = cells["editor"]
-      discard app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
+      let act = app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
+      if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
+        app.ed.gotoPos(act.pos)
+        openLink(app)
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)

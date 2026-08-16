@@ -43,6 +43,7 @@ proc configure*(app: var App) =
   bindkey("C-=", "zoom-in")             # font size
   bindkey("C--", "zoom-out")
   bindkey("C-0", "zoom-reset")
+  bindkey("C-c C-o", "open-link")       # open org link at cursor
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.

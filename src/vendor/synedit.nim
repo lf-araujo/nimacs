@@ -1051,6 +1051,17 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.Whitespace)
     pos = lineEnd + 1
   if insideBlock: s.srcBlockRanges.add(blockStart .. last)   # unterminated block
+  # colour [[...]] org links (overrides the base styles above)
+  var lp = first
+  while lp < last:
+    if s[lp] == '[' and s[lp + 1] == '[':
+      var q = lp + 2
+      while q < last and not (s[q] == ']' and s[q + 1] == ']'): inc q
+      if q < last:
+        for k in lp .. q + 1: s.setCellStyle(k, TokenClass.Link)
+        lp = q + 2
+        continue
+    inc lp
 
 proc highlightEverything(s: var SynEdit) =
   if s.lang == langNone: return

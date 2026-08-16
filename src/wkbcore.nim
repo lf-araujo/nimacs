@@ -158,6 +158,7 @@ proc openFile*(app: var App; path: string) =
   var ed = createSynEdit(app.font)
   ed.showLineNumbers = true
   ed.bigFont = app.bigFont
+  ed.theme.fg[TokenClass.Link] = color(96, 160, 255)
   let ext = splitFile(path).ext
   ed.lang = fileExtToLanguage(ext)
   try: ed.loadFromFile(path)
@@ -357,6 +358,41 @@ proc openFileCmd*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   app.paletteDir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
   openPalette(app, pmFiles)
+
+proc orgLinkAt(line: string; col: int): string =
+  ## The TARGET of the [[TARGET]] / [[TARGET][DESC]] link under `col`, or "".
+  var i = 0
+  while i < line.len - 1:
+    if line[i] == '[' and line[i + 1] == '[':
+      let start = i
+      var j = i + 2
+      while j < line.len - 1 and not (line[j] == ']' and line[j + 1] == ']'): inc j
+      if j < line.len - 1:
+        let endB = j + 1
+        if col >= start and col <= endB:
+          let inner = line[start + 2 ..< j]
+          let sep = inner.find("][")
+          return if sep >= 0: inner[0 ..< sep] else: inner
+        i = endB + 1
+        continue
+    inc i
+
+proc openLink*(app: var App) =
+  ## Open the org link at the cursor with the system tool (browser / file
+  ## manager / viewer), like Emacs org-open-at-point.
+  let target = orgLinkAt(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
+  if target.len == 0: app.msg = "no link at cursor"; return
+  var t = target
+  if t.startsWith("file:"): t = t[5 .. ^1]
+  if t.find("://") < 0 and not t.startsWith("mailto:") and
+     not isAbsolute(t) and app.filePath.len > 0:
+    t = parentDir(app.filePath) / t      # resolve relative file links
+  when defined(windows):
+    discard execShellCmd("start \"\" " & quoteShell(t))
+  else:
+    let opener = when defined(macosx): "open" else: "xdg-open"
+    discard execShellCmd(opener & " " & quoteShell(t) & " &")
+  app.msg = "opening " & target
 
 proc killBuffer*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
@@ -725,6 +761,7 @@ proc registerBuiltins*() =
   defcommand("zoom-in", "Increase font size", zoomIn)
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
+  defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
   defcommand("refresh-objects", "Objects: refresh from session", refreshObjects)
   defcommand("show-help", "Help: for word at cursor", showHelp)
