@@ -21,3 +21,9 @@ Run each **interactively** and note whether keyboard input WORKS or HANGS.
   thread (what it does at startup), not threads in general.
 - all work                  -> the hang needs the app's fuller context; we bisect
   from the real integration next.
+
+- **test5_pty_nothread** — a THREAD-FREE PTY terminal: spawns bash on a
+  pseudo-terminal we own and polls the fd from the main loop (no Nim thread).
+  Type commands, Enter runs them. If keyboard works AND bash output appears here
+  with no hang, this is the path for the real in-pane terminal (and the
+  claude-code-ide) -- it avoids the thread entirely.
