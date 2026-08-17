@@ -1,16 +1,12 @@
-## Interactive REPL sessions on a pseudo-terminal we own -- ported almost
-## verbatim from the GTK version's engine (pure std/posix, so it also covers
-## macOS; Windows will need a ConPTY variant). A ReplSpec drives it; the driver
-## brackets each block's output with markers whose literals are split (paste0)
-## so they never appear in the driver's echo and desync the reader.
+## Interactive REPL sessions -- a `ReplSpec` driving a `Pty` (see wkbpty.nim).
+## The driver brackets each block's output with markers whose literals are split
+## (paste0 / adjacent quoted strings) so they never appear in the driver's own
+## echo and desync the reader. The session runs on the SAME thread-free PTY
+## primitive the in-pane terminal uses -- one spawn path, and `session.pty.outbuf`
+## already holds a live log we can surface as a terminal later.
 
-import std/[posix, os, strutils, tempfiles]
-
-when not declared(posix_openpt):
-  proc posix_openpt(flags: cint): cint {.importc, header: "<stdlib.h>".}
-  proc grantpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
-  proc unlockpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
-  proc ptsname(fd: cint): cstring {.importc, header: "<stdlib.h>".}
+import std/[os, tempfiles, strutils]
+import wkbpty
 
 type
   ReplSpec* = object
@@ -18,9 +14,8 @@ type
     env*: seq[(string, string)]   ## extra env for the child (before execv)
     prime*, ready*, run*, quit*: string
   Session* = ref object
-    master: cint
-    pid: Pid
-    spec: ReplSpec
+    pty*: Pty
+    spec*: ReplSpec
 
 const
   markerBegin = "__NIMACS_BOR__"
@@ -67,50 +62,21 @@ let bashSpec* = ReplSpec(
   run: "nimacs_run '{file}'\n",
   quit: "exit\n")
 
-proc ptyWrite(fd: cint; s: string) =
-  var off = 0
-  while off < s.len:
-    let n = write(fd, unsafeAddr s[off], s.len - off)
-    if n <= 0: break
-    off += n
-
-proc readUntil(fd: cint; token: string): string =
-  var b: array[4096, char]
-  while token notin result:
-    let n = read(fd, addr b[0], b.len)
-    if n <= 0: break
-    for i in 0 ..< n: result.add(b[i])
-
 proc startSession*(spec: ReplSpec): Session =
-  let exe = findExe(spec.argv[0])
-  if exe.len == 0: return nil
-  let master = posix_openpt(O_RDWR or O_NOCTTY)
-  if master < 0: return nil
-  discard grantpt(master); discard unlockpt(master)
-  let sname = $ptsname(master)
-  let argv = allocCStringArray(spec.argv)
-  let pid = fork()
-  if pid == 0:
-    discard setsid()
-    for (k, v) in spec.env: putEnv(k, v)
-    let slave = posix.open(sname.cstring, O_RDWR)
-    discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
-    if slave > 2: discard close(slave)
-    discard close(master)
-    discard execv(exe.cstring, argv)
-    quit(127)
-  discard fcntl(master, F_SETFD, FD_CLOEXEC)   # don't leak into later forks
-  result = Session(master: master, pid: pid, spec: spec)
-  ptyWrite(master, spec.prime)
-  ptyWrite(master, spec.ready)   # sync past banner + prime echo
-  discard readUntil(master, "NIMACSxREADY")
+  var pty = spawnPty(spec.argv, env = spec.env)
+  if not pty.alive: return nil
+  result = Session(pty: pty, spec: spec)
+  result.pty.feed(spec.prime)
+  result.pty.feed(spec.ready)                    # sync past banner + prime echo
+  discard result.pty.readUntil("NIMACSxREADY")
 
 proc runBlock*(s: Session; code: string): string =
   ## Run `code` in the session, returning the captured output.
+  if s == nil or not s.pty.alive: return ""
   let path = genTempPath("wkbenchless-", ".src")
   writeFile(path, code)
-  ptyWrite(s.master, s.spec.run.replace("{file}", path))
-  let acc = readUntil(s.master, markerEnd)
+  s.pty.feed(s.spec.run.replace("{file}", path))
+  let acc = s.pty.readUntil(markerEnd)
   removeFile(path)
   var lines: seq[string]
   var collecting = false
@@ -124,8 +90,4 @@ proc runBlock*(s: Session; code: string): string =
 
 proc closeSession*(s: Session) =
   if s == nil: return
-  ptyWrite(s.master, s.spec.quit)
-  discard close(s.master)
-  discard kill(s.pid, SIGTERM)
-  var status: cint
-  discard waitpid(s.pid, status, 0)
+  s.pty.closePty(s.spec.quit)

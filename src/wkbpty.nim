@@ -1,6 +1,13 @@
-## Thread-free PTY terminal: spawn a program on a pseudo-terminal we own
+## Thread-free PTY primitive: spawn a program on a pseudo-terminal we own
 ## (fork/exec -- NO Nim thread, which floods input with phantom Esc under
 ## labwc/XWayland) and poll the non-blocking master fd from the main loop.
+##
+## `Pty` is the shared low-level object used by BOTH the in-pane terminal and
+## the interactive REPL sessions (wkbsession): openpt/fork/exec, a non-blocking
+## master, a rolling output buffer for live display, feed/size/close. Sessions
+## layer a marker-driven `runBlock` on top of the same primitive (see
+## wkbsession.nim); nothing here spawns twice.
+##
 ## v1 renders a scrolling, ANSI-stripped log; full VT/screen emulation (needed
 ## for claude's TUI) is future work.
 
@@ -23,75 +30,115 @@ proc setSize(master: cint; rows, cols: int) =
   discard ioctl(master, TIOCSWINSZ.cint, addr ws)
 
 type
-  PtyTerm* = object
+  Pty* = object
     master*: cint         ## -1 when not running
     pid*: Pid
-    outbuf*: string       ## accumulated output
+    outbuf*: string       ## accumulated output (live-display log)
+  PtyTerm* = Pty          ## the in-pane terminal is a bare Pty (name kept for the host)
 
-proc startPty*(cmd, dir: string): PtyTerm =
+# --- low-level primitive: spawn / drain / feed / size / close -----------------
+
+proc spawnPty*(argv: openArray[string]; dir = "";
+               env: openArray[(string, string)] = @[];
+               rows = 24; cols = 80): Pty =
+  ## Fork/exec `argv` on a fresh PTY. Master is non-blocking + CLOEXEC.
+  ## Returns a Pty with master == -1 on any failure.
   result.master = -1
-  let parts = cmd.splitWhitespace()
-  if parts.len == 0: return
-  let exe = findExe(parts[0])
+  if argv.len == 0: return
+  let exe = findExe(argv[0])
   if exe.len == 0: return
   let master = posix_openpt(O_RDWR or O_NOCTTY)
   if master < 0: return
   discard grantpt(master); discard unlockpt(master)
   let sname = $ptsname(master)
-  let argv = allocCStringArray(parts)
+  let cargv = allocCStringArray(@argv)
   let pid = fork()
   if pid == 0:
     discard setsid()
+    for (k, v) in env: putEnv(k, v)
     let slave = posix.open(sname.cstring, O_RDWR)
     discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
     if slave > 2: discard close(slave)
     discard close(master)
     if dir.len > 0: discard chdir(dir.cstring)
     putEnv("TERM", "xterm-256color")
-    discard execv(exe.cstring, argv)
+    discard execv(exe.cstring, cargv)
     quit(127)
   discard fcntl(master, F_SETFL, O_NONBLOCK)
-  discard fcntl(master, F_SETFD, FD_CLOEXEC)
-  setSize(master, 24, 80)          # give the child a sane terminal size
+  discard fcntl(master, F_SETFD, FD_CLOEXEC)   # don't leak into later forks
+  setSize(master, rows, cols)
   result.master = master
   result.pid = pid
   result.outbuf = ""
 
-proc setPtySize*(t: PtyTerm; rows, cols: int) =
-  setSize(t.master, rows, cols)
+proc setPtySize*(t: Pty; rows, cols: int) = setSize(t.master, rows, cols)
 
-proc pump*(t: var PtyTerm) =
-  ## Drain whatever the pty has (non-blocking). Also reaps: if the child closed
-  ## its side, mark not-running.
-  if t.master < 0: return
+proc alive*(t: Pty): bool = t.master >= 0
+
+proc feed*(t: var Pty; s: string) =
+  if t.master >= 0 and s.len > 0:
+    discard write(t.master, unsafeAddr s[0], s.len)
+
+proc drain*(t: var Pty): bool =
+  ## Non-blocking: append everything available to `outbuf`. Returns false and
+  ## marks not-running on EOF (child closed its side).
+  if t.master < 0: return false
   var b {.noinit.}: array[8192, char]
-  var got = false
   while true:
     let n = read(t.master, addr b[0], b.len)
     if n > 0:
       for i in 0 ..< n: t.outbuf.add b[i]
-      got = true
     elif n == 0:
       t.master = -1                # EOF: child exited
-      break
+      return false
     else:
       break                        # EAGAIN: nothing more right now
-  if got and t.outbuf.len > 200_000:
+  true
+
+proc pump*(t: var Pty) =
+  ## Drain and cap the rolling buffer (for the live terminal display).
+  discard drain(t)
+  if t.outbuf.len > 200_000:
     t.outbuf = t.outbuf[^120_000 .. ^1]
 
-proc feed*(t: var PtyTerm; s: string) =
-  if t.master >= 0 and s.len > 0:
-    discard write(t.master, unsafeAddr s[0], s.len)
+proc waitReadable(fd: cint; timeoutMs: int): bool =
+  ## select() on one fd so blocking reads (runBlock) don't busy-spin.
+  var fds: TFdSet
+  FD_ZERO(fds)
+  FD_SET(fd, fds)
+  var tv = Timeval(tv_sec: posix.Time(timeoutMs div 1000),
+                   tv_usec: posix.Suseconds((timeoutMs mod 1000) * 1000))
+  select(fd + 1, addr fds, nil, nil, addr tv) > 0
 
-proc alive*(t: PtyTerm): bool = t.master >= 0
-
-proc closePty*(t: var PtyTerm) =
+proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000): string =
+  ## Block (via select) reading from the master until `token` appears or we
+  ## time out. Bytes also flow into `outbuf` so the live display stays current.
   if t.master < 0: return
+  var b {.noinit.}: array[4096, char]
+  while token notin result:
+    if not waitReadable(t.master, timeoutMs): break     # timed out / no data
+    let n = read(t.master, addr b[0], b.len)
+    if n > 0:
+      for i in 0 ..< n:
+        result.add b[i]; t.outbuf.add b[i]
+    elif n == 0:
+      t.master = -1; break                              # child exited
+    # n < 0 (EAGAIN after a spurious wakeup): loop and select again
+
+proc closePty*(t: var Pty; quit = "") =
+  if t.master < 0: return
+  if quit.len > 0: feed(t, quit)
   discard close(t.master)
   discard kill(t.pid, SIGTERM)
   var status: cint
   discard waitpid(t.pid, status, 0)
   t.master = -1
+
+# --- convenience: the in-pane terminal (a Pty driven by a command line) -------
+
+proc startPty*(cmd, dir: string): Pty =
+  ## Split a shell-style command line and spawn it on a PTY (terminal pane).
+  spawnPty(cmd.splitWhitespace(), dir)
 
 proc stripAnsi*(s: string): string =
   ## Remove CSI (ESC[ ... final) and OSC (ESC] ... BEL) sequences and CRs.
