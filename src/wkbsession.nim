@@ -68,7 +68,10 @@ proc startSession*(spec: ReplSpec): Session =
   result = Session(pty: pty, spec: spec)
   result.pty.feed(spec.prime)
   result.pty.feed(spec.ready)                    # sync past banner + prime echo
-  discard result.pty.readUntil("NIMACSxREADY")
+  # mirror=false: the banner, the multi-line prime definition, and the REPL's
+  # continuation prompts must NOT land in the terminal (python's def spans many
+  # lines that don't carry the "nimacs" token the display filter keys on).
+  discard result.pty.readUntil("NIMACSxREADY", mirror = false)
 
 proc runBlock*(s: Session; code: string; quiet = false): string =
   ## Run `code` in the session, returning the captured output. `quiet` keeps the
