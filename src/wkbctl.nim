@@ -1,14 +1,18 @@
 ## wkbctl -- talk to a running wkbenchless over its control socket.
 ## For scripts/agents (e.g. Claude in the terminal) to drive the editor.
 ##
-##   wkbctl buffer                 # print the current buffer
-##   wkbctl blocks                 # list #+begin_src blocks (line: header)
-##   wkbctl command <name>         # run a registered command
+##   wkbctl buffer                        # print the current buffer
+##   wkbctl blocks                        # list #+begin_src blocks (line: header)
+##   wkbctl command <name>                # run a registered command
 ##   echo 'mean(1:10)' | wkbctl eval r default   # run code in a live session
+##   echo TEXT | wkbctl set-buffer        # replace the whole buffer
+##   echo TEXT | wkbctl insert <line>     # insert before 1-based <line>
+##   echo TEXT | wkbctl replace <from> <to>   # replace 1-based lines [from..to]
+##   wkbctl goto <line>                   # move the cursor
 ##
-## `eval` reads the code from stdin. lang/session default to r/default.
+## Verbs that take text read it from stdin. lang/session default to r/default.
 
-import std/[net, os, strutils]
+import std/[net, os]
 from std/posix import shutdown, SHUT_WR
 
 proc main() =
@@ -26,6 +30,17 @@ proc main() =
     let lang = if args.len > 1: args[1] else: "r"
     let sess = if args.len > 2: args[2] else: "default"
     req = "eval\t" & lang & "\t" & sess & "\n" & stdin.readAll()
+  of "set-buffer":
+    req = "set-buffer\n" & stdin.readAll()
+  of "insert":                           # insert <line> (text on stdin)
+    if args.len < 2: quit("wkbctl insert <line>   (text on stdin)", 1)
+    req = "insert\t" & args[1] & "\n" & stdin.readAll()
+  of "replace":                          # replace <from> <to> (text on stdin)
+    if args.len < 3: quit("wkbctl replace <from> <to>   (text on stdin)", 1)
+    req = "replace\t" & args[1] & "\t" & args[2] & "\n" & stdin.readAll()
+  of "goto":
+    if args.len < 2: quit("wkbctl goto <line>", 1)
+    req = "goto\t" & args[1]
   else:
     quit("unknown verb: " & args[0], 1)
 

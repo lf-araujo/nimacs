@@ -60,6 +60,32 @@ proc handle(app: var App; req: string): string =
     if parts.len > 1 and gCommands.hasKey(parts[1]):
       gCommands[parts[1]].run(app); result = "ok: " & parts[1]
     else: result = "unknown command"
+  of "set-buffer":                       # replace the whole buffer with <body>
+    app.ed.setText(body)
+    app.ed.markChanged()
+    result = "ok: buffer set (" & $app.ed.getLineCount() & " lines)"
+  of "insert", "replace":
+    # insert\t<line>\n<text>            -- insert <text> before 1-based <line>
+    # replace\t<from>\t<to>\n<text>     -- replace 1-based lines [from..to] with <text>
+    let total = app.ed.getLineCount()
+    var newBody = body.split('\n')
+    if newBody.len > 0 and newBody[^1] == "": newBody.setLen(newBody.len - 1)
+    let frm = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else: 1) - 1
+    let a = clamp(frm, 0, total)
+    let b = if parts[0] == "replace":
+              clamp((if parts.len > 2: (try: parseInt(parts[2]) except: a) else: a), a, total)
+            else: a                       # insert removes nothing
+    var lines: seq[string]
+    for i in 0 ..< total: lines.add app.ed.getLineText(i)
+    let res = lines[0 ..< a] & newBody & lines[b ..< total]
+    app.ed.setText(res.join("\n"))
+    app.ed.markChanged()
+    result = "ok: " & parts[0] & " at " & $(a + 1) &
+             (if parts[0] == "replace": ".." & $b else: "")
+  of "goto":                             # move the cursor to 1-based <line>
+    let ln = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else: 1) - 1
+    app.ed.gotoLine(clamp(ln, 0, app.ed.getLineCount() - 1), 0)
+    result = "ok: goto " & $(ln + 1)
   of "blocks":
     let total = app.ed.getLineCount()
     var i = 0
