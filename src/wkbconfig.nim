@@ -46,6 +46,30 @@ proc configure*(app: var App) =
   bindkey("C-c C-o", "open-link")       # open org link at cursor
   bindkey("C-c a", "claude")            # claude in the bottom panel (best-effort)
   bindkey("M-t", "terminal")            # bash terminal in the bottom panel
+  bindkey("C-c C-t", "theme")           # pick a theme (palette); also M-x theme
+
+  # ---- Themes ---------------------------------------------------------------
+  # A theme is a base16 palette (base00..base0F): base00 is the background,
+  # base05 the default text, base08..0F the accents. `registerTheme` derives the
+  # whole editor + chrome from it. The FIRST registered theme is the default;
+  # `M-x theme` (or C-c T) opens a palette to switch live. Add your own by
+  # copying a block and changing the sixteen hex values.
+  registerTheme("one-dark", [
+    rgb(0x282c34), rgb(0x353b45), rgb(0x3e4451), rgb(0x545862),
+    rgb(0x565c64), rgb(0xabb2bf), rgb(0xb6bdca), rgb(0xc8ccd4),
+    rgb(0xe06c75), rgb(0xd19a66), rgb(0xe5c07b), rgb(0x98c379),
+    rgb(0x56b6c2), rgb(0x61afef), rgb(0xc678dd), rgb(0xbe5046)])
+  registerTheme("gruvbox-dark", [
+    rgb(0x282828), rgb(0x3c3836), rgb(0x504945), rgb(0x665c54),
+    rgb(0xbdae93), rgb(0xd5c4a1), rgb(0xebdbb2), rgb(0xfbf1c7),
+    rgb(0xfb4934), rgb(0xfe8019), rgb(0xfabd2f), rgb(0xb8bb26),
+    rgb(0x8ec07c), rgb(0x83a598), rgb(0xd3869b), rgb(0xd65d0e)])
+  registerTheme("solarized-light", [
+    rgb(0xfdf6e3), rgb(0xeee8d5), rgb(0x93a1a1), rgb(0x839496),
+    rgb(0x657b83), rgb(0x586e75), rgb(0x073642), rgb(0x002b36),
+    rgb(0xdc322f), rgb(0xcb4b16), rgb(0xb58900), rgb(0x859900),
+    rgb(0x2aa198), rgb(0x268bd2), rgb(0x6c71c4), rgb(0xd33682)])
+  applyThemeByName(app, "one-dark")     # the default; comment out for the first-registered
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.

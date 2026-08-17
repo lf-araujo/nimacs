@@ -42,6 +42,8 @@ type
     completionSel*: int
     completionPrefix*: string
     focus*: string                        ## which pane gets keyboard events
+    theme*: AppTheme                      ## active theme (chrome + editor)
+    themeIdx*: int                        ## index into gThemes
     vimEnabled*: bool                     ## modal (vim) editing
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
@@ -59,11 +61,25 @@ type
     run*: proc(app: var App)
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
-  PaletteMode* = enum pmCommands, pmBuffers, pmFiles
+  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes
   VimMode* = enum vmNormal, vmInsert
   BufferState* = object
     ed*: SynEdit
     filePath*, docLang*: string
+  Base16* = array[16, Color]   ## base00..base0F, a standard base16 palette
+  AppTheme* = object
+    ## One theme drives BOTH the editor buffers (`ed`: a SynEdit Theme) and the
+    ## host chrome (panels, status bar, tabs, terminal, palette). Built from a
+    ## base16 palette by `base16Theme`, or hand-tuned in the config.
+    name*: string
+    ed*: Theme                 ## editor/buffer colors (synedit)
+    srcBlockBg*: Color         ## org src-block shading in the editor
+    windowBg*, panelBg*, tabBarBg*: Color
+    statusBg*, statusFg*: Color
+    chipBg*, chipFg*, chipActiveBg*, chipActiveFg*: Color
+    termFg*, dimFg*, dividerColor*: Color
+    boxBg*, boxSelBg*, boxFg*: Color        ## palette / completion popups
+    closeBg*, closeFg*: Color               ## the [x] hide button
 
 var
   gCommands*: OrderedTable[string, Command]
@@ -74,6 +90,7 @@ var
   gHelpQuery*: Table[string, string]      ## langId -> code, {word} substituted
   gRebuildCmd*: string                    ## shell command C-c r runs to rebuild
   gLspServers*: Table[string, string]     ## langId -> server command (argv, space-split)
+  gThemes*: seq[AppTheme]                 ## themes the config registers (palette picks one)
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -86,6 +103,98 @@ proc addHook*(name: string; h: Hook) =
 proc runHooks*(app: var App; name: string) =
   if gHooks.hasKey(name):
     for h in gHooks[name]: h(app)
+
+# -- themes: a base16 palette -> full editor + chrome theme ------------------
+proc rgb*(hex: int): Color =
+  ## 0xRRGGBB -> Color, so a config spells a palette the way base16 files do.
+  color(uint8((hex shr 16) and 0xFF), uint8((hex shr 8) and 0xFF), uint8(hex and 0xFF))
+
+proc nudged(c: Color; d: int): Color =
+  ## Shift each channel toward the middle by `d` (for the src-block lift).
+  proc n(v: int): uint8 = uint8(if v < 128: min(255, v + d) else: max(0, v - d))
+  color(n(c.r.int), n(c.g.int), n(c.b.int))
+
+proc base16Theme*(name: string; b: Base16): AppTheme =
+  ## Derive a full theme from base16 slots using the standard styling guide:
+  ## base00 bg .. base05 default fg; base08..0F the accent colors.
+  result.name = name
+  var t = default(Theme)
+  for tc in low(TokenClass)..high(TokenClass): t.fg[tc] = b[0x5]   # default text
+  t.fg[TokenClass.Keyword] = b[0xE]
+  t.fg[TokenClass.Preprocessor] = b[0xE]
+  t.fg[TokenClass.Directive] = b[0xC]
+  t.fg[TokenClass.Comment] = b[0x3]
+  t.fg[TokenClass.LongComment] = b[0x3]
+  t.fg[TokenClass.MarkdownFence] = b[0x3]
+  for tc in [TokenClass.StringLit, TokenClass.LongStringLit, TokenClass.CharLit,
+             TokenClass.RawData, TokenClass.Backticks, TokenClass.Key]:
+    t.fg[tc] = b[0xB]                                              # strings: green
+  for tc in [TokenClass.DecNumber, TokenClass.BinNumber, TokenClass.HexNumber,
+             TokenClass.OctNumber, TokenClass.FloatNumber, TokenClass.Value,
+             TokenClass.Label, TokenClass.Reference]:
+    t.fg[tc] = b[0x9]                                              # numbers: orange
+  t.fg[TokenClass.EscapeSequence] = b[0xC]
+  t.fg[TokenClass.RegularExpression] = b[0xC]
+  t.fg[TokenClass.Link] = b[0xD]
+  t.fg[TokenClass.Rule] = b[0xA]
+  for tc in [TokenClass.TagStart, TokenClass.TagStandalone, TokenClass.TagEnd,
+             TokenClass.Command, TokenClass.Assembler]:
+    t.fg[tc] = b[0xA]
+  t.fg[TokenClass.Green] = b[0xB]
+  t.fg[TokenClass.Yellow] = b[0xA]
+  t.fg[TokenClass.Red] = b[0x8]
+  t.bg = b[0x0]
+  t.selBg = b[0x2]
+  t.bracketBg = b[0x3]
+  t.cursorColor = b[0xD]
+  t.lineNumColor = b[0x3]
+  t.markerBg = b[0x2]
+  t.scrollBarColor = b[0x2]
+  t.scrollBarActiveColor = b[0x3]
+  t.scrollTrackColor = b[0x1]
+  t.activeLineBg = b[0x1]
+  t.actionColor = b[0x2]
+  t.closeColor = b[0xD]
+  result.ed = t
+  result.srcBlockBg = nudged(b[0x0], 8)
+  # host chrome
+  result.windowBg = b[0x0]; result.panelBg = b[0x0]; result.tabBarBg = b[0x1]
+  result.statusBg = b[0x1]; result.statusFg = b[0x4]
+  result.chipBg = b[0x1]; result.chipFg = b[0x5]
+  result.chipActiveBg = b[0x2]; result.chipActiveFg = b[0xA]
+  result.termFg = b[0x5]; result.dimFg = b[0x3]; result.dividerColor = b[0x2]
+  result.boxBg = b[0x1]; result.boxSelBg = b[0x2]; result.boxFg = b[0x5]
+  result.closeBg = b[0x8]; result.closeFg = b[0x0]
+
+proc registerTheme*(name: string; palette: Base16) =
+  ## Register a base16 theme (the config surface). First registered = default.
+  gThemes.add base16Theme(name, palette)
+proc registerTheme*(t: AppTheme) = gThemes.add t   # a fully hand-tuned theme
+
+proc applyTheme*(app: var App; idx: int) =
+  ## Point every editor + the chrome at gThemes[idx].
+  if idx < 0 or idx >= gThemes.len: return
+  app.themeIdx = idx
+  app.theme = gThemes[idx]
+  let t = app.theme
+  template paint(e: untyped) =
+    e.theme = t.ed
+    e.srcBlockBg = t.srcBlockBg
+  paint(app.ed); paint(app.sess); paint(app.objects); paint(app.help)
+  for b in app.buffers.mitems: paint(b.ed)
+  app.msg = "theme: " & t.name
+
+proc applyThemeByName*(app: var App; name: string) =
+  for i in 0 ..< gThemes.len:
+    if gThemes[i].name == name: applyTheme(app, i); return
+
+proc defaultBase16*(): Base16 =
+  ## A built-in dark palette (One-Dark-ish) so the app is never unstyled even
+  ## if the config registers no theme. The config normally overrides this.
+  [ rgb(0x15171b), rgb(0x20242d), rgb(0x2e3440), rgb(0x545b6b),
+    rgb(0xa0a6b0), rgb(0xc8ccd4), rgb(0xe0e3e8), rgb(0xf0f2f5),
+    rgb(0xe06c75), rgb(0xd19a66), rgb(0xe5c07b), rgb(0x98c379),
+    rgb(0x56b6c2), rgb(0x61afef), rgb(0xc678dd), rgb(0xbe5046) ]
 
 proc getSession*(app: var App; lang, name: string): Session =
   let key = lang.toLowerAscii & "/" & name
@@ -205,6 +314,11 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
     dirs.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
     files.sort(proc(a, b: (string, string)): int = cmp(a[1], b[1]))
     result.add dirs; result.add files
+  of pmThemes:
+    for i in 0 ..< gThemes.len:
+      let nm = gThemes[i].name
+      if q.len == 0 or q in nm.toLowerAscii:
+        result.add ($i, nm & (if i == app.themeIdx: "  (current)" else: ""))
 
 # -- objects / help panes --------------------------------------------------
 proc isWordChar(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
@@ -345,6 +459,10 @@ proc openPalette(app: var App; mode: PaletteMode) =
   app.paletteSel = 0
 
 proc paletteCmd*(app: var App) = openPalette(app, pmCommands)
+
+proc themeCmd*(app: var App) =
+  if gThemes.len == 0: app.msg = "no themes registered (see wkbconfig)"; return
+  openPalette(app, pmThemes)
 
 proc listBuffers*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
@@ -936,6 +1054,7 @@ proc registerBuiltins*() =
   defcommand("undo", "Undo", proc(app: var App) = app.ed.undo())
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
   defcommand("palette", "Command palette", paletteCmd)
+  defcommand("theme", "Theme: pick a color theme", themeCmd)
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)

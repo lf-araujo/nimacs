@@ -52,19 +52,20 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
   let by = area.y + 36
   let items = paletteEntries(app)
   let rows = min(items.len, 12)
-  let boxBg = color(38, 42, 52)
+  let boxBg = app.theme.boxBg
   fillRect(rect(bx, by, boxW, (rows + 1) * lineH + 20), boxBg)
   let prompt = case app.paletteMode
     of pmCommands: "> "
     of pmBuffers: "buffer: "
     of pmFiles: app.paletteDir & "/ "
+    of pmThemes: "theme: "
   discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery,
-                   color(235, 235, 235), boxBg)
+                   app.theme.boxFg, boxBg)
   var y = by + 8 + lineH + 4
   for i in 0 ..< rows:
-    let rowBg = if i == app.paletteSel: color(60, 72, 96) else: boxBg
+    let rowBg = if i == app.paletteSel: app.theme.boxSelBg else: boxBg
     fillRect(rect(bx + 4, y, boxW - 8, lineH), rowBg)
-    discard drawText(app.font, bx + 12, y, items[i][1], color(222, 222, 222), rowBg)
+    discard drawText(app.font, bx + 12, y, items[i][1], app.theme.boxFg, rowBg)
     y += lineH
 
 proc paletteAccept(app: var App) =
@@ -86,6 +87,9 @@ proc paletteAccept(app: var App) =
     else:
       app.paletteActive = false
       openFile(app, id)
+  of pmThemes:
+    app.paletteActive = false
+    applyTheme(app, parseInt(id))
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
@@ -113,13 +117,13 @@ proc drawCompletion(app: App; area: Rect; lineH: int) =
   let w = min(chars * (lineH div 2 + 1) + 16, area.w - 40)
   let bx = area.x + 24
   let by = area.y + 24
-  let boxBg = color(40, 44, 52)
+  let boxBg = app.theme.boxBg
   fillRect(rect(bx, by, w, rows * lineH + 8), boxBg)
   var y = by + 4
   for i in 0 ..< rows:
-    let rowBg = if i == app.completionSel: color(60, 72, 96) else: boxBg
+    let rowBg = if i == app.completionSel: app.theme.boxSelBg else: boxBg
     fillRect(rect(bx + 2, y, w - 4, lineH), rowBg)
-    discard drawText(app.font, bx + 6, y, app.completionItems[i], color(222, 222, 222), rowBg)
+    discard drawText(app.font, bx + 6, y, app.completionItems[i], app.theme.boxFg, rowBg)
     y += lineH
 
 proc handleCompletion(app: var App; e: Event): bool =
@@ -205,7 +209,6 @@ proc main() =
                 running: true, msg: "ready")
   app.ed.showLineNumbers = true
   app.ed.bigFont = bigFont
-  app.ed.theme.fg[TokenClass.Link] = color(96, 160, 255)   # org links in blue
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
@@ -229,6 +232,10 @@ proc main() =
       except ValueError: discard
 
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
+  # Themes come from the config; guarantee one so the chrome is never unstyled,
+  # and honor a default the config may already have applied.
+  if gThemes.len == 0: registerTheme("default", defaultBase16())
+  if app.theme.name.len == 0: applyTheme(app, 0)
   app.runHooks("startup")
 
   let layBare = parseLayout(layoutBare)
@@ -246,10 +253,6 @@ proc main() =
       let cs = currentSession(app)
       if cs != nil: addr cs.pty else: nil
   var suppressText = false   # swallow the TextInput that follows a prefix chord
-  let bg = color(21, 23, 27)
-  let sessBg = color(16, 18, 22)
-  let statusBg = color(32, 35, 42)
-  let statusFg = color(190, 190, 190)
   let noEvent = Event(kind: NoEvent)
 
   var e: Event
@@ -337,6 +340,12 @@ proc main() =
               let w = (" " & k & " ").len * (lineH div 2) + 4
               if e.x >= cx and e.x < cx + w: setSession(app, k); break
               cx += w + 4
+    # Chrome colors from the active theme (re-read each frame so a palette
+    # theme-switch takes effect immediately).
+    let bg = app.theme.windowBg
+    let sessBg = app.theme.panelBg
+    let statusBg = app.theme.statusBg
+    let statusFg = app.theme.statusFg
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
     var editorRect = rect(0, 0, screen.width, screen.height)
@@ -365,23 +374,25 @@ proc main() =
       fillRect(r, sessBg)
       let bh = lineH                       # top row = session tab bar
       # tab bar: session chips + an [x] at the far right to hide the panel
-      fillRect(rect(r.x, r.y, r.w, bh), color(26, 30, 38))
+      fillRect(rect(r.x, r.y, r.w, bh), app.theme.tabBarBg)
       var cx = r.x + 4
       let curKey = app.curLang & "/" & app.curSession
       for k in app.sessionKeys():
-        let chipBg = if k == curKey: color(70, 100, 70) else: color(40, 44, 52)
+        let active = k == curKey
+        let chipBg = if active: app.theme.chipActiveBg else: app.theme.chipBg
+        let chipFg = if active: app.theme.chipActiveFg else: app.theme.chipFg
         let label = " " & k & " "
         let w = label.len * (lineH div 2) + 4
         fillRect(rect(cx, r.y, w, bh), chipBg)
-        discard drawText(app.font, cx + 2, r.y, label, color(220, 224, 210), chipBg)
+        discard drawText(app.font, cx + 2, r.y, label, chipFg, chipBg)
         cx += w + 4
       if app.termActive:                   # a "terminal" chip
-        let tbg = color(70, 90, 110)
+        let tbg = app.theme.chipActiveBg
         fillRect(rect(cx, r.y, 10 * (lineH div 2), bh), tbg)
-        discard drawText(app.font, cx + 2, r.y, " terminal ", color(224, 228, 234), tbg)
+        discard drawText(app.font, cx + 2, r.y, " terminal ", app.theme.chipActiveFg, tbg)
       let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
-      fillRect(xr, color(70, 40, 40))
-      discard drawText(app.font, xr.x + bh div 3, r.y, "x", color(230, 190, 190), color(70, 40, 40))
+      fillRect(xr, app.theme.closeBg)
+      discard drawText(app.font, xr.x + bh div 3, r.y, "x", app.theme.closeFg, app.theme.closeBg)
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
       # Unified live terminal: the standalone terminal OR the current REPL
       # session, both rendered from a Pty's rolling buffer (v1: ANSI-stripped
@@ -395,16 +406,16 @@ proc main() =
         let lines = termLines(ap[].outbuf, rows)
         var y = body.y
         for ln in lines:
-          discard drawText(app.font, body.x + 4, y, ln, color(200, 210, 200), sessBg)
+          discard drawText(app.font, body.x + 4, y, ln, app.theme.termFg, sessBg)
           y += lineH
         if not ap[].alive:
           let hint = if app.termActive: "[process ended -- Esc-hide, reopen with M-x terminal]"
                      else: "[session ended]"
-          discard drawText(app.font, body.x + 4, y, hint, color(150, 150, 160), sessBg)
+          discard drawText(app.font, body.x + 4, y, hint, app.theme.dimFg, sessBg)
       else:
         discard drawText(app.font, body.x + 4, body.y,
           "no session yet -- run a src block (C-c C-c) or M-x terminal",
-          color(150, 150, 160), sessBg)
+          app.theme.dimFg, sessBg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
@@ -412,7 +423,7 @@ proc main() =
       fillRect(cells["help"], sessBg)
       discard app.help.draw(evFor("help"), cells["help"], focused = app.focus == "help")
     for dn in dividerNames:
-      if cells.hasKey(dn): fillRect(cells[dn], color(70, 78, 92))
+      if cells.hasKey(dn): fillRect(cells[dn], app.theme.dividerColor)
     if cells.hasKey("status"):
       let sr = cells["status"]
       fillRect(sr, statusBg)
