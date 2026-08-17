@@ -42,7 +42,6 @@ type
     completionSel*: int
     completionPrefix*: string
     focus*: string                        ## which pane gets keyboard events
-    replInput*: string                    ## the session pane's live prompt line
     vimEnabled*: bool                     ## modal (vim) editing
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
@@ -96,6 +95,11 @@ proc getSession*(app: var App; lang, name: string): Session =
   let s = startSession(gRepls[lang.toLowerAscii])
   if s != nil: app.sessions[key] = s
   s
+
+proc currentSession*(app: var App): Session =
+  ## The session the bottom pane tracks as a live terminal, or nil.
+  let key = app.curLang & "/" & app.curSession
+  if app.sessions.hasKey(key): app.sessions[key] else: nil
 
 # -- keychords -------------------------------------------------------------
 proc keyName*(k: KeyCode): string =
@@ -316,20 +320,6 @@ proc runLine*(app: var App) =
   app.sess.appendOutput("> " & line & "\n")
   if outp.len > 0: app.sess.appendOutput(outp & "\n")
   app.msg = "ran line"
-  refreshObjects(app)
-
-proc replSubmit*(app: var App) =
-  ## Run the session pane's prompt line in the current session (the same one the
-  ## blocks use, so state is shared) and echo the result.
-  let line = app.replInput
-  app.replInput = ""
-  if strutils.strip(line).len == 0: return
-  let lang = if app.curLang.len > 0: app.curLang else: "r"
-  let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
-  app.sess.appendOutput(lang & "> " & line & "\n")
-  if s == nil: app.sess.appendOutput("(no " & lang & " session)\n"); return
-  let outp = s.runBlock(line)
-  if outp.len > 0: app.sess.appendOutput(outp & "\n")
   refreshObjects(app)
 
 proc saveCmd*(app: var App) =
@@ -697,9 +687,12 @@ proc recompileConfig*(app: var App) =
     if gRebuildCmd.len == 0: gRebuildCmd = detectRebuildCmd()
     let (outp, code) = execCmdEx(gRebuildCmd, workingDir = dir)
     if code != 0:
-      app.sess.appendOutput("-- recompile FAILED --\n$ " & gRebuildCmd & "\n" &
-                            outp & "\n")
-      app.msg = "recompile failed (see session pane)"
+      stderr.write("-- recompile FAILED --\n$ " & gRebuildCmd & "\n" & outp & "\n")
+      # surface the first real error line in the status bar
+      var firstErr = ""
+      for ln in outp.splitLines():
+        if "Error:" in ln or " error:" in ln: firstErr = strutils.strip(ln); break
+      app.msg = "recompile failed" & (if firstErr.len > 0: " -- " & firstErr else: " (see launch terminal)")
       return
     # persist the buffer so edits survive the exec
     var fileArg = app.filePath

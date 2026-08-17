@@ -155,6 +155,39 @@ proc dispatch(app: var App; e: Event): bool =
     app.pendingPrefix = chord; app.msg = chord & "-"; return true
   false
 
+proc feedTerminalKey(t: var Pty; e: Event): bool =
+  ## Translate a keystroke into the bytes a PTY expects. Shared by the standalone
+  ## terminal and the live REPL-session terminal (both are just a `Pty`).
+  case e.kind
+  of TextInputEvent:
+    for ch in e.text:
+      if ch != '\0': t.feed($ch)
+    true
+  of KeyDownEvent:
+    case e.key
+    of KeyEnter: t.feed("\r"); true
+    of KeyBackspace: t.feed("\x7f"); true
+    of KeyTab: t.feed("\t"); true
+    of KeyEsc: t.feed("\e"); true
+    of KeyUp: t.feed("\e[A"); true
+    of KeyDown: t.feed("\e[B"); true
+    of KeyRight: t.feed("\e[C"); true
+    of KeyLeft: t.feed("\e[D"); true
+    else:
+      if CtrlPressed in e.mods and e.key in {KeyA..KeyZ}:
+        t.feed($chr(ord(e.key) - ord(KeyA) + 1))   # Ctrl-A..Ctrl-Z
+        true
+      else: false
+  else: false
+
+proc termLines(outbuf: string; rows: int): seq[string] =
+  ## ANSI-strip the live buffer and drop the marker driver's own noise (every
+  ## driver token -- markers, ready ping, run function -- contains "NIMACS"), so
+  ## a session terminal shows only interactive I/O and real block output.
+  for ln in stripAnsi(outbuf).splitLines():
+    if "NIMACS" notin ln: result.add ln
+  if result.len > rows: result = result[^rows .. ^1]
+
 proc main() =
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
@@ -204,6 +237,14 @@ proc main() =
   var lastMouse = (x: 0, y: 0)
   var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
+
+  # The bottom pane is a live terminal on whichever Pty is current: the
+  # standalone terminal (M-t / claude), or else the current REPL session.
+  proc activePtyPtr(): ptr Pty =
+    if app.termActive: addr pty
+    else:
+      let cs = currentSession(app)
+      if cs != nil: addr cs.pty else: nil
   var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
@@ -213,9 +254,9 @@ proc main() =
 
   var e: Event
   while app.running:
-    let liveTerm = app.termActive and not app.sessionHidden
+    let livePane = not app.sessionHidden and (app.termActive or currentSession(app) != nil)
     # A timeout so we still poll the pty and the control socket while idle.
-    if not waitEvent(e, if liveTerm: 30 else: 100):
+    if not waitEvent(e, if livePane: 30 else: 100):
       e = Event(kind: NoEvent)
     if e.kind in {WindowCloseEvent, QuitEvent}: break
 
@@ -224,7 +265,9 @@ proc main() =
       pty = startPty(app.termRequest, terminalDir(app))
       if not pty.alive: app.msg = "could not start " & app.termRequest
       app.termRequest = ""
-    if app.termActive: pump(pty)
+    block:                                    # drain the live pane's pty each frame
+      let ap = activePtyPtr()
+      if ap != nil: pump(ap[])
     poll(ctrl, app)                           # handle any wkbctl / agent request
 
     var consumed = false
@@ -248,43 +291,13 @@ proc main() =
        not app.paletteActive and not app.completionActive:
       consumed = vimHandle(app, e)
 
-    # Terminal (PTY) gets session-focused input; else the session REPL prompt.
+    # Session-focused input goes straight to the live pane's pty (the standalone
+    # terminal, or the current REPL session -- both are a Pty).
     if not consumed and not app.paletteActive and not app.completionActive and
        app.focus == "session":
-      if app.termActive:
-        case e.kind
-        of TextInputEvent:
-          for ch in e.text:
-            if ch != '\0': pty.feed($ch)
-          consumed = true
-        of KeyDownEvent:
-          case e.key
-          of KeyEnter: pty.feed("\r"); consumed = true
-          of KeyBackspace: pty.feed("\x7f"); consumed = true
-          of KeyTab: pty.feed("\t"); consumed = true
-          of KeyEsc: pty.feed("\e"); consumed = true
-          of KeyUp: pty.feed("\e[A"); consumed = true
-          of KeyDown: pty.feed("\e[B"); consumed = true
-          of KeyRight: pty.feed("\e[C"); consumed = true
-          of KeyLeft: pty.feed("\e[D"); consumed = true
-          else:
-            if CtrlPressed in e.mods and e.key in {KeyA..KeyZ}:
-              pty.feed($chr(ord(e.key) - ord(KeyA) + 1))   # Ctrl-A..Ctrl-Z
-              consumed = true
-        else: discard
-      else:
-        case e.kind
-        of KeyDownEvent:
-          if e.key == KeyEnter: replSubmit(app); consumed = true
-          elif e.key == KeyBackspace:
-            if app.replInput.len > 0: app.replInput.setLen(app.replInput.len - 1)
-            consumed = true
-        of TextInputEvent:
-          for ch in e.text:
-            if ch == '\0': break
-            app.replInput.add ch
-          consumed = true
-        else: discard
+      let ap = activePtyPtr()
+      if ap != nil and ap[].alive:
+        consumed = feedTerminalKey(ap[], e)
 
     if e.kind in {MouseMoveEvent, MouseDownEvent, MouseUpEvent}:
       lastMouse = (e.x, e.y)   # live proof of pointer delivery (XWayland check)
@@ -370,30 +383,28 @@ proc main() =
       fillRect(xr, color(70, 40, 40))
       discard drawText(app.font, xr.x + bh div 3, r.y, "x", color(230, 190, 190), color(70, 40, 40))
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
-      if app.termActive:
-        # scrolling, ANSI-stripped terminal output (v1: no cursor/VT emulation)
-        if pty.alive:
-          setPtySize(pty, max(1, body.h div lineH), max(1, body.w div max(1, lineH div 2)))
-        let lines = stripAnsi(pty.outbuf).splitLines()
-        let rows = max(1, body.h div lineH)
-        let start = max(0, lines.len - rows)
+      # Unified live terminal: the standalone terminal OR the current REPL
+      # session, both rendered from a Pty's rolling buffer (v1: ANSI-stripped
+      # scrollback, no cursor/VT emulation). C-c C-c block results still go to
+      # #+RESULTS; interactive typing and block output scroll here.
+      let rows = max(1, body.h div lineH)
+      let ap = activePtyPtr()
+      if ap != nil:
+        if ap[].alive:
+          setPtySize(ap[], rows, max(1, body.w div max(1, lineH div 2)))
+        let lines = termLines(ap[].outbuf, rows)
         var y = body.y
-        for i in start ..< lines.len:
-          discard drawText(app.font, body.x + 4, y, lines[i], color(200, 210, 200), sessBg)
+        for ln in lines:
+          discard drawText(app.font, body.x + 4, y, ln, color(200, 210, 200), sessBg)
           y += lineH
-        if not pty.alive:
-          discard drawText(app.font, body.x + 4, y, "[process ended -- Esc-hide, reopen with M-x terminal]",
-                           color(150, 150, 160), sessBg)
+        if not ap[].alive:
+          let hint = if app.termActive: "[process ended -- Esc-hide, reopen with M-x terminal]"
+                     else: "[session ended]"
+          discard drawText(app.font, body.x + 4, y, hint, color(150, 150, 160), sessBg)
       else:
-        let ph = lineH                     # bottom row = live REPL prompt
-        discard app.sess.draw(evFor("session"),
-          rect(body.x, body.y, body.w, max(lineH, body.h - ph)), focused = app.focus == "session")
-        let pr = rect(r.x, r.y + r.h - ph, r.w, ph)
-        let pbg = if app.focus == "session": color(30, 40, 52) else: color(20, 24, 30)
-        fillRect(pr, pbg)
-        let caret = if app.focus == "session": "_" else: ""
-        discard drawText(app.font, pr.x + 4, pr.y,
-          app.curLang & "> " & app.replInput & caret, color(210, 220, 150), pbg)
+        discard drawText(app.font, body.x + 4, body.y,
+          "no session yet -- run a src block (C-c C-c) or M-x terminal",
+          color(150, 150, 160), sessBg)
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
