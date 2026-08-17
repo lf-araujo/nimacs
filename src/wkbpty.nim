@@ -12,6 +12,9 @@
 ## for claude's TUI) is future work.
 
 import std/[posix, strutils, os]
+import wkbvterm
+export wkbvterm
+from uirelays import Color
 
 when not declared(posix_openpt):
   proc posix_openpt(flags: cint): cint {.importc, header: "<stdlib.h>".}
@@ -33,7 +36,8 @@ type
   Pty* = object
     master*: cint         ## -1 when not running
     pid*: Pid
-    outbuf*: string       ## accumulated output (live-display log)
+    outbuf*: string       ## line-log (REPL sessions; ANSI-stripped at draw)
+    vt*: VTerm            ## screen-grid emulator (standalone terminal); nil for sessions
   PtyTerm* = Pty          ## the in-pane terminal is a bare Pty (name kept for the host)
 
 # --- low-level primitive: spawn / drain / feed / size / close -----------------
@@ -71,7 +75,12 @@ proc spawnPty*(argv: openArray[string]; dir = "";
   result.pid = pid
   result.outbuf = ""
 
-proc setPtySize*(t: Pty; rows, cols: int) = setSize(t.master, rows, cols)
+proc setPtySize*(t: Pty; rows, cols: int) =
+  setSize(t.master, rows, cols)
+  if t.vt != nil: t.vt.resize(rows, cols)
+
+proc setVtColors*(t: Pty; fg, bg: Color) =
+  if t.vt != nil: (t.vt.defFg = fg; t.vt.defBg = bg)
 
 proc alive*(t: Pty): bool = t.master >= 0
 
@@ -80,14 +89,20 @@ proc feed*(t: var Pty; s: string) =
     discard write(t.master, unsafeAddr s[0], s.len)
 
 proc drain*(t: var Pty): bool =
-  ## Non-blocking: append everything available to `outbuf`. Returns false and
-  ## marks not-running on EOF (child closed its side).
+  ## Non-blocking: consume everything available. A screen-grid terminal (vt !=
+  ## nil) feeds the emulator; a REPL session appends to the line-log `outbuf`.
+  ## Returns false and marks not-running on EOF (child closed its side).
   if t.master < 0: return false
   var b {.noinit.}: array[8192, char]
   while true:
     let n = read(t.master, addr b[0], b.len)
     if n > 0:
-      for i in 0 ..< n: t.outbuf.add b[i]
+      if t.vt != nil:
+        var chunk = newString(n)
+        copyMem(addr chunk[0], addr b[0], n)
+        t.vt.write(chunk)
+      else:
+        for i in 0 ..< n: t.outbuf.add b[i]
     elif n == 0:
       t.master = -1                # EOF: child exited
       return false
@@ -96,9 +111,10 @@ proc drain*(t: var Pty): bool =
   true
 
 proc pump*(t: var Pty) =
-  ## Drain and cap the rolling buffer (for the live terminal display).
+  ## Drain and cap the line-log (for the session live display; the vt grid is
+  ## bounded by construction).
   discard drain(t)
-  if t.outbuf.len > 200_000:
+  if t.vt == nil and t.outbuf.len > 200_000:
     t.outbuf = t.outbuf[^120_000 .. ^1]
 
 proc waitReadable(fd: cint; timeoutMs: int): bool =
@@ -138,9 +154,11 @@ proc closePty*(t: var Pty; quit = "") =
 
 # --- convenience: the in-pane terminal (a Pty driven by a command line) -------
 
-proc startPty*(cmd, dir: string): Pty =
-  ## Split a shell-style command line and spawn it on a PTY (terminal pane).
-  spawnPty(cmd.splitWhitespace(), dir)
+proc startPty*(cmd, dir: string; fg, bg: Color): Pty =
+  ## Split a shell-style command line and spawn it on a PTY (terminal pane),
+  ## backed by a screen-grid emulator so cursor-addressed TUIs render.
+  result = spawnPty(cmd.splitWhitespace(), dir)
+  if result.alive: result.vt = newVTerm(24, 80, fg, bg)
 
 proc stripAnsi*(s: string): string =
   ## Remove CSI (ESC[ ... final) and OSC (ESC] ... BEL) sequences and CRs.

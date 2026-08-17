@@ -277,7 +277,7 @@ proc main() =
 
     if app.termRequest.len > 0:               # (re)start the terminal process
       closePty(pty)
-      pty = startPty(app.termRequest, terminalDir(app))
+      pty = startPty(app.termRequest, terminalDir(app), app.theme.termFg, app.theme.panelBg)
       if not pty.alive: app.msg = "could not start " & app.termRequest
       app.termRequest = ""
     # Retire the terminal tab once its process has ended and we've moved off it.
@@ -405,17 +405,44 @@ proc main() =
       fillRect(xr, app.theme.closeBg)
       discard drawText(app.font, xr.x + bh div 3, r.y, "x", app.theme.closeFg, app.theme.closeBg)
       let body = rect(r.x, r.y + bh, r.w, max(lineH, r.h - bh))
-      # Unified live terminal: the standalone terminal OR the current REPL
-      # session, both rendered from a Pty's rolling buffer (v1: ANSI-stripped
-      # scrollback, no cursor/VT emulation). C-c C-c block results still go to
-      # #+RESULTS; interactive typing and block output scroll here.
       let rows = max(1, body.h div lineH)
+      let charW = max(1, measureText(app.font, "0").w)
       let ap = activePtyPtr()
-      if ap != nil:
-        if ap[].alive:
-          setPtySize(ap[], rows, max(1, body.w div max(1, lineH div 2)))
+      if ap != nil and ap[].vt != nil:
+        # Standalone terminal: a full screen-grid emulator (cursor-addressed
+        # TUIs like claude render here). Colored cell runs + block cursor.
+        let vt = ap[].vt
+        if ap[].alive: setPtySize(ap[], rows, max(1, body.w div charW))
+        setVtColors(ap[], app.theme.termFg, app.theme.panelBg)
+        for ry in 0 ..< vt.rows:
+          var cxp = 0
+          while cxp < vt.cols:                  # coalesce same-attribute cells
+            let c0 = vt.grid[ry][cxp]
+            var run = ""
+            var cxe = cxp
+            while cxe < vt.cols:
+              let c = vt.grid[ry][cxe]
+              if c.fg != c0.fg or c.bg != c0.bg or c.inv != c0.inv: break
+              run.add (if c.ch.len == 0: " " else: c.ch)
+              inc cxe
+            let fg = if c0.inv: c0.bg else: c0.fg
+            let bg = if c0.inv: c0.fg else: c0.bg
+            discard drawText(app.font, body.x + cxp * charW, body.y + ry * lineH, run, fg, bg)
+            cxp = cxe
+        if ap[].alive:                          # block cursor (inverse cell)
+          let cc = vt.grid[vt.cy][vt.cx]
+          let cxr = body.x + vt.cx * charW
+          let cyr = body.y + vt.cy * lineH
+          fillRect(rect(cxr, cyr, charW, lineH), app.theme.termFg)
+          discard drawText(app.font, cxr, cyr, (if cc.ch.len == 0: " " else: cc.ch),
+                           app.theme.panelBg, app.theme.termFg)
+        else:
+          discard drawText(app.font, body.x + 4, body.y + (vt.rows) * lineH,
+            "[process ended -- Esc-hide, reopen with M-x terminal]", app.theme.dimFg, sessBg)
+      elif ap != nil:
+        # REPL session: the ANSI-stripped, marker-filtered line-log + scrollback.
         let all = termLines(ap[].outbuf)
-        # Mouse-wheel scrollback over the terminal body (e.y: +1 up / -1 down).
+        if ap[].alive: setPtySize(ap[], rows, max(1, body.w div charW))
         if e.kind == MouseWheelEvent and
            lastMouse.x >= body.x and lastMouse.x < body.x + body.w and
            lastMouse.y >= body.y and lastMouse.y < body.y + body.h:
@@ -428,13 +455,11 @@ proc main() =
         for i in start ..< stop:
           discard drawText(app.font, body.x + 4, y, all[i], app.theme.termFg, sessBg)
           y += lineH
-        if app.termScroll > 0:                  # scrollback indicator
-          discard drawText(app.font, body.x + body.w - 6 * (lineH div 2), body.y,
+        if app.termScroll > 0:
+          discard drawText(app.font, body.x + body.w - 6 * charW, body.y,
             "[+" & $app.termScroll & "]", app.theme.dimFg, sessBg)
         if not ap[].alive:
-          let hint = if app.termActive: "[process ended -- Esc-hide, reopen with M-x terminal]"
-                     else: "[session ended]"
-          discard drawText(app.font, body.x + 4, y, hint, app.theme.dimFg, sessBg)
+          discard drawText(app.font, body.x + 4, y, "[session ended]", app.theme.dimFg, sessBg)
       else:
         discard drawText(app.font, body.x + 4, body.y,
           "no session yet -- run a src block (C-c C-c) or M-x terminal",
