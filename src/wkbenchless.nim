@@ -185,11 +185,15 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
   else: false
 
 proc termLines(outbuf: string; rows: int): seq[string] =
-  ## ANSI-strip the live buffer and drop the marker driver's own noise (every
-  ## driver token -- markers, ready ping, run function -- contains "NIMACS"), so
-  ## a session terminal shows only interactive I/O and real block output.
+  ## ANSI-strip the live buffer and drop the marker driver's own noise so a
+  ## session terminal shows only interactive I/O and real block output. The run
+  ## call echoes lowercase (`.nimacs_run(...)`, `_nimacs_run(...)`,
+  ## `nimacs_run '...'`) while the markers/ready ping are upper (`__NIMACS_BOR__`,
+  ## `NIMACSxREADY`), so match the known tokens case-insensitively.
   for ln in stripAnsi(outbuf).splitLines():
-    if "NIMACS" notin ln: result.add ln
+    let low = ln.toLowerAscii
+    if "nimacs_run" in low or "__nimacs" in low or "nimacsxready" in low: continue
+    result.add ln
   if result.len > rows: result = result[^rows .. ^1]
 
 proc main() =

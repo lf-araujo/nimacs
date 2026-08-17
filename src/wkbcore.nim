@@ -425,15 +425,17 @@ proc dedentBody(lines: seq[string]): string =
   outl.join("\n")
 
 proc runLine*(app: var App) =
+  ## Send the current editor line to the CURRENT session (the one the bottom
+  ## pane tracks). Does NOT spin up a default R session on a stray Ctrl+Enter --
+  ## run a src block (C-c C-c) first to establish a session.
   let line = app.ed.getLineText(app.ed.currentLine)
   if strutils.strip(line).len == 0: return
-  app.curLang = "r"; app.curSession = "default"
-  let s = getSession(app, "r", "default")
-  if s == nil: app.msg = "could not start R (on PATH?)"; return
-  let outp = s.runBlock(line)
-  app.sess.appendOutput("> " & line & "\n")
-  if outp.len > 0: app.sess.appendOutput(outp & "\n")
-  app.msg = "ran line"
+  let s = currentSession(app)
+  if s == nil:
+    app.msg = "no active session -- run a src block (C-c C-c) first"
+    return
+  discard s.runBlock(line)          # output scrolls live in the session terminal
+  app.msg = "ran line in " & app.curLang & "/" & app.curSession
   refreshObjects(app)
 
 proc saveCmd*(app: var App) =
