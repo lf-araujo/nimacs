@@ -1,0 +1,132 @@
+name: Build and release binaries
+
+# Adapted from the fastsem release-rlib.yml pattern, but for wkbenchless'
+# application binaries (wkbenchless + wkbctl) across Linux / macOS / Windows.
+#
+# NOTE on portability:
+#   * Linux  -- builds now (uirelays X11 driver + POSIX PTY).
+#   * macOS  -- expected to build: uirelays selects its native Cocoa driver, and
+#     the PTY/control layer (fork/execv/posix_openpt/sockaddr_un) is POSIX, which
+#     macOS provides. No XQuartz needed.
+#   * Windows-- uirelays HAS a winapi UI driver, but wkbpty/wkbctrl/wkbctl are
+#     POSIX-only, so they will NOT compile until they gain a ConPTY variant and a
+#     winsock control socket. Kept in the matrix as best-effort.
+# `fail-fast: false` means a green Linux/macOS build still ships a release even
+# while Windows is being brought up.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach assets to (e.g. v0.1.1)'
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.config.label }}
+    runs-on: ${{ matrix.config.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.0.8' }
+          - { os: macos-13,       label: macos_x86_64,  exe: '',     nim: '2.0.8' }
+          - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.0.8' }
+          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.0.8' }
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── X11 / font dev libraries (Linux build & runtime deps) ──────────────
+      - name: Install X11 dev libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxft-dev libxext-dev libxrender-dev \
+            libfontconfig1-dev libfreetype6-dev
+
+      # macOS needs no extra deps: uirelays uses the native Cocoa driver.
+
+      # ── Install Nim ────────────────────────────────────────────────────────
+      - name: Install Nim
+        uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: ${{ matrix.config.nim }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Install Nimble dependencies (uirelays, etc.) ───────────────────────
+      - name: Install Nimble packages
+        run: nimble install -d -y
+
+      # ── Build the binaries ─────────────────────────────────────────────────
+      - name: Build wkbenchless + wkbctl
+        shell: bash
+        run: |
+          nim c -d:release -d:danger --opt:size \
+            -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
+          nim c -d:release -d:danger --opt:size \
+            -o:wkbctl${{ matrix.config.exe }} src/wkbctl.nim
+
+      # ── Package the two binaries into one per-platform archive ─────────────
+      - name: Package artifact
+        shell: bash
+        run: |
+          DIST="wkbenchless_${{ matrix.config.label }}"
+          mkdir -p "$DIST"
+          cp "wkbenchless${{ matrix.config.exe }}" "wkbctl${{ matrix.config.exe }}" "$DIST/"
+          if [ -n "${{ matrix.config.exe }}" ]; then
+            7z a "$DIST.zip" "$DIST"
+            echo "ASSET=$DIST.zip" >> $GITHUB_ENV
+          else
+            tar czf "$DIST.tar.gz" "$DIST"
+            echo "ASSET=$DIST.tar.gz" >> $GITHUB_ENV
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.config.label }}
+          path: ${{ env.ASSET }}
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: wkbenchless ${{ steps.tag.outputs.TAG }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: artifacts/*
