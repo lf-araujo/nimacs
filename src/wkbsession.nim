@@ -70,13 +70,14 @@ proc startSession*(spec: ReplSpec): Session =
   result.pty.feed(spec.ready)                    # sync past banner + prime echo
   discard result.pty.readUntil("NIMACSxREADY")
 
-proc runBlock*(s: Session; code: string): string =
-  ## Run `code` in the session, returning the captured output.
+proc runBlock*(s: Session; code: string; quiet = false): string =
+  ## Run `code` in the session, returning the captured output. `quiet` keeps the
+  ## run off the live terminal display (for internal object/help queries).
   if s == nil or not s.pty.alive: return ""
   let path = genTempPath("wkbenchless-", ".src")
   writeFile(path, code)
   s.pty.feed(s.spec.run.replace("{file}", path))
-  let acc = s.pty.readUntil(markerEnd)
+  let acc = s.pty.readUntil(markerEnd, mirror = not quiet)
   removeFile(path)
   var lines: seq[string]
   var collecting = false

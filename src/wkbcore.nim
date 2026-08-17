@@ -48,8 +48,10 @@ type
     vimMode*: VimMode
     vimPending*: string                   ## pending operator/prefix (d, g, y)
     sessionHidden*: bool                  ## bottom panel hidden (x on the tab bar)
-    termActive*: bool                     ## bottom panel shows the PTY terminal
+    termActive*: bool                     ## the standalone terminal is the current tab
     termRequest*: string                  ## command the host should run in the PTY
+    hasTerminal*: bool                    ## a standalone terminal tab exists (alive)
+    termLabel*: string                    ## its tab label ("claude", "bash", ...)
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -91,6 +93,8 @@ var
   gRebuildCmd*: string                    ## shell command C-c r runs to rebuild
   gLspServers*: Table[string, string]     ## langId -> server command (argv, space-split)
   gThemes*: seq[AppTheme]                 ## themes the config registers (palette picks one)
+  gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
+  gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -103,6 +107,32 @@ proc addHook*(name: string; h: Hook) =
 proc runHooks*(app: var App; name: string) =
   if gHooks.hasKey(name):
     for h in gHooks[name]: h(app)
+
+proc addExecPath*(dir: string) =
+  ## Config helper: add a directory to PATH for sessions/terminals (~ expanded).
+  gExtraPaths.add dir
+
+proc setupExecPath*() =
+  ## Make the login shell's PATH (plus gExtraPaths) the process PATH, so
+  ## sessions, terminals, and findExe locate the user's executables even when
+  ## wkbenchless was launched from a GUI with a stripped-down environment.
+  ## Called once at startup, after configure() so gExtraPaths is set, before any
+  ## session or terminal spawns. Order: extra paths first (highest priority),
+  ## then the login shell's PATH, then whatever we already inherited.
+  var parts: seq[string]
+  proc addDir(d: string) =
+    let e = (if d.startsWith("~"): expandTilde(d) else: d)
+    if e.len > 0 and e notin parts: parts.add e
+  for p in gExtraPaths: addDir(p)
+  if gLoadLoginPath:
+    let sh = getEnv("SHELL", "/bin/bash")
+    try:
+      let (outp, code) = execCmdEx(sh & " -lc 'printf %s \"$PATH\"'")
+      if code == 0:
+        for p in outp.strip.split(':'): addDir(p)
+    except CatchableError: discard
+  for p in getEnv("PATH").split(':'): addDir(p)
+  if parts.len > 0: putEnv("PATH", parts.join(":"))
 
 # -- themes: a base16 palette -> full editor + chrome theme ------------------
 proc rgb*(hex: int): Color =
@@ -207,7 +237,7 @@ proc getSession*(app: var App; lang, name: string): Session =
 
 proc currentSession*(app: var App): Session =
   ## The session the bottom pane tracks as a live terminal, or nil.
-  let key = app.curLang & "/" & app.curSession
+  let key = app.curLang.toLowerAscii & "/" & app.curSession   # keys use lower-lang
   if app.sessions.hasKey(key): app.sessions[key] else: nil
 
 # -- keychords -------------------------------------------------------------
@@ -349,7 +379,7 @@ proc refreshObjects*(app: var App) =
     app.objects.setText("(no objects query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.objects.setText("(no session)"); return
-  let outp = s.runBlock(gObjectsQuery[lang])
+  let outp = s.runBlock(gObjectsQuery[lang], quiet = true)   # keep off the terminal
   app.objects.setText("Objects [" & lang & "/" & app.curSession & "]\n" &
                       (if strutils.strip(outp).len > 0: outp else: "(none)"))
 
@@ -361,7 +391,7 @@ proc showHelp*(app: var App) =
     app.help.setText("(no help query for " & lang & ")"); return
   let s = getSession(app, lang, (if app.curSession.len > 0: app.curSession else: "default"))
   if s == nil: app.help.setText("(no session)"); return
-  let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w)))
+  let outp = cleanOverstrike(s.runBlock(gHelpQuery[lang].replace("{word}", w), quiet = true))
   app.help.setText("Help: " & w & "\n\n" & outp)
   app.msg = "help: " & w
 
@@ -672,34 +702,49 @@ proc srcEditBlock*(app: var App) =
 proc srcEditSession*(app: var App) =
   if app.editMode != emNone: srcEditExit(app) else: srcEditEnter(app, true)
 
+const terminalTabKey* = "·terminal"   # sentinel tab key for the standalone terminal
+
 proc sessionKeys*(app: App): seq[string] =
   for k in app.sessions.keys: result.add k
   sort(result)
 
-proc switchSession*(app: var App) =
-  ## Cycle the current session (the one the pane/objects/help track).
-  let keys = app.sessionKeys()
-  if keys.len == 0: app.msg = "no sessions yet"; return
-  let curKey = app.curLang & "/" & app.curSession
-  var i = -1
-  for k, name in keys:
-    if name == curKey: i = k
-  let nk = keys[(i + 1) mod keys.len]
-  let parts = nk.split('/')
-  app.curLang = parts[0]
-  app.curSession = if parts.len > 1: parts[1] else: "default"
-  app.focus = "session"
-  refreshObjects(app)
-  app.msg = "session: " & nk
+proc tabKeys*(app: App): seq[string] =
+  ## Every bottom-pane tab, in order: the REPL sessions, then the standalone
+  ## terminal (if one is open). Used for rendering, clicking, and cycling.
+  result = app.sessionKeys()
+  if app.hasTerminal: result.add terminalTabKey
 
-proc setSession*(app: var App; key: string) =
-  ## Make `key` ("lang/name") the current session (e.g. clicking a session tab).
+proc currentTabKey*(app: App): string =
+  ## Which tab the pane is showing right now.
+  if app.termActive: terminalTabKey else: app.curLang.toLowerAscii & "/" & app.curSession
+
+proc selectTab*(app: var App; key: string) =
+  ## Make `key` the current tab. Selecting a session turns the terminal off (and
+  ## vice versa) -- the two were previously independent, so switching was
+  ## invisible while the terminal was active.
+  app.focus = "session"
+  if key == terminalTabKey:
+    app.termActive = true
+    app.msg = "terminal: " & app.termLabel
+    return
+  app.termActive = false
   let parts = key.split('/')
   app.curLang = parts[0]
   app.curSession = if parts.len > 1: parts[1] else: "default"
-  app.focus = "session"
   refreshObjects(app)
   app.msg = "session: " & key
+
+proc setSession*(app: var App; key: string) = selectTab(app, key)
+
+proc switchSession*(app: var App) =
+  ## Cycle to the next bottom-pane tab (sessions and the terminal alike).
+  let keys = app.tabKeys()
+  if keys.len == 0: app.msg = "no sessions yet"; return
+  let cur = app.currentTabKey()
+  var i = -1
+  for k, name in keys:
+    if name == cur: i = k
+  selectTab(app, keys[(i + 1) mod keys.len])
 
 proc newTerminal*(app: var App) =
   ## Start (or reuse) a bash shell session and switch the pane to it.
@@ -744,7 +789,7 @@ proc babelExecute*(app: var App) =
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
-  app.curLang = lang; app.curSession = sessName
+  app.curLang = lang.toLowerAscii; app.curSession = sessName   # keys are lower-lang
   let s = getSession(app, lang, sessName)
   if s == nil: app.msg = "no session for '" & lang & "'"; return
   let outp = s.runBlock(dedentBody(bodyLines))
@@ -869,8 +914,11 @@ proc terminalDir*(app: App): string =
   if gTerminalDir.len > 0: expandTilde(gTerminalDir) else: projectRoot(app)
 
 proc openTerminal*(app: var App; cmd: string) =
-  ## Ask the host to run `cmd` in the thread-free PTY terminal (bottom panel).
+  ## Ask the host to run `cmd` in the thread-free PTY terminal (bottom panel),
+  ## and register it as a selectable tab.
   app.termActive = true
+  app.hasTerminal = true
+  app.termLabel = cmd.splitWhitespace()[0]   # "claude", "bash", ...
   app.sessionHidden = false
   app.termRequest = cmd
   app.focus = "session"

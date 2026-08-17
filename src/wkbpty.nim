@@ -110,9 +110,10 @@ proc waitReadable(fd: cint; timeoutMs: int): bool =
                    tv_usec: posix.Suseconds((timeoutMs mod 1000) * 1000))
   select(fd + 1, addr fds, nil, nil, addr tv) > 0
 
-proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000): string =
+proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000; mirror = true): string =
   ## Block (via select) reading from the master until `token` appears or we
-  ## time out. Bytes also flow into `outbuf` so the live display stays current.
+  ## time out. When `mirror`, bytes also flow into `outbuf` so the live display
+  ## stays current; internal queries pass mirror=false to stay off the terminal.
   if t.master < 0: return
   var b {.noinit.}: array[4096, char]
   while token notin result:
@@ -120,7 +121,8 @@ proc readUntil*(t: var Pty; token: string; timeoutMs = 15_000): string =
     let n = read(t.master, addr b[0], b.len)
     if n > 0:
       for i in 0 ..< n:
-        result.add b[i]; t.outbuf.add b[i]
+        result.add b[i]
+        if mirror: t.outbuf.add b[i]
     elif n == 0:
       t.master = -1; break                              # child exited
     # n < 0 (EAGAIN after a spurious wakeup): loop and select again

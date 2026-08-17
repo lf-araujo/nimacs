@@ -184,15 +184,22 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
       else: false
   else: false
 
+proc tabLabel(app: App; key: string): string =
+  ## Display text for a bottom-pane tab key (the terminal shows its command).
+  if key == terminalTabKey: app.termLabel else: key
+
+proc tabWidth(app: App; key: string; lineH: int): int =
+  (" " & tabLabel(app, key) & " ").len * (lineH div 2) + 4
+
 proc termLines(outbuf: string; rows: int): seq[string] =
   ## ANSI-strip the live buffer and drop the marker driver's own noise so a
-  ## session terminal shows only interactive I/O and real block output. The run
-  ## call echoes lowercase (`.nimacs_run(...)`, `_nimacs_run(...)`,
-  ## `nimacs_run '...'`) while the markers/ready ping are upper (`__NIMACS_BOR__`,
-  ## `NIMACSxREADY`), so match the known tokens case-insensitively.
+  ## session terminal shows only interactive I/O and real block output. Every
+  ## driver artefact -- the run call (`.nimacs_run(...)`), the markers
+  ## (`__NIMACS_BOR__`), and the ready ping and its echo (`paste0("NIMACSx",
+  ## "READY")`, split so the token never appears contiguously) -- carries
+  ## "nimacs", so a case-insensitive substring test catches them all.
   for ln in stripAnsi(outbuf).splitLines():
-    let low = ln.toLowerAscii
-    if "nimacs_run" in low or "__nimacs" in low or "nimacsxready" in low: continue
+    if "nimacs" in ln.toLowerAscii: continue
     result.add ln
   if result.len > rows: result = result[^rows .. ^1]
 
@@ -236,6 +243,7 @@ proc main() =
       except ValueError: discard
 
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
+  setupExecPath()           # seed PATH from the login shell (+ config paths)
   # Themes come from the config; guarantee one so the chrome is never unstyled,
   # and honor a default the config may already have applied.
   if gThemes.len == 0: registerTheme("default", defaultBase16())
@@ -272,6 +280,9 @@ proc main() =
       pty = startPty(app.termRequest, terminalDir(app))
       if not pty.alive: app.msg = "could not start " & app.termRequest
       app.termRequest = ""
+    # Retire the terminal tab once its process has ended and we've moved off it.
+    if app.hasTerminal and not pty.alive and not app.termActive:
+      app.hasTerminal = false
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])
@@ -322,7 +333,7 @@ proc main() =
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
-              elif (app.sessions.len > 0 or app.termActive) and not app.sessionHidden: layPlain
+              elif (app.sessions.len > 0 or app.hasTerminal) and not app.sessionHidden: layPlain
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
@@ -340,9 +351,9 @@ proc main() =
             app.sessionHidden = true; app.focus = "editor"
           else:
             var cx = r.x + 4
-            for k in app.sessionKeys():
-              let w = (" " & k & " ").len * (lineH div 2) + 4
-              if e.x >= cx and e.x < cx + w: setSession(app, k); break
+            for k in app.tabKeys():
+              let w = tabWidth(app, k, lineH)
+              if e.x >= cx and e.x < cx + w: selectTab(app, k); break
               cx += w + 4
     # Chrome colors from the active theme (re-read each frame so a palette
     # theme-switch takes effect immediately).
@@ -377,23 +388,19 @@ proc main() =
       let r = cells["session"]
       fillRect(r, sessBg)
       let bh = lineH                       # top row = session tab bar
-      # tab bar: session chips + an [x] at the far right to hide the panel
+      # tab bar: one chip per tab (sessions + the terminal), then an [x] to hide.
       fillRect(rect(r.x, r.y, r.w, bh), app.theme.tabBarBg)
       var cx = r.x + 4
-      let curKey = app.curLang & "/" & app.curSession
-      for k in app.sessionKeys():
+      let curKey = app.currentTabKey()
+      for k in app.tabKeys():
         let active = k == curKey
         let chipBg = if active: app.theme.chipActiveBg else: app.theme.chipBg
         let chipFg = if active: app.theme.chipActiveFg else: app.theme.chipFg
-        let label = " " & k & " "
-        let w = label.len * (lineH div 2) + 4
+        let label = " " & tabLabel(app, k) & " "
+        let w = tabWidth(app, k, lineH)
         fillRect(rect(cx, r.y, w, bh), chipBg)
         discard drawText(app.font, cx + 2, r.y, label, chipFg, chipBg)
         cx += w + 4
-      if app.termActive:                   # a "terminal" chip
-        let tbg = app.theme.chipActiveBg
-        fillRect(rect(cx, r.y, 10 * (lineH div 2), bh), tbg)
-        discard drawText(app.font, cx + 2, r.y, " terminal ", app.theme.chipActiveFg, tbg)
       let xr = rect(r.x + r.w - bh, r.y, bh, bh)   # [x] hide button
       fillRect(xr, app.theme.closeBg)
       discard drawText(app.font, xr.x + bh div 3, r.y, "x", app.theme.closeFg, app.theme.closeBg)

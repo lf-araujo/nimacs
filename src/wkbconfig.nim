@@ -86,6 +86,14 @@ proc configure*(app: var App) =
   # override, e.g.  gTerminalDir = "~/projects/analysis"
   gTerminalDir = ""
 
+  # PATH for sessions & terminals. Launched from a GUI, wkbenchless may inherit a
+  # stripped PATH, so at startup it seeds PATH from your login shell ($SHELL -lc)
+  # -- that alone usually locates R, python, etc. Add extra dirs here (prepended,
+  # ~ expanded); set gLoadLoginPath = false to skip the login-shell probe.
+  addExecPath("~/.local/bin")
+  addExecPath("~/bin")
+  # gLoadLoginPath = false
+
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
   #    note after every babel run.
   addHook("startup", proc(a: var App) =
