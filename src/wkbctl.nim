@@ -1,0 +1,49 @@
+## wkbctl -- talk to a running wkbenchless over its control socket.
+## For scripts/agents (e.g. Claude in the terminal) to drive the editor.
+##
+##   wkbctl buffer                 # print the current buffer
+##   wkbctl blocks                 # list #+begin_src blocks (line: header)
+##   wkbctl command <name>         # run a registered command
+##   echo 'mean(1:10)' | wkbctl eval r default   # run code in a live session
+##
+## `eval` reads the code from stdin. lang/session default to r/default.
+
+import std/[net, os, strutils]
+from std/posix import shutdown, SHUT_WR
+
+proc main() =
+  let args = commandLineParams()
+  if args.len == 0:
+    quit("usage: wkbctl buffer|blocks|command <name>|eval [lang] [session] (code on stdin)", 1)
+  var req = ""
+  case args[0]
+  of "buffer", "blocks":
+    req = args[0]
+  of "command":
+    if args.len < 2: quit("wkbctl command <name>", 1)
+    req = "command\t" & args[1]
+  of "eval":
+    let lang = if args.len > 1: args[1] else: "r"
+    let sess = if args.len > 2: args[2] else: "default"
+    req = "eval\t" & lang & "\t" & sess & "\n" & stdin.readAll()
+  else:
+    quit("unknown verb: " & args[0], 1)
+
+  let path = getCacheDir() / "wkbenchless" / "control.sock"
+  var s = newSocket(AF_UNIX, SOCK_STREAM, IPPROTO_IP)
+  try:
+    s.connectUnix(path)
+  except OSError:
+    quit("wkbenchless is not running (no control socket at " & path & ")", 1)
+  s.send(req)
+  discard shutdown(s.getFd, SHUT_WR)     # half-close so the server sees EOF
+  var resp = ""
+  while true:
+    let chunk = s.recv(4096)
+    if chunk.len == 0: break
+    resp.add chunk
+  s.close()
+  stdout.write(resp)
+  if resp.len > 0 and resp[^1] != '\n': stdout.write("\n")
+
+main()

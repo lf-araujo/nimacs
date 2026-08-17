@@ -51,6 +51,7 @@ proc startPty*(cmd, dir: string): PtyTerm =
     discard execv(exe.cstring, argv)
     quit(127)
   discard fcntl(master, F_SETFL, O_NONBLOCK)
+  discard fcntl(master, F_SETFD, FD_CLOEXEC)
   setSize(master, 24, 80)          # give the child a sane terminal size
   result.master = master
   result.pid = pid

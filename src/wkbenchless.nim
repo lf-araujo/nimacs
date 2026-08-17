@@ -11,6 +11,7 @@ import uirelays/layout
 import wkbcore
 import wkbconfig
 import wkbpty
+import wkbctrl
 import std/[os, tables, strutils]
 
 const fontPath =
@@ -202,6 +203,7 @@ proc main() =
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
   var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
+  var ctrl = startControl()              # control socket for wkbctl / agents
   var suppressText = false   # swallow the TextInput that follows a prefix chord
   let bg = color(21, 23, 27)
   let sessBg = color(16, 18, 22)
@@ -212,9 +214,9 @@ proc main() =
   var e: Event
   while app.running:
     let liveTerm = app.termActive and not app.sessionHidden
-    if not waitEvent(e, if liveTerm: 30 else: -1):
-      if liveTerm: e = Event(kind: NoEvent)   # tick to poll the pty
-      else: continue
+    # A timeout so we still poll the pty and the control socket while idle.
+    if not waitEvent(e, if liveTerm: 30 else: 100):
+      e = Event(kind: NoEvent)
     if e.kind in {WindowCloseEvent, QuitEvent}: break
 
     if app.termRequest.len > 0:               # (re)start the terminal process
@@ -223,6 +225,7 @@ proc main() =
       if not pty.alive: app.msg = "could not start " & app.termRequest
       app.termRequest = ""
     if app.termActive: pump(pty)
+    poll(ctrl, app)                           # handle any wkbctl / agent request
 
     var consumed = false
     if suppressText:

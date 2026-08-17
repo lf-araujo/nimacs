@@ -99,6 +99,7 @@ proc startSession*(spec: ReplSpec): Session =
     discard close(master)
     discard execv(exe.cstring, argv)
     quit(127)
+  discard fcntl(master, F_SETFD, FD_CLOEXEC)   # don't leak into later forks
   result = Session(master: master, pid: pid, spec: spec)
   ptyWrite(master, spec.prime)
   ptyWrite(master, spec.ready)   # sync past banner + prime echo
