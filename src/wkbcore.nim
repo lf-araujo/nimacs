@@ -52,6 +52,7 @@ type
     termRequest*: string                  ## command the host should run in the PTY
     hasTerminal*: bool                    ## a standalone terminal tab exists (alive)
     termLabel*: string                    ## its tab label ("claude", "bash", ...)
+    termScroll*: int                      ## bottom-pane scrollback: lines up from tail
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -723,6 +724,7 @@ proc selectTab*(app: var App; key: string) =
   ## vice versa) -- the two were previously independent, so switching was
   ## invisible while the terminal was active.
   app.focus = "session"
+  app.termScroll = 0                    # a freshly selected tab starts at the tail
   if key == terminalTabKey:
     app.termActive = true
     app.msg = "terminal: " & app.termLabel

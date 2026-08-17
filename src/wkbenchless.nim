@@ -191,17 +191,17 @@ proc tabLabel(app: App; key: string): string =
 proc tabWidth(app: App; key: string; lineH: int): int =
   (" " & tabLabel(app, key) & " ").len * (lineH div 2) + 4
 
-proc termLines(outbuf: string; rows: int): seq[string] =
+proc termLines(outbuf: string): seq[string] =
   ## ANSI-strip the live buffer and drop the marker driver's own noise so a
   ## session terminal shows only interactive I/O and real block output. Every
   ## driver artefact -- the run call (`.nimacs_run(...)`), the markers
   ## (`__NIMACS_BOR__`), and the ready ping and its echo (`paste0("NIMACSx",
   ## "READY")`, split so the token never appears contiguously) -- carries
-  ## "nimacs", so a case-insensitive substring test catches them all.
+  ## "nimacs", so a case-insensitive substring test catches them all. Returns
+  ## ALL lines; the caller windows them (with scrollback).
   for ln in stripAnsi(outbuf).splitLines():
     if "nimacs" in ln.toLowerAscii: continue
     result.add ln
-  if result.len > rows: result = result[^rows .. ^1]
 
 proc main() =
   var screen = createWindow(960, 700)
@@ -414,11 +414,23 @@ proc main() =
       if ap != nil:
         if ap[].alive:
           setPtySize(ap[], rows, max(1, body.w div max(1, lineH div 2)))
-        let lines = termLines(ap[].outbuf, rows)
+        let all = termLines(ap[].outbuf)
+        # Mouse-wheel scrollback over the terminal body (e.y: +1 up / -1 down).
+        if e.kind == MouseWheelEvent and
+           lastMouse.x >= body.x and lastMouse.x < body.x + body.w and
+           lastMouse.y >= body.y and lastMouse.y < body.y + body.h:
+          app.termScroll += e.y * 3
+        let maxScroll = max(0, all.len - rows)
+        app.termScroll = max(0, min(app.termScroll, maxScroll))
+        let stop = all.len - app.termScroll     # exclusive; tail when scroll==0
+        let start = max(0, stop - rows)
         var y = body.y
-        for ln in lines:
-          discard drawText(app.font, body.x + 4, y, ln, app.theme.termFg, sessBg)
+        for i in start ..< stop:
+          discard drawText(app.font, body.x + 4, y, all[i], app.theme.termFg, sessBg)
           y += lineH
+        if app.termScroll > 0:                  # scrollback indicator
+          discard drawText(app.font, body.x + body.w - 6 * (lineH div 2), body.y,
+            "[+" & $app.termScroll & "]", app.theme.dimFg, sessBg)
         if not ap[].alive:
           let hint = if app.termActive: "[process ended -- Esc-hide, reopen with M-x terminal]"
                      else: "[session ended]"
