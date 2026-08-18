@@ -20,7 +20,11 @@ type
     rows*, cols*: int
     grid*: seq[seq[Cell]]      ## the visible screen, rows*cols
     saved: seq[seq[Cell]]      ## stash for the primary screen while in alt
-    inAlt: bool
+    inAlt*: bool               ## on the alternate screen (TUIs; no scrollback)
+    scrollback*: seq[seq[Cell]] ## lines pushed off the top of the primary screen
+    viewOffset*: int           ## lines scrolled up into scrollback (0 == live tail)
+    mouseRep*: bool            ## app enabled mouse reporting (DECSET 1000/1002/1003)
+    mouseSgr*: bool            ## app enabled SGR mouse encoding (DECSET 1006)
     cx*, cy*: int              ## cursor column, row (0-based)
     scx, scy: int              ## saved cursor (DECSC / ESC7)
     top, bot: int              ## scroll region rows [top, bot]
@@ -31,6 +35,8 @@ type
     par: string                ## collected CSI parameter bytes
     priv: bool                 ## CSI '?' private marker
     osc: string
+
+const maxScrollback = 5000    ## cap history so a long-running shell stays bounded
 
 proc blankCell(t: VTerm): Cell = Cell(ch: "", fg: t.curFg, bg: t.curBg, inv: false)
 
@@ -63,16 +69,43 @@ proc resize*(t: VTerm; rows, cols: int) =
   t.rows = rows; t.cols = cols
   t.grid = ng
   t.top = 0; t.bot = rows - 1
+  t.viewOffset = min(t.viewOffset, t.scrollback.len)
   t.clampCursor()
+
+proc maxViewOffset*(t: VTerm): int = t.scrollback.len
+
+proc scrollView*(t: VTerm; delta: int) =
+  ## Move the viewport by `delta` lines (positive = back into history).
+  t.viewOffset = max(0, min(t.viewOffset + delta, t.scrollback.len))
+
+proc viewRow*(t: VTerm; ry: int): seq[Cell] =
+  ## Row `ry` (0-based, top of body) of the viewport, accounting for how far the
+  ## user has scrolled back. When `viewOffset == 0` this is just `grid[ry]`.
+  let idx = t.scrollback.len - t.viewOffset + ry
+  if idx < 0: return t.blankRow()
+  if idx < t.scrollback.len: return t.scrollback[idx]
+  let g = idx - t.scrollback.len
+  if g >= 0 and g < t.grid.len: return t.grid[g]
+  t.blankRow()
 
 # --- screen ops -------------------------------------------------------------
 
 proc scrollUp(t: VTerm; n = 1) =
   ## Move lines in the scroll region up by n; blank the vacated bottom lines.
+  ## On the primary screen with a full-height region, the evicted top line is
+  ## preserved in `scrollback` so the user can scroll back to it.
+  let history = not t.inAlt and t.top == 0 and t.bot == t.rows - 1
   for _ in 0 ..< n:
+    if history:
+      t.scrollback.add t.grid[0]
     for r in t.top ..< t.bot:
       t.grid[r] = t.grid[r + 1]
     t.grid[t.bot] = t.blankRow()
+  if history and t.scrollback.len > maxScrollback:
+    t.scrollback = t.scrollback[^maxScrollback .. ^1]
+  # Keep a scrolled-up viewport looking at the same content as history grows.
+  if history and t.viewOffset > 0:
+    t.viewOffset = min(t.viewOffset + n, t.scrollback.len)
 
 proc scrollDown(t: VTerm; n = 1) =
   for _ in 0 ..< n:
@@ -228,19 +261,23 @@ proc handleCsi(t: VTerm; final: char) =
     if t.priv:
       let on = final == 'h'
       for p in ps:
-        if p in [1049, 1047, 47]:        # alternate screen
+        case p
+        of 1049, 1047, 47:               # alternate screen
           if on and not t.inAlt:
             t.saved = t.grid
             t.grid = newSeq[seq[Cell]](t.rows)
             for r in 0 ..< t.rows: t.grid[r] = t.blankRow()
             t.inAlt = true
+            t.viewOffset = 0             # alt screen has no scrollback to view
             if p == 1049: (t.scx = t.cx; t.scy = t.cy)
           elif not on and t.inAlt:
             t.grid = t.saved
             t.saved = @[]
             t.inAlt = false
             if p == 1049: (t.cx = t.scx; t.cy = t.scy)
-        # ?25 (cursor visibility), ?2004 (bracketed paste), etc.: ignored
+        of 1000, 1002, 1003: t.mouseRep = on   # mouse click/drag/any reporting
+        of 1006: t.mouseSgr = on               # SGR mouse encoding
+        else: discard                    # ?25 (cursor), ?2004 (bracketed paste): ignored
   else: discard
   t.clampCursor()
 
