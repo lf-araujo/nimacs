@@ -223,9 +223,7 @@ type
     # whose body + #+end_src are collapsed to a single "..." row.
     foldedBlocks*: seq[int]
     foldAllPending*: bool           ## fold every block once ranges are known
-    noWrap*: bool                   ## draw long lines past the edge (clipped)
-                                    ## instead of soft-wrapping to the next row
-    hScroll*: int                   ## columns scrolled right (noWrap view)
+    hScroll*: int                   ## columns wide tables are panned right
     # Markers (search results, etc.)
     markers: seq[Marker]
     # Line decorations (breakpoints, active execution line, etc.)
@@ -2443,6 +2441,7 @@ type
     i, charsLen: int
     font: Font
     oldX, maxY, lineH, spaceWidth: int
+    lineNoWrap: bool          ## this row draws past the edge (clipped) not wrapped
     chars: array[CharBufSize, char]
     toCursor: array[CharBufSize, int]
 
@@ -2542,9 +2541,9 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
   for k in 0 ..< db.charsLen: db.tempStr.add db.chars[k]
   let ext = measureText(db.font, db.tempStr)
   let w = ext.w
-  if db.s[].noWrap or db.dim.x + w + db.spaceWidth <= db.dim.w:
-    # noWrap: draw the whole run; the editor sets a clip rect so overflow past
-    # the right edge is hidden rather than wrapped.
+  if db.lineNoWrap or db.dim.x + w + db.spaceWidth <= db.dim.w:
+    # A no-wrap (table) row draws the whole run; render() clips to the pane so
+    # overflow past the right edge is hidden rather than wrapped.
     drawSubtoken(db, 0, db.charsLen - 1, fg, bg)
     db.dim.x += w
   else:
@@ -2573,6 +2572,14 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
         db.dim.y += db.lineH
         if db.dim.y + db.lineH > db.maxY: break
 
+proc isTableLine(s: SynEdit; i: int): bool =
+  ## org table rows (start with '|' after leading whitespace) don't wrap; they
+  ## extend past the edge and pan with hScroll.
+  if s.lang != langOrg: return false
+  var j = i
+  while j < s.len and s[j] in {' ', '\t'}: inc j
+  j < s.len and s[j] == '|'
+
 proc fontForFlags(s: SynEdit; f: CellFlags; base: Font): Font =
   if cfBold in f and cfItalic in f: (if s.boldItalicFont.int != 0: s.boldItalicFont else: base)
   elif cfBold in f: (if s.boldFont.int != 0: s.boldFont else: base)
@@ -2589,8 +2596,9 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   db.maxY = dim.h
   db.dim = dim
   let baseFont = s.font
-  if s.noWrap and s.hScroll > 0:
-    db.dim.x -= s.hScroll * textWidth(baseFont, " ")   # shift the row left
+  db.lineNoWrap = isTableLine(s, i)
+  if db.lineNoWrap and s.hScroll > 0:
+    db.dim.x -= s.hScroll * textWidth(baseFont, " ")   # pan a wide table left
   db.font = fontForFlags(s, styleFlags, baseFont)
   db.s = addr s
   db.i = i
@@ -2770,9 +2778,8 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   dim.h = endY
 
   fillRect(area, s.theme.bg)
-  if s.noWrap:
-    saveState()
-    setClipRect(area)   # keep overflowing (unwrapped) rows inside this pane
+  saveState()
+  setClipRect(area)   # keep overflowing (unwrapped table) rows inside this pane
 
   let spl = s.spaceForLines()
   if s.showLineNumbers:
@@ -2898,7 +2905,7 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
                     else: s.theme.scrollBarColor
     fillRect(finalGrip, gripColor)
 
-  if s.noWrap: restoreState()
+  restoreState()
 
 proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
   ## Per-frame entry point. When focused, processes input and shows cursor.

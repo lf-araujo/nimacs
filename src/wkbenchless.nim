@@ -316,13 +316,11 @@ proc main() =
     noteRecentFile(app.filePath)
     if app.ed.lang == langOrg:
       app.ed.foldAllPending = true
-      app.ed.noWrap = true
   else:
     app.ed.lang = langOrg                  # before setText, so org highlights now
     app.docLang = ""
     app.ed.setText(welcomeOrg)
     app.ed.foldAllPending = true
-    app.ed.noWrap = true
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
   app.sess.setText("session output\n")
@@ -505,6 +503,12 @@ proc main() =
       if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
         app.ed.gotoPos(act.pos)
         openLink(app)
+      elif e.kind == MouseDownEvent and e.button == LeftButton and
+           not overlay and app.focus == "editor" and app.ed.lang == langOrg and
+           e.x >= editorRect.x and e.x < editorRect.x + editorRect.w and
+           e.y >= editorRect.y and e.y < editorRect.y + editorRect.h and
+           linkAtCursor(app).len > 0:
+        openLink(app)              # plain click on an org link follows it
       # Always-on completion: after a printable edit reaches the editor, refresh
       # the suggestion popup (LSP languages only; no popup while overlays show).
       if not overlay and app.focus == "editor" and app.docLang.len > 0:

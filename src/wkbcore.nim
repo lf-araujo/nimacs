@@ -356,7 +356,6 @@ proc openFile*(app: var App; path: string) =
     app.msg = "could not open " & path; return
   if ed.lang == langOrg:
     ed.foldAllPending = true
-    ed.noWrap = true
   app.syncActive()
   app.buffers.add BufferState(ed: ed, filePath: path, docLang: extToLangId(ext))
   app.activate(app.buffers.high)
@@ -770,6 +769,10 @@ proc foldAllSrc*(app: var App) =
   if app.ed.lang == langOrg: app.ed.foldAllBlocks(); app.msg = "all blocks folded"
 proc unfoldAllSrc*(app: var App) =
   if app.ed.lang == langOrg: app.ed.unfoldAll(); app.msg = "all blocks unfolded"
+
+proc linkAtCursor*(app: App): string =
+  ## The org link target under the cursor, or "" (for plain-click activation).
+  orgLinkAt(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
 
 proc openLink*(app: var App) =
   ## Open the org link at the cursor with the system tool (browser / file
