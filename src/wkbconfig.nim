@@ -94,6 +94,11 @@ proc configure*(app: var App) =
   addExecPath("~/bin")
   # gLoadLoginPath = false
 
+  # The `claude` action (C-c a) runs this. Default resumes the last conversation
+  # in the project; set to "claude" for a fresh chat, or add your own flags.
+  gClaudeCmd = "claude --continue"
+  # gClaudeCmd = "claude"                # start fresh instead of continuing
+
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
   #    note after every babel run.
   addHook("startup", proc(a: var App) =

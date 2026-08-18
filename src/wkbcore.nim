@@ -96,6 +96,7 @@ var
   gThemes*: seq[AppTheme]                 ## themes the config registers (palette picks one)
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
   gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
+  gClaudeCmd* = "claude --continue"       ## command the `claude` action runs (config)
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -1117,8 +1118,8 @@ proc registerBuiltins*() =
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
   defcommand("terminal", "Open a bash terminal in the bottom panel",
              proc(app: var App) = openTerminal(app, "bash --norc"))
-  defcommand("claude", "Open claude in the bottom panel (best-effort)",
-             proc(app: var App) = openTerminal(app, "claude"))
+  defcommand("claude", "Open claude in the bottom panel (continues last chat)",
+             proc(app: var App) = openTerminal(app, gClaudeCmd))
   defcommand("show-panel", "Show the bottom panel", showPanel)
   defcommand("toggle-panel", "Show/hide the bottom panel", togglePanel)
   defcommand("recompile", "Recompile config & restart", recompileConfig)
