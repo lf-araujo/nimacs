@@ -256,6 +256,11 @@ proc main() =
   var lastMouse = (x: 0, y: 0)
   var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
+  # Terminal text selection (drag to select, copy on release). Coords are
+  # (row, col) within the drawn terminal body.
+  var selecting = false
+  var selHas = false
+  var selA, selB = (r: 0, c: 0)
 
   # The bottom pane is a live terminal on whichever Pty is current: the
   # standalone terminal (M-t / claude), or else the current REPL session.
@@ -408,6 +413,20 @@ proc main() =
       let rows = max(1, body.h div lineH)
       let charW = max(1, measureText(app.font, "0").w)
       let ap = activePtyPtr()
+      var visText: seq[string]     # text of each drawn body row (for select/copy)
+      var copyNow = false
+      block termSelect:            # drag to select, copy on release
+        if ap == nil: break termSelect
+        let inBody = lastMouse.x >= body.x and lastMouse.x < body.x + body.w and
+                     lastMouse.y >= body.y and lastMouse.y < body.y + body.h
+        let sr = max(0, (lastMouse.y - body.y) div lineH)
+        let sc = max(0, (lastMouse.x - body.x) div charW)
+        if e.kind == MouseDownEvent and e.button == LeftButton and inBody:
+          selecting = true; selHas = false; selA = (sr, sc); selB = (sr, sc)
+        elif e.kind == MouseMoveEvent and selecting:
+          selB = (sr, sc)
+        elif e.kind == MouseUpEvent and selecting:
+          selecting = false; selHas = selA != selB; copyNow = selHas
       if ap != nil and ap[].vt != nil:
         # Standalone terminal: a full screen-grid emulator (cursor-addressed
         # TUIs like claude render here). Colored cell runs + block cursor.
@@ -429,6 +448,9 @@ proc main() =
             let bg = if c0.inv: c0.fg else: c0.bg
             discard drawText(app.font, body.x + cxp * charW, body.y + ry * lineH, run, fg, bg)
             cxp = cxe
+          var rowStr = ""                       # full-width row text (for selection)
+          for c in vt.grid[ry]: rowStr.add (if c.ch.len == 0: " " else: c.ch)
+          visText.add rowStr
         if ap[].alive:                          # block cursor (inverse cell)
           let cc = vt.grid[vt.cy][vt.cx]
           let cxr = body.x + vt.cx * charW
@@ -454,6 +476,7 @@ proc main() =
         var y = body.y
         for i in start ..< stop:
           discard drawText(app.font, body.x + 4, y, all[i], app.theme.termFg, sessBg)
+          visText.add all[i]
           y += lineH
         if app.termScroll > 0:
           discard drawText(app.font, body.x + body.w - 6 * charW, body.y,
@@ -464,6 +487,27 @@ proc main() =
         discard drawText(app.font, body.x + 4, body.y,
           "no session yet -- run a src block (C-c C-c) or M-x terminal",
           app.theme.dimFg, sessBg)
+      # selection highlight + copy-on-release (over whichever content was drawn)
+      if (selecting or selHas or copyNow) and visText.len > 0:
+        var a = selA
+        var b = selB
+        if (a.r, a.c) > (b.r, b.c): swap a, b
+        var txt = ""
+        for row in a.r .. b.r:
+          if row < 0 or row >= visText.len: continue
+          let line = visText[row]
+          let cS = (if row == a.r: min(a.c, line.len) else: 0)
+          let cE = (if row == b.r: min(b.c, line.len) else: line.len)
+          if cE > cS:
+            let hx = body.x + cS * charW
+            fillRect(rect(hx, body.y + row * lineH, (cE - cS) * charW, lineH), app.theme.ed.selBg)
+            discard drawText(app.font, hx, body.y + row * lineH,
+                             line[cS ..< cE], app.theme.termFg, app.theme.ed.selBg)
+          if copyNow:
+            txt.add line[cS ..< max(cS, cE)].strip(leading = false, trailing = true)
+            if row < b.r: txt.add "\n"
+        if copyNow and txt.len > 0:
+          putClipboardText(txt); app.msg = "copied " & $txt.len & " chars"
     if cells.hasKey("objects"):
       fillRect(cells["objects"], sessBg)
       discard app.objects.draw(evFor("objects"), cells["objects"], focused = app.focus == "objects")
