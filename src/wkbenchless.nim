@@ -154,6 +154,7 @@ proc paletteAccept(app: var App) =
   of pmThemes:
     app.paletteActive = false
     applyTheme(app, parseInt(id))
+    setState("theme", app.theme.name)      # remember across restarts
   of pmOrg:
     app.paletteActive = false
     app.ed.gotoLine(parseInt(id) + 1, 0)
@@ -337,6 +338,9 @@ proc main() =
   # and honor a default the config may already have applied.
   if gThemes.len == 0: registerTheme("default", defaultBase16())
   if app.theme.name.len == 0: applyTheme(app, 0)
+  loadState()                               # persisted UI state (XDG config dir)
+  if gState.hasKey("theme"):                # start in the last theme the user picked
+    applyThemeByName(app, gState["theme"])
   app.runHooks("startup")
 
   let layBare = parseLayout(layoutBare)

@@ -243,6 +243,30 @@ proc defaultBase16*(): Base16 =
     rgb(0xe06c75), rgb(0xd19a66), rgb(0xe5c07b), rgb(0x98c379),
     rgb(0x56b6c2), rgb(0x61afef), rgb(0xc678dd), rgb(0xbe5046) ]
 
+# -- persisted UI state (XDG config dir; e.g. ~/.config/wkbenchless/state.cfg) --
+var gState*: Table[string, string]
+
+proc stateDir*(): string = getConfigDir() / "wkbenchless"
+proc statePath*(): string = stateDir() / "state.cfg"
+
+proc loadState*() =
+  gState.clear()
+  let p = statePath()
+  if fileExists(p):
+    for line in readFile(p).splitLines():
+      let eq = line.find('=')
+      if eq > 0: gState[strutils.strip(line[0 ..< eq])] = strutils.strip(line[eq + 1 .. ^1])
+
+proc setState*(key, val: string) =
+  ## Remember a key and write the state file (created under the XDG config dir).
+  gState[key] = val
+  try:
+    createDir(stateDir())
+    var s = ""
+    for k, v in gState: s.add k & " = " & v & "\n"
+    writeFile(statePath(), s)
+  except CatchableError: discard
+
 proc getSession*(app: var App; lang, name: string): Session =
   let key = lang.toLowerAscii & "/" & name
   if app.sessions.hasKey(key) and app.sessions[key] != nil:
@@ -618,6 +642,7 @@ proc openRecentCmd*(app: var App) =
 proc themeCmd*(app: var App) =
   if gThemes.len == 0: app.msg = "no themes registered (see wkbconfig)"; return
   openPalette(app, pmThemes)
+  app.paletteSel = app.themeIdx        # reopen on the currently-active theme
 
 proc listBuffers*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return

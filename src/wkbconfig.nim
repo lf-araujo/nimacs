@@ -76,7 +76,15 @@ proc configure*(app: var App) =
     rgb(0x657b83), rgb(0x586e75), rgb(0x073642), rgb(0x002b36),
     rgb(0xdc322f), rgb(0xcb4b16), rgb(0xb58900), rgb(0x859900),
     rgb(0x2aa198), rgb(0x268bd2), rgb(0x6c71c4), rgb(0xd33682)])
-  applyThemeByName(app, "one-dark")     # the default; comment out for the first-registered
+  # "seventeen": a NANO light theme styled after Sublime Text's "Sixteen".
+  # grey5 text on off-white; strong/headings pink-red, salient/links orange,
+  # strings green, comments faded grey, selection light grey.
+  registerTheme("seventeen", [
+    rgb(0xf9f9f9), rgb(0xededed), rgb(0xd8d8d8), rgb(0xb8b8b8),
+    rgb(0x767676), rgb(0x545454), rgb(0x333333), rgb(0xffffff),
+    rgb(0xd2322d), rgb(0xf09642), rgb(0xc9a227), rgb(0x9dbf42),
+    rgb(0x4d9d9d), rgb(0xf09642), rgb(0xd2322d), rgb(0x8b5a2b)])
+  applyThemeByName(app, "seventeen")    # the default (persisted choice overrides it)
 
   # ---- Your customisations --------------------------------------------------
   # A brand-new command, written in Nim, bound to a two-key sequence.
