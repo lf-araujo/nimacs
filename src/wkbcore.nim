@@ -1106,7 +1106,7 @@ proc registerBuiltins*() =
   defcommand("undo", "Undo", proc(app: var App) = app.ed.undo())
   defcommand("redo", "Redo", proc(app: var App) = app.ed.redo())
   defcommand("palette", "Command palette", paletteCmd)
-  defcommand("theme", "Theme: pick a color theme", themeCmd)
+  defcommand("theme", "Theme: pick a base16 / sixteen color theme", themeCmd)
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)
