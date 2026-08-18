@@ -345,13 +345,18 @@ proc main() =
   var lastMouse = (x: 0, y: 0)
   var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
-  var termRepaintFrames = 0              # after a reload, nudge the TUI to repaint
+  let termGridPath = getTempDir() / "wkbenchless-termgrid"
+  var termRepaintFrames = 0              # fallback nudge if no grid snapshot exists
   block:                                 # adopt sessions/terminal from a hot reload
     let ti = adoptHandoff(app)
     if ti.master >= 0:
       pty = adoptTerminal(ti.master, ti.pid, app.theme.termFg, app.theme.panelBg)
       app.hasTerminal = true; app.termLabel = ti.label; app.termActive = ti.active
-      termRepaintFrames = 3              # repaint over the first few sized frames
+      if getEnv("WKB_TERMGRID").len > 0 and fileExists(getEnv("WKB_TERMGRID")):
+        pty.vt.restore(readFile(getEnv("WKB_TERMGRID")))   # identical screen, no repaint wait
+        removeFile(getEnv("WKB_TERMGRID")); delEnv("WKB_TERMGRID")
+      else:
+        termRepaintFrames = 3            # no snapshot: fall back to SIGWINCH nudges
     if app.sessions.len > 0 or ti.master >= 0:
       app.sessionHidden = false
       app.msg = "reloaded -- sessions & terminal preserved"
@@ -392,6 +397,15 @@ proc main() =
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])
     poll(ctrl, app)                           # handle any wkbctl / agent request
+
+    if app.reloadPending:                     # recompile finished -> snapshot & re-exec
+      if pty.vt != nil and pty.alive:
+        try:
+          writeFile(termGridPath, pty.vt.serialize())
+          putEnv("WKB_TERMGRID", termGridPath)
+        except CatchableError: discard
+      execReload(app)                         # execv; only returns on failure
+      app.reloadPending = false
 
     var consumed = false
     if suppressText:

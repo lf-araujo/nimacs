@@ -63,6 +63,9 @@ type
     termScroll*: int                      ## bottom-pane scrollback: lines up from tail
     termMaster*: cint                     ## host keeps this synced with the terminal pty
     termPid*: int                         ## (so a hot reload can hand the terminal off)
+    reloadPending*: bool                  ## recompile done -> host snapshots + re-execs
+    reloadBin*, reloadFile*: string       ## the freshly built binary + file to reopen
+    reloadLine*: int                      ## cursor line to restore
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -1204,9 +1207,19 @@ proc recompileConfig*(app: var App) =
     if not fileExists(bin):
       app.msg = "recompile: built binary not found at " & bin; return
     if handoff.len > 0: putEnv("WKB_HANDOFF", handoff)
-    let argv = allocCStringArray(@[bin, fileArg, "--goto", $line])
-    discard execv(bin.cstring, argv)
-    app.msg = "recompile: exec failed (" & bin & ")"   # only if execv failed
+    # Defer the execv to the host: it owns the terminal's screen grid, which it
+    # snapshots (so a TUI looks identical after reload) just before re-exec.
+    app.reloadBin = bin; app.reloadFile = fileArg; app.reloadLine = line
+    app.reloadPending = true
+
+proc execReload*(app: var App) =
+  ## Re-exec the freshly built binary, restoring the file + cursor. Called by the
+  ## host after it has stashed the terminal grid (WKB_TERMGRID) and sessions.
+  when defined(posix):
+    let argv = allocCStringArray(@[app.reloadBin, app.reloadFile, "--goto", $app.reloadLine])
+    discard execv(app.reloadBin.cstring, argv)
+    app.msg = "recompile: exec failed (" & app.reloadBin & ")"   # only if execv failed
+    app.reloadPending = false
 
 proc editConfig*(app: var App) =
   ## Open src/wkbconfig.nim in the editor (edit, then reload-config / C-c r).

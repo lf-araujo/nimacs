@@ -344,3 +344,49 @@ proc lineText*(t: VTerm; row: int): string =
   for c in t.grid[row]:
     result.add (if c.ch.len == 0: " " else: c.ch)
   result = result.strip(leading = false, trailing = true)
+
+# --- hot-reload snapshot: preserve the visible screen across a re-exec so a TUI
+#     looks identical afterwards without waiting for it to repaint (tmux-style).
+
+proc serialize*(t: VTerm): string =
+  ## Compact binary snapshot of the visible screen (dims, alt flag, cursor, cells).
+  proc u16(s: var string; v: int) = s.add chr((v shr 8) and 0xFF); s.add chr(v and 0xFF)
+  result = newStringOfCap(t.rows * t.cols * 8 + 16)
+  result.u16(t.rows); result.u16(t.cols)
+  result.add chr(if t.inAlt: 1 else: 0)
+  result.u16(t.cx); result.u16(t.cy)
+  for row in t.grid:
+    for c in row:
+      let n = min(c.ch.len, 255)
+      result.add chr(n)
+      if n > 0: result.add c.ch[0 ..< n]
+      result.add chr(c.fg.r.int); result.add chr(c.fg.g.int); result.add chr(c.fg.b.int)
+      result.add chr(c.bg.r.int); result.add chr(c.bg.g.int); result.add chr(c.bg.b.int)
+      result.add chr(if c.inv: 1 else: 0)
+
+proc restore*(t: VTerm; blob: string) =
+  ## Rebuild the screen from a `serialize` snapshot.
+  if blob.len < 9: return
+  var i = 0
+  proc rd(): int =
+    if i >= blob.len: return 0
+    result = blob[i].int and 0xFF; inc i
+  proc rd16(): int = (let hi = rd(); let lo = rd(); (hi shl 8) or lo)
+  let rows = rd16(); let cols = rd16()
+  if rows <= 0 or cols <= 0: return
+  t.resize(rows, cols)
+  t.inAlt = rd() == 1
+  t.cx = rd16(); t.cy = rd16()
+  for r in 0 ..< rows:
+    for c in 0 ..< cols:
+      let n = rd()
+      var ch = ""
+      for _ in 0 ..< n:
+        if i < blob.len: (ch.add blob[i]; inc i)
+      let fr = rd(); let fgc = rd(); let fb = rd()
+      let br = rd(); let bgc = rd(); let bb = rd()
+      let inv = rd() == 1
+      if r < t.grid.len and c < t.grid[r].len:
+        t.grid[r][c] = Cell(ch: ch, fg: color(fr.uint8, fgc.uint8, fb.uint8),
+                            bg: color(br.uint8, bgc.uint8, bb.uint8), inv: inv)
+  t.clampCursor()
