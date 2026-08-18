@@ -22,6 +22,9 @@ when not declared(posix_openpt):
   proc unlockpt(fd: cint): cint {.importc, header: "<stdlib.h>".}
   proc ptsname(fd: cint): cstring {.importc, header: "<stdlib.h>".}
 
+when not declared(SIGWINCH):
+  const SIGWINCH = cint(28)   # Linux/macOS/BSD: window-size-change signal
+
 type WinSz = object
   ws_row, ws_col, ws_xpixel, ws_ypixel: cushort
 proc ioctl(fd, request: cint; argp: pointer): cint {.importc, header: "<sys/ioctl.h>", varargs.}
@@ -159,6 +162,20 @@ proc startPty*(cmd, dir: string; fg, bg: Color): Pty =
   ## backed by a screen-grid emulator so cursor-addressed TUIs render.
   result = spawnPty(cmd.splitWhitespace(), dir)
   if result.alive: result.vt = newVTerm(24, 80, fg, bg)
+
+proc adoptTerminal*(master: cint; pid: int; fg, bg: Color): Pty =
+  ## Rebuild a terminal Pty from an fd/pid inherited across a hot reload, with a
+  ## fresh screen grid. The caller nudges a repaint (SIGWINCH) AFTER sizing the
+  ## grid to the pane, so the TUI repaints at the right dimensions.
+  result = Pty(master: master, pid: Pid(pid), vt: newVTerm(24, 80, fg, bg))
+  discard fcntl(master, F_SETFL, O_NONBLOCK)
+  discard fcntl(master, F_SETFD, FD_CLOEXEC)
+  setSize(master, 2, 2)   # tiny now, so the first real resize is a genuine change
+                          # the TUI can't ignore -> it repaints into the fresh grid
+
+proc nudgeRepaint*(t: Pty) =
+  ## SIGWINCH the child so a full-screen TUI repaints (used after a hot reload).
+  if t.master >= 0: discard kill(t.pid, SIGWINCH)
 
 proc stripAnsi*(s: string): string =
   ## Remove CSI (ESC[ ... final) and OSC (ESC] ... BEL) sequences and CRs.

@@ -7,6 +7,7 @@
 
 import std/[os, tempfiles, strutils]
 import wkbpty
+export wkbpty   # Pty / alive / newVTerm ... visible wherever a Session is used
 
 type
   ReplSpec* = object
