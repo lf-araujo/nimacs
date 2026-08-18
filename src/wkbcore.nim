@@ -66,6 +66,12 @@ type
     reloadPending*: bool                  ## recompile done -> host snapshots + re-execs
     reloadBin*, reloadFile*: string       ## the freshly built binary + file to reopen
     reloadLine*: int                      ## cursor line to restore
+    # two-pane diff view (Claude/agents push a before/after via wkbctl)
+    diffActive*: bool
+    diffTitle*: string
+    diffL*, diffR*: seq[string]           ## aligned old / new lines
+    diffLK*, diffRK*: seq[char]           ## per row: ' ' same, '-' removed, '+' added
+    diffScroll*: int
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -895,6 +901,52 @@ proc criticRejectAll*(app: var App) =
   app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = false))
   app.ed.markChanged(); app.msg = "rejected all tracked changes"
 
+# -- two-pane diff (for agents to show before/after) -------------------------
+proc lineDiff(a, b: seq[string]): tuple[l, r: seq[string]; lk, rk: seq[char]] =
+  ## LCS line alignment: each output row is (left, right) with a kind --
+  ## ' ' unchanged, '-' removed (right blank), '+' added (left blank).
+  let n = a.len; let m = b.len
+  var dp = newSeq[seq[int]](n + 1)
+  for i in 0 .. n: dp[i] = newSeq[int](m + 1)
+  for i in countdown(n - 1, 0):
+    for j in countdown(m - 1, 0):
+      dp[i][j] = if a[i] == b[j]: dp[i+1][j+1] + 1 else: max(dp[i+1][j], dp[i][j+1])
+  var i = 0; var j = 0
+  while i < n and j < m:
+    if a[i] == b[j]:
+      result.l.add a[i]; result.r.add b[j]; result.lk.add ' '; result.rk.add ' '; inc i; inc j
+    elif dp[i+1][j] >= dp[i][j+1]:
+      result.l.add a[i]; result.r.add ""; result.lk.add '-'; result.rk.add ' '; inc i
+    else:
+      result.l.add ""; result.r.add b[j]; result.lk.add ' '; result.rk.add '+'; inc j
+  while i < n: (result.l.add a[i]; result.r.add ""; result.lk.add '-'; result.rk.add ' '; inc i)
+  while j < m: (result.l.add ""; result.r.add b[j]; result.lk.add ' '; result.rk.add '+'; inc j)
+
+proc showDiff*(app: var App; oldText, newText, title: string) =
+  ## Populate and open the side-by-side diff view.
+  let d = lineDiff(oldText.splitLines(), newText.splitLines())
+  app.diffL = d.l; app.diffR = d.r; app.diffLK = d.lk; app.diffRK = d.rk
+  app.diffTitle = if title.len > 0: title else: "diff"
+  app.diffScroll = 0
+  app.diffActive = true
+  app.focus = "diff"
+  var adds, dels = 0
+  for k in d.lk: (if k == '-': inc dels)
+  for k in d.rk: (if k == '+': inc adds)
+  app.msg = "diff: " & app.diffTitle & "  +" & $adds & " -" & $dels & "  (Esc to close)"
+
+proc closeDiff*(app: var App) =
+  app.diffActive = false
+  app.diffL = @[]; app.diffR = @[]; app.diffLK = @[]; app.diffRK = @[]
+  if app.focus == "diff": app.focus = "editor"
+
+proc diffBuffer*(app: var App) =
+  ## Diff the current buffer against its saved on-disk version.
+  if app.filePath.len == 0 or not fileExists(app.filePath):
+    app.msg = "no saved file to diff against"; return
+  showDiff(app, readFile(app.filePath), app.ed.fullText(),
+           extractFilename(app.filePath) & " (disk -> buffer)")
+
 proc killBuffer*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   if app.buffers.len <= 1: app.msg = "can't kill the last buffer"; return
@@ -1537,6 +1589,8 @@ proc registerBuiltins*() =
   defcommand("open-link", "Open org link at cursor", openLink)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
   defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)
+  defcommand("diff-buffer", "Diff: buffer vs saved file (two panes)", diffBuffer)
+  defcommand("close-diff", "Diff: close the diff view", closeDiff)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
   defcommand("terminal", "Open a bash terminal in the bottom panel",
              proc(app: var App) = openTerminal(app, "bash --norc"))

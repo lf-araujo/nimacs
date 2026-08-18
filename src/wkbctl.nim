@@ -41,6 +41,10 @@ proc main() =
   of "goto":
     if args.len < 2: quit("wkbctl goto <line>", 1)
     req = "goto\t" & args[1]
+  of "diff":                             # diff <oldfile> <newfile> [title]
+    if args.len < 3: quit("wkbctl diff <oldfile> <newfile> [title]", 1)
+    let title = if args.len > 3: args[3] else: extractFilename(args[2])
+    req = "diff\t" & title & "\n" & readFile(args[1]) & "\x1e" & readFile(args[2])
   else:
     quit("unknown verb: " & args[0], 1)
 

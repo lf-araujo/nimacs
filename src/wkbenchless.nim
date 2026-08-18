@@ -262,6 +262,11 @@ proc feedTerminalKey(t: var Pty; e: Event): bool =
       else: false
   else: false
 
+proc blend(a, b: Color; t: int): Color =
+  ## Mix t% of b into a (per channel), for subtle diff line backgrounds.
+  proc mix(x, y: uint8): uint8 = uint8((x.int * (100 - t) + y.int * t) div 100)
+  color(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
+
 proc tabLabel(app: App; key: string): string =
   ## Display text for a bottom-pane tab key (the terminal shows its command).
   if key == terminalTabKey: app.termLabel else: key
@@ -412,7 +417,10 @@ proc main() =
       app.reloadPending = false
 
     var consumed = false
-    if suppressText:
+    if app.diffActive:                        # diff view captures input while open
+      if e.kind == KeyDownEvent and e.key in {KeyEsc, KeyQ}: closeDiff(app)
+      consumed = true
+    if not consumed and suppressText:
       suppressText = false
       if e.kind == TextInputEvent: consumed = true   # the char after e.g. "C-c e"
     if not consumed:
@@ -499,6 +507,41 @@ proc main() =
     let statusBg = app.theme.statusBg
     let statusFg = app.theme.statusFg
     fillRect(rect(0, 0, screen.width, screen.height), bg)
+
+    if app.diffActive:                        # two-pane side-by-side diff view
+      let charW = max(1, measureText(app.font, "0").w)
+      fillRect(rect(0, 0, screen.width, lineH), app.theme.tabBarBg)
+      discard drawText(app.font, 6, 0,
+        "DIFF  " & app.diffTitle & "     Esc/q to close · wheel to scroll",
+        app.theme.chipActiveFg, app.theme.tabBarBg)
+      let bodyY = lineH
+      let rows = max(1, (screen.height - bodyY - lineH) div lineH)
+      if e.kind == MouseWheelEvent: app.diffScroll += e.y * 3
+      let total = app.diffL.len
+      app.diffScroll = max(0, min(app.diffScroll, max(0, total - rows)))
+      let colW = (screen.width - 6) div 2
+      let rightX = colW + 6
+      let removedBg = blend(bg, app.theme.ed.fg[TokenClass.Red], 24)
+      let addedBg = blend(bg, app.theme.ed.fg[TokenClass.Green], 24)
+      let gapBg = blend(bg, app.theme.dimFg, 14)
+      fillRect(rect(colW + 2, bodyY, 2, screen.height - bodyY - lineH), app.theme.dividerColor)
+      var y = bodyY
+      for idx in app.diffScroll ..< min(total, app.diffScroll + rows):
+        let lk = app.diffLK[idx]; let rk = app.diffRK[idx]
+        let lbg = if lk == '-': removedBg elif rk == '+': gapBg else: bg
+        let rbg = if rk == '+': addedBg elif lk == '-': gapBg else: bg
+        fillRect(rect(0, y, colW, lineH), lbg)
+        fillRect(rect(rightX, y, screen.width - rightX, lineH), rbg)
+        let lmark = if lk == '-': "-" else: " "
+        let rmark = if rk == '+': "+" else: " "
+        discard drawText(app.font, 4, y, lmark & app.diffL[idx], app.theme.ed.fg[TokenClass.None], lbg)
+        discard drawText(app.font, rightX + 4, y, rmark & app.diffR[idx], app.theme.ed.fg[TokenClass.None], rbg)
+        y += lineH
+      # status line
+      fillRect(rect(0, screen.height - lineH, screen.width, lineH), statusBg)
+      discard drawText(app.font, 6, screen.height - lineH, "  " & app.msg, statusFg, statusBg)
+      refresh()
+      continue
 
     var editorRect = rect(0, 0, screen.width, screen.height)
     # Route: a wheel goes to the pane under the pointer; other unconsumed input
