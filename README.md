@@ -19,9 +19,15 @@ languages are data, and `C-c r` recompiles and restarts in place.
   a bash terminal.
 - **Src-edit** (`C-c e` / `C-c b`): zoom into a block as a real code file with
   LSP + highlighting, then splice it back. `C-c t` tangles a whole session.
-- **LSP completion** (`C-Space`): nim / python / R (config-registerable).
+- **LSP completion**: always-on as you type in code buffers (`C-Space` also
+  triggers it manually); nim / python / R (config-registerable).
 - **Native org highlighting**: `#+begin_src r … #+end_src` bodies are
-  syntax-highlighted in their language, in place.
+  syntax-highlighted in their language, in place. Blocks start **folded** —
+  `Tab` on the `#+begin_src` line toggles; `C-c u` unfolds all. `*bold*` and
+  `/italic/` render in their faces, `#+caption` a touch larger, and `[[url][x]]`
+  links show just the label (Ctrl/Cmd-click or `C-c C-o` to open).
+- **Wide tables**: org rows don't reflow; `M-Left` / `M-Right` pan the view so
+  columns past the window edge come into reach.
 - **RStudio-style panes**: editor · session · objects/environment · help,
   shown in the src-edit view.
 - **Find / replace**: `C-f` finds incrementally (all matches highlighted,
@@ -29,7 +35,8 @@ languages are data, and `C-c r` recompiles and restarts in place.
   match, `!` replaces all, `Tab` switches field).
 - **Org navigator**: `C-j` opens a palette of the document's headings, named /
   captioned src blocks, and figure / table captions — pick one to jump there.
-- **Command palette**: `M-x` (or `C-p`).
+- **Command palette**: `M-x` (or `C-p`) — scrolls through long lists;
+  `C-x C-r` opens a recent file.
 
 ## Build & run
 

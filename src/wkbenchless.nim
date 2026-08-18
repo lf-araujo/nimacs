@@ -19,6 +19,12 @@ const fontPath =
   elif defined(macosx): "/System/Library/Fonts/Menlo.ttc"
   else: "/usr/share/fonts/truetype/hack/Hack-Regular.ttf"
 
+proc facePath(suffix: string): string =
+  ## The bold/italic sibling of `fontPath` if it exists, else the regular font
+  ## (so emphasis degrades to plain rather than failing to open).
+  let cand = fontPath.replace("-Regular", "-" & suffix)
+  if cand != fontPath and fileExists(cand): cand else: fontPath
+
 const layoutBare =                         # no session yet: just the editor
   "(layout (editor) (divS (px 2)) (status (lines 1)))"
 const layoutPlain =                        # a session exists
@@ -51,7 +57,8 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
   let bx = area.x + (area.w - boxW) div 2
   let by = area.y + 36
   let items = paletteEntries(app)
-  let rows = min(items.len, 12)
+  const maxRows = 12
+  let rows = min(items.len, maxRows)
   let boxBg = app.theme.boxBg
   fillRect(rect(bx, by, boxW, (rows + 1) * lineH + 20), boxBg)
   let prompt = case app.paletteMode
@@ -60,13 +67,21 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmFiles: app.paletteDir & "/ "
     of pmThemes: "theme: "
     of pmOrg: "org: "
-  discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery,
+    of pmRecent: "recent: "
+  # Scroll the visible window so the selection stays in view.
+  var top = 0
+  if app.paletteSel >= maxRows: top = app.paletteSel - maxRows + 1
+  top = clamp(top, 0, max(0, items.len - maxRows))
+  let more = items.len - top - rows
+  let countTag = if items.len > maxRows: "   (" & $(app.paletteSel + 1) & "/" & $items.len & ")" else: ""
+  discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery & countTag,
                    app.theme.boxFg, boxBg)
   var y = by + 8 + lineH + 4
-  for i in 0 ..< rows:
+  for i in top ..< top + rows:
     let rowBg = if i == app.paletteSel: app.theme.boxSelBg else: boxBg
     fillRect(rect(bx + 4, y, boxW - 8, lineH), rowBg)
-    discard drawText(app.font, bx + 12, y, items[i][1], app.theme.boxFg, rowBg)
+    let suffix = if i == top + rows - 1 and more > 0: "   \u2026 +" & $more else: ""
+    discard drawText(app.font, bx + 12, y, items[i][1] & suffix, app.theme.boxFg, rowBg)
     y += lineH
 
 proc drawSearch(app: App; sr: Rect; lineH: int) =
@@ -142,6 +157,9 @@ proc paletteAccept(app: var App) =
   of pmOrg:
     app.paletteActive = false
     app.ed.gotoLine(parseInt(id) + 1, 0)
+  of pmRecent:
+    app.paletteActive = false
+    openFile(app, id)
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
@@ -184,11 +202,16 @@ proc handleCompletion(app: var App; e: Event): bool =
   if e.kind != KeyDownEvent: return false
   case e.key
   of KeyEsc: app.completionActive = false; true
-  of KeyEnter, KeyTab: completionAccept(app); true
+  of KeyTab: completionAccept(app); true
   of KeyUp: app.completionSel = max(0, app.completionSel - 1); true
   of KeyDown:
     app.completionSel = min(app.completionItems.len - 1, app.completionSel + 1); true
-  else: app.completionActive = false; false
+  of KeyEnter:
+    # Enter accepts only if the user has moved into the list; otherwise it is a
+    # newline so always-on suggestions never hijack the return key.
+    if app.completionSel > 0: completionAccept(app); true
+    else: app.completionActive = false; false
+  else: false   # let the keystroke reach the editor; refresh happens post-draw
 
 proc dispatch(app: var App; e: Event): bool =
   ## Route a key through the keymap (with prefix-sequence support). Returns
@@ -265,6 +288,13 @@ proc main() =
   var font = openFont(fontPath, fontSize, metrics)
   var bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)   # ~1.5x
   var lineH = metrics.lineHeight
+  var emMetrics: FontMetrics
+  var boldFont = openFont(facePath("Bold"), fontSize, emMetrics)
+  var italicFont = openFont(facePath("Italic"), fontSize, emMetrics)
+  var boldItalicFont = openFont(facePath("BoldItalic"), fontSize, emMetrics)
+  var captionFont = openFont(fontPath, fontSize + 2, emMetrics)
+  proc applyEmphasisFonts(ed: var SynEdit) =
+    ed.setEmphasisFonts(boldFont, italicFont, boldItalicFont, captionFont)
 
   registerBuiltins()
   var app = App(ed: createSynEdit(font), sess: createSynEdit(font),
@@ -274,6 +304,7 @@ proc main() =
                 running: true, msg: "ready")
   app.ed.showLineNumbers = true
   app.ed.bigFont = bigFont
+  applyEmphasisFonts(app.ed)
   app.objects.setText("Objects\n(run a block: C-c C-c)\n")
   app.help.setText("Help\n(F1 on a word)\n")
   if paramCount() >= 1 and fileExists(paramStr(1)):
@@ -282,10 +313,16 @@ proc main() =
     app.ed.lang = fileExtToLanguage(ext)   # set before load: setText highlights now
     app.docLang = langIdOf(ext)            # for LSP
     app.ed.loadFromFile(app.filePath)
+    noteRecentFile(app.filePath)
+    if app.ed.lang == langOrg:
+      app.ed.foldAllPending = true
+      app.ed.noWrap = true
   else:
     app.ed.lang = langOrg                  # before setText, so org highlights now
     app.docLang = ""
     app.ed.setText(welcomeOrg)
+    app.ed.foldAllPending = true
+    app.ed.noWrap = true
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
   app.sess.setText("session output\n")
@@ -369,6 +406,13 @@ proc main() =
         handlePalette(app, e); consumed = true
       elif app.completionActive:
         consumed = handleCompletion(app, e)
+    # Tab on a #+begin_src line folds/unfolds the block instead of indenting.
+    if not consumed and app.focus == "editor" and not app.completionActive and
+       e.kind == KeyDownEvent and e.key == KeyTab and app.ed.lang == langOrg:
+      let ln = strutils.strip(app.ed.getLineText(app.ed.currentLine)).toLowerAscii
+      if ln.startsWith("#+begin_src"):
+        toggleFold(app); consumed = true; suppressText = true
+
     if not consumed and not app.paletteActive and not app.searchActive:
       if dispatch(app, e):
         consumed = true
@@ -396,12 +440,17 @@ proc main() =
       fontSize = app.fontSize
       font = openFont(fontPath, fontSize, metrics)
       bigFont = openFont(fontPath, fontSize * 3 div 2, bigMetrics)
+      boldFont = openFont(facePath("Bold"), fontSize, emMetrics)
+      italicFont = openFont(facePath("Italic"), fontSize, emMetrics)
+      boldItalicFont = openFont(facePath("BoldItalic"), fontSize, emMetrics)
+      captionFont = openFont(fontPath, fontSize + 2, emMetrics)
       lineH = metrics.lineHeight
       app.font = font; app.bigFont = bigFont
       app.ed.setFont(font); app.sess.setFont(font)
       app.objects.setFont(font); app.help.setFont(font)
-      app.ed.bigFont = bigFont
-      for b in app.buffers.mitems: b.ed.setFont(font); b.ed.bigFont = bigFont
+      app.ed.bigFont = bigFont; applyEmphasisFonts(app.ed)
+      for b in app.buffers.mitems:
+        b.ed.setFont(font); b.ed.bigFont = bigFont; applyEmphasisFonts(b.ed)
 
     screen = getWindowLayout()
     let lay = if app.srcEdit: laySrc
@@ -456,6 +505,16 @@ proc main() =
       if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
         app.ed.gotoPos(act.pos)
         openLink(app)
+      # Always-on completion: after a printable edit reaches the editor, refresh
+      # the suggestion popup (LSP languages only; no popup while overlays show).
+      if not overlay and app.focus == "editor" and app.docLang.len > 0:
+        let edited =
+          (e.kind == TextInputEvent and not consumed) or
+          (e.kind == KeyDownEvent and e.key == KeyBackspace)
+        if edited: autoComplete(app)
+        elif e.kind == KeyDownEvent and e.key notin
+             {KeyUp, KeyDown, KeyEnter, KeyTab, KeyLeft, KeyRight}:
+          app.completionActive = false
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)

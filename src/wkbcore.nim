@@ -74,7 +74,7 @@ type
     run*: proc(app: var App)
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
-  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg
+  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg, pmRecent
   SearchMode* = enum smFind, smReplace
   SearchField* = enum sfQuery, sfReplace
   VimMode* = enum vmNormal, vmInsert
@@ -316,18 +316,47 @@ proc switchToBuffer*(app: var App; idx: int) =
   app.activate(idx)
   app.msg = "buffer: " & bufName(app.buffers[idx])
 
+proc recentFilesPath(): string = getCacheDir() / "wkbenchless" / "recent"
+
+proc loadRecentFiles*(): seq[string] =
+  try:
+    for line in lines(recentFilesPath()):
+      let p = strutils.strip(line)
+      if p.len > 0 and fileExists(p): result.add p
+  except CatchableError: discard
+
+proc noteRecentFile*(path: string) =
+  if path.len == 0: return
+  let abs = try: absolutePath(path) except CatchableError: path
+  var recent = loadRecentFiles()
+  recent.insert(abs, 0)
+  var seen: seq[string]
+  for p in recent:
+    if p notin seen: seen.add p
+    if seen.len >= 30: break
+  try:
+    createDir(recentFilesPath().parentDir)
+    writeFile(recentFilesPath(), seen.join("\n"))
+  except CatchableError: discard
+
 proc openFile*(app: var App; path: string) =
+  noteRecentFile(path)
   for i, b in app.buffers:
     if b.filePath == path: switchToBuffer(app, i); return   # already open
   var ed = createSynEdit(app.font)
   ed.showLineNumbers = true
   ed.bigFont = app.bigFont
+  ed.setEmphasisFonts(app.ed.boldFont, app.ed.italicFont,
+                      app.ed.boldItalicFont, app.ed.captionFont)
   ed.theme.fg[TokenClass.Link] = color(96, 160, 255)
   let ext = splitFile(path).ext
   ed.lang = fileExtToLanguage(ext)
   try: ed.loadFromFile(path)
   except CatchableError:
     app.msg = "could not open " & path; return
+  if ed.lang == langOrg:
+    ed.foldAllPending = true
+    ed.noWrap = true
   app.syncActive()
   app.buffers.add BufferState(ed: ed, filePath: path, docLang: extToLangId(ext))
   app.activate(app.buffers.high)
@@ -406,6 +435,11 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
     for (line, label) in orgOutline(app):
       if q.len == 0 or q in label.toLowerAscii:
         result.add ($line, label)
+  of pmRecent:
+    for p in loadRecentFiles():
+      let nm = extractFilename(p)
+      if q.len == 0 or q in p.toLowerAscii:
+        result.add (p, nm & "    " & p.parentDir)
 
 # -- objects / help panes --------------------------------------------------
 proc isWordChar(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
@@ -489,6 +523,27 @@ proc lspComplete*(app: var App) =
   app.completionActive = true
   app.msg = $app.completionItems.len & " completions"
 
+proc autoComplete*(app: var App) =
+  ## Non-intrusive completion refresh for always-on mode: no "no completions"
+  ## noise, dismisses itself when there's nothing (useful) to show.
+  if app.docLang.len == 0: app.completionActive = false; return
+  let pre = prefixBeforeCursor(app)
+  if pre.len < 2:                     # wait for a couple of chars before firing
+    app.completionActive = false; return
+  let c = getLspClient(app, app.docLang)
+  if c == nil: app.completionActive = false; return
+  let uri = if app.filePath.len > 0: uriOf(app.filePath) else: "file:///wkbenchless-scratch"
+  c.syncDoc(uri, app.docLang, app.ed.fullText())
+  let items = c.completion(uri, app.ed.currentLine, app.ed.currentCol)
+  var filtered: seq[string]
+  for it in items:
+    if it.toLowerAscii.startsWith(pre.toLowerAscii) and it != pre: filtered.add it
+  if filtered.len == 0: app.completionActive = false; return
+  app.completionItems = filtered
+  app.completionPrefix = pre
+  app.completionSel = 0
+  app.completionActive = true
+
 proc completionAccept*(app: var App) =
   app.completionActive = false
   if app.completionSel < 0 or app.completionSel >= app.completionItems.len: return
@@ -552,6 +607,11 @@ proc paletteCmd*(app: var App) = openPalette(app, pmCommands)
 proc orgNavCmd*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   openPalette(app, pmOrg)
+
+proc openRecentCmd*(app: var App) =
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  if loadRecentFiles().len == 0: app.msg = "no recent files"; return
+  openPalette(app, pmRecent)
 
 proc themeCmd*(app: var App) =
   if gThemes.len == 0: app.msg = "no themes registered (see wkbconfig)"; return
@@ -673,6 +733,43 @@ proc orgLinkAt(line: string; col: int): string =
         i = endB + 1
         continue
     inc i
+
+proc lineStartOffset(app: App; line: int): int =
+  ## Buffer offset of the first char of `line` (0-based) via a single scan.
+  let txt = app.ed.fullText
+  var off = 0
+  var n = 0
+  while off < txt.len and n < line:
+    if txt[off] == '\L': inc n
+    inc off
+  off
+
+proc blockStartLineAtCursor(app: App): int =
+  ## Line index of the #+begin_src that opens the block the cursor sits in, -1.
+  let cur = app.ed.currentLine
+  var i = cur
+  while i >= 0:
+    let low = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if low.startsWith("#+begin_src"): return i
+    if low.startsWith("#+end_src") and i < cur: return -1
+    dec i
+  -1
+
+proc toggleFold*(app: var App) =
+  if app.ed.lang != langOrg: app.msg = "folding is for org files"; return
+  let line = blockStartLineAtCursor(app)
+  if line < 0: app.msg = "not on a src block"; return
+  let off = lineStartOffset(app, line)
+  app.ed.toggleFold(off)
+  app.msg = if app.ed.isFolded(off): "folded" else: "unfolded"
+
+proc scrollRight*(app: var App) = app.ed.hScroll = min(app.ed.hScroll + 8, 400)
+proc scrollLeft*(app: var App) = app.ed.hScroll = max(app.ed.hScroll - 8, 0)
+
+proc foldAllSrc*(app: var App) =
+  if app.ed.lang == langOrg: app.ed.foldAllBlocks(); app.msg = "all blocks folded"
+proc unfoldAllSrc*(app: var App) =
+  if app.ed.lang == langOrg: app.ed.unfoldAll(); app.msg = "all blocks unfolded"
 
 proc openLink*(app: var App) =
   ## Open the org link at the cursor with the system tool (browser / file
@@ -1310,6 +1407,12 @@ proc registerBuiltins*() =
   defcommand("find", "Find in buffer", openFind)
   defcommand("replace", "Find & replace in buffer", openReplace)
   defcommand("org-nav", "Org: navigate headings / named blocks / captions", orgNavCmd)
+  defcommand("recent-files", "Open a recent file", openRecentCmd)
+  defcommand("toggle-fold", "Org: fold / unfold this src block", toggleFold)
+  defcommand("fold-all", "Org: fold all src blocks", foldAllSrc)
+  defcommand("unfold-all", "Org: unfold all src blocks", unfoldAllSrc)
+  defcommand("scroll-right", "Scroll the view right (wide tables)", scrollRight)
+  defcommand("scroll-left", "Scroll the view left", scrollLeft)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)
   defcommand("zoom-in", "Increase font size", zoomIn)
   defcommand("zoom-out", "Decrease font size", zoomOut)

@@ -106,9 +106,16 @@ proc fileExtToLanguage*(ext: string): SourceLanguage =
 # ---------------------------------------------------------------------------
 
 type
+  CellFlag* = enum
+    cfBold,      ## draw with the bold face (org *emphasis*)
+    cfItalic,    ## draw with the italic face (org /emphasis/)
+    cfHidden     ## not drawn at all (org markup chars / hidden link targets)
+  CellFlags* = set[CellFlag]
+
   Cell* = object
     c*: char
     s*: TokenClass
+    f*: CellFlags
 
   ActionKind = enum
     ## Undo grouping: consecutive keystrokes accumulate into a single Action
@@ -176,6 +183,8 @@ type
     # Rendering
     font: Font
     bigFont*: Font           ## larger font for org #+title/#+author/* headings
+    boldFont*, italicFont*, boldItalicFont*: Font  ## org emphasis faces
+    captionFont*: Font       ## slightly larger face for #+caption lines
     theme*: Theme
     flags*: set[RenderFlag]
     showLineNumbers*: bool
@@ -210,6 +219,13 @@ type
     # highlightOrg, read by getBg). Emulates the GTK version's shaded blocks.
     srcBlockRanges: seq[Slice[int]]
     srcBlockBg*: Color
+    # org src-block folding: buffer offsets (line-start of a #+begin_src line)
+    # whose body + #+end_src are collapsed to a single "..." row.
+    foldedBlocks*: seq[int]
+    foldAllPending*: bool           ## fold every block once ranges are known
+    noWrap*: bool                   ## draw long lines past the edge (clipped)
+                                    ## instead of soft-wrapping to the next row
+    hScroll*: int                   ## columns scrolled right (noWrap view)
     # Markers (search results, etc.)
     markers: seq[Marker]
     # Line decorations (breakpoints, active execution line, etc.)
@@ -240,6 +256,11 @@ proc cursor*(s: SynEdit): int {.inline.} = s.cursor.int
 proc cacheId*(s: SynEdit): int {.inline.} = s.cacheId
 proc getFont*(s: SynEdit): Font {.inline.} = s.font
 proc setFont*(s: var SynEdit; f: Font) {.inline.} = s.font = f
+proc setEmphasisFonts*(s: var SynEdit; bold, italic, boldItalic, caption: Font) =
+  ## Register the org emphasis / caption faces. Must match the regular font's
+  ## advance width (monospace) so column math stays correct.
+  s.boldFont = bold; s.italicFont = italic
+  s.boldItalicFont = boldItalic; s.captionFont = caption
 proc setRenderFlag*(s: var SynEdit; flag: RenderFlag; enabled = true) =
   if enabled: s.flags.incl flag
   else: s.flags.excl flag
@@ -266,6 +287,22 @@ proc setCellStyle(s: var SynEdit; i: Natural; tc: TokenClass) =
     let j = i - s.front.len
     if j <= s.back.high:
       s.back[s.back.high - j].s = tc
+
+proc setCellFlags(s: var SynEdit; i: Natural; f: CellFlags) =
+  if i < s.front.len:
+    s.front[i].f = f
+  else:
+    let j = i - s.front.len
+    if j <= s.back.high:
+      s.back[s.back.high - j].f = f
+
+proc addCellFlags(s: var SynEdit; i: Natural; f: CellFlags) =
+  if i < s.front.len:
+    s.front[i].f = s.front[i].f + f
+  else:
+    let j = i - s.front.len
+    if j <= s.back.high:
+      s.back[s.back.high - j].f = s.back[s.back.high - j].f + f
 
 proc `[]`*(s: SynEdit; i: Natural): char {.inline.} = s.getCell(i).c
 
@@ -995,6 +1032,31 @@ proc highlightLine(s: var SynEdit; oldCursor: Natural) =
   let initialState = if first == 0: TokenClass.None else: s.getCell(first-1).s
   s.highlight(first, last, initialState)
 
+proc inSrcBlock(s: SynEdit; offset: int): bool =
+  for r in s.srcBlockRanges:
+    if offset in r: return true
+  false
+
+proc blockRangeAt*(s: SynEdit; offset: int): Slice[int] =
+  ## The src-block range whose #+begin_src line starts at `offset`, or (-1..-1).
+  for r in s.srcBlockRanges:
+    if r.a == offset: return r
+  -1 .. -1
+
+proc isFolded*(s: SynEdit; blockStart: int): bool = blockStart in s.foldedBlocks
+
+proc toggleFold*(s: var SynEdit; blockStart: int) =
+  let idx = s.foldedBlocks.find(blockStart)
+  if idx >= 0: s.foldedBlocks.delete(idx)
+  else: s.foldedBlocks.add blockStart
+
+proc foldAllBlocks*(s: var SynEdit) =
+  ## Collapse every src block (used to start documents with code hidden).
+  s.foldedBlocks.setLen 0
+  for r in s.srcBlockRanges: s.foldedBlocks.add r.a
+
+proc unfoldAll*(s: var SynEdit) = s.foldedBlocks.setLen 0
+
 proc highlightOrg(s: var SynEdit; first, last: int) =
   ## Org-mode, fontified natively: #+directives / * headings / # and : lines
   ## get their own colour, and the body of a #+begin_src <lang> ... #+end_src
@@ -1004,6 +1066,7 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
   var blockLang = langNone
   var blockStart = first
   s.srcBlockRanges.setLen(0)             # org calls this full-buffer, so rebuild
+  for j in first .. last: s.setCellFlags(j, {})   # rebuilt below each pass
   var pos = first
   while pos > 0 and s[pos-1] != '\L': dec pos
   while pos <= last:
@@ -1038,6 +1101,13 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
         for k in 0 ..< g.length:
           if g.start + k <= last: s.setCellStyle(g.start + k, g.kind)
       if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.None)
+    elif stripped.len > 0 and stripped[0] == '|':
+      # org table row: colour the | borders (and +---+ rules) like a frame so
+      # the table reads as a grid; cells keep the default text colour.
+      for j in lineStart ..< min(lineEnd, last + 1):
+        s.setCellStyle(j, if s[j] in {'|', '+', '-'}: TokenClass.Operator
+                          else: TokenClass.Text)
+      if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.Whitespace)
     else:
       var tc = TokenClass.Text
       if stripped.len > 0:
@@ -1051,17 +1121,54 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       if lineEnd <= last: s.setCellStyle(lineEnd, TokenClass.Whitespace)
     pos = lineEnd + 1
   if insideBlock: s.srcBlockRanges.add(blockStart .. last)   # unterminated block
-  # colour [[...]] org links (overrides the base styles above)
+  # [[target][label]] / [[target]] org links: colour the label, hide the
+  # brackets and the target so only the human-readable text shows.
   var lp = first
   while lp < last:
-    if s[lp] == '[' and s[lp + 1] == '[':
+    if s[lp] == '[' and s[lp + 1] == '[' and not s.inSrcBlock(lp):
       var q = lp + 2
       while q < last and not (s[q] == ']' and s[q + 1] == ']'): inc q
       if q < last:
+        # inner = between [[ and ]] ; split on "][" into target / label
+        var sep = -1
+        var t = lp + 2
+        while t < q - 1:
+          if s[t] == ']' and s[t + 1] == '[': sep = t; break
+          inc t
         for k in lp .. q + 1: s.setCellStyle(k, TokenClass.Link)
+        s.addCellFlags(lp, {cfHidden}); s.addCellFlags(lp + 1, {cfHidden})   # [[
+        s.addCellFlags(q, {cfHidden}); s.addCellFlags(q + 1, {cfHidden})     # ]]
+        if sep >= 0:
+          for k in lp + 2 .. sep + 1: s.addCellFlags(k, {cfHidden})  # target + ][
         lp = q + 2
         continue
     inc lp
+  # inline emphasis: *bold* /italic/ _underline_ =verbatim= ~code~. Org requires
+  # the markers to hug non-space text, so a lone '*' or a spaced '/' is left be.
+  proc emph(s: var SynEdit; ch: char; flag: CellFlag; first, last: int) =
+    var p = first
+    while p < last:
+      if s[p] == ch and not s.inSrcBlock(p) and
+         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
+         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
+        var q = p + 1
+        while q <= last and s[q] != '\L':
+          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
+          inc q
+        if q <= last and s[q] == ch and q > p + 1:
+          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
+          for k in p + 1 .. q - 1: s.addCellFlags(k, {flag})
+          p = q + 1
+          continue
+      inc p
+  s.emph('*', cfBold, first, last)
+  s.emph('/', cfItalic, first, last)
+  # Drop folds that no longer sit on a block start (edits shifted the buffer).
+  var kept: seq[int]
+  for f in s.foldedBlocks:
+    for r in s.srcBlockRanges:
+      if r.a == f: kept.add f; break
+  s.foldedBlocks = kept
 
 proc highlightEverything(s: var SynEdit) =
   if s.lang == langNone: return
@@ -2254,11 +2361,6 @@ proc getBg(s: SynEdit; i: int): Color =
     if i in r: return s.srcBlockBg
   return s.theme.bg
 
-proc inSrcBlock(s: SynEdit; offset: int): bool =
-  for r in s.srcBlockRanges:
-    if offset in r: return true
-  false
-
 proc underline*(s: var SynEdit; a, b: int) =
   ## Set the underline range. Call before the draw/render that should show it.
   ## Pass (-1, -1) to clear.
@@ -2440,7 +2542,9 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
   for k in 0 ..< db.charsLen: db.tempStr.add db.chars[k]
   let ext = measureText(db.font, db.tempStr)
   let w = ext.w
-  if db.dim.x + w + db.spaceWidth <= db.dim.w:
+  if db.s[].noWrap or db.dim.x + w + db.spaceWidth <= db.dim.w:
+    # noWrap: draw the whole run; the editor sets a clip rect so overflow past
+    # the right edge is hidden rather than wrapped.
     drawSubtoken(db, 0, db.charsLen - 1, fg, bg)
     db.dim.x += w
   else:
@@ -2469,19 +2573,29 @@ proc drawToken(db: var DrawBuf; fg, bg: Color) =
         db.dim.y += db.lineH
         if db.dim.y + db.lineH > db.maxY: break
 
+proc fontForFlags(s: SynEdit; f: CellFlags; base: Font): Font =
+  if cfBold in f and cfItalic in f: (if s.boldItalicFont.int != 0: s.boldItalicFont else: base)
+  elif cfBold in f: (if s.boldFont.int != 0: s.boldFont else: base)
+  elif cfItalic in f: (if s.italicFont.int != 0: s.italicFont else: base)
+  else: base
+
 proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
   var tokenClass = s.getCell(i).s
   var styleBg = s.getBg(i)
+  var styleFlags = s.getCell(i).f
 
   var db: DrawBuf
   db.oldX = dim.x
   db.maxY = dim.h
   db.dim = dim
-  db.font = s.font
+  let baseFont = s.font
+  if s.noWrap and s.hScroll > 0:
+    db.dim.x -= s.hScroll * textWidth(baseFont, " ")   # shift the row left
+  db.font = fontForFlags(s, styleFlags, baseFont)
   db.s = addr s
   db.i = i
-  db.lineH = fontLineSkip(db.font)
-  db.spaceWidth = textWidth(db.font, " ")
+  db.lineH = fontLineSkip(baseFont)
+  db.spaceWidth = textWidth(baseFont, " ")
   db.tempStr = ""
 
   block outerLoop:
@@ -2492,7 +2606,7 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
         if cell.c == '\L':
           db.chars[db.charsLen] = '\0'
           db.toCursor[db.charsLen] = db.i
-          if db.charsLen >= 1:
+          if db.charsLen >= 1 and cfHidden notin styleFlags:
             db.drawToken(s.theme.fg[tokenClass], styleBg)
           elif db.i == s.cursor.int:
             db.cursorDim = db.dim
@@ -2504,7 +2618,7 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
             s.clicks = 0
             s.cursorMoved()
           break outerLoop
-        if cell.s != tokenClass or s.getBg(db.i) != styleBg:
+        if cell.s != tokenClass or s.getBg(db.i) != styleBg or cell.f != styleFlags:
           break
         elif db.charsLen == high(db.chars):
           break
@@ -2529,9 +2643,12 @@ proc drawTextLine(s: var SynEdit; i: int; dim: var Rect; blink: bool): int =
       db.chars[db.charsLen] = '\0'
       db.toCursor[db.charsLen] = db.i
       if db.charsLen >= 1:
-        db.drawToken(s.theme.fg[tokenClass], styleBg)
+        if cfHidden notin styleFlags:
+          db.drawToken(s.theme.fg[tokenClass], styleBg)
         tokenClass = s.getCell(db.i).s
         styleBg = s.getBg(db.i)
+        styleFlags = s.getCell(db.i).f
+        db.font = fontForFlags(s, styleFlags, baseFont)
 
   dim = db.dim
   dim.y += fontLineSkip(s.font)
@@ -2627,12 +2744,23 @@ proc isBigOrgLine(s: SynEdit; i: int): bool =
   result = ls.startsWith("#+title") or ls.startsWith("#+author") or
            (ls.len > 0 and ls[0] == '*')
 
+proc isCaptionLine(s: SynEdit; i: int): bool =
+  ## org #+caption: lines render a touch larger (captionFont).
+  if s.lang != langOrg: return false
+  var t = ""
+  var j = i
+  while j < s.len and s[j] != '\L' and t.len < 12:
+    t.add s[j]; inc j
+  t.strip(leading = true, trailing = false).toLowerAscii.startsWith("#+caption")
+
 proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   ## Core rendering. Paints the buffer, optionally with a blinking cursor.
   let lineH = fontLineSkip(s.font)
   let hasScrollBar = s.scrollEnabled
 
   s.highlightIncrementally()
+  if s.foldAllPending and s.srcBlockRanges.len > 0:
+    s.foldAllBlocks(); s.foldAllPending = false
 
   s.cursorDim.h = 0
   let endY = area.y + area.h - 1
@@ -2642,6 +2770,9 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
   dim.h = endY
 
   fillRect(area, s.theme.bg)
+  if s.noWrap:
+    saveState()
+    setClipRect(area)   # keep overflowing (unwrapped) rows inside this pane
 
   let spl = s.spaceForLines()
   if s.showLineNumbers:
@@ -2693,10 +2824,24 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
       # Shade the whole row width (not just behind the glyphs) so org src
       # blocks read as full-width panels, like the GTK version.
       fillRect(rect(dim.x, dim.y, endX - dim.x, lineH), s.srcBlockBg)
+    let fold = s.blockRangeAt(lineStart)
+    let folded = fold.a == lineStart and s.isFolded(lineStart)
     let savedFont = s.font
     if isBigOrgLine(s, i): s.font = s.bigFont   # taller row, bigger glyphs
+    elif isCaptionLine(s, i) and s.captionFont.int != 0: s.font = s.captionFont
     i = s.drawTextLine(i, dim, blink)
     s.font = savedFont
+    if folded:
+      # Mark the collapsed block and hop the buffer/line cursors past its body.
+      discard drawText(s.font, endX - 60, lineY, "\u25b8 \u22ef",
+                       s.theme.lineNumColor, s.srcBlockBg)
+      var skipped = 0
+      var j = i
+      while j <= fold.b:
+        if s[j] == '\L': inc skipped
+        inc j
+      i = fold.b + 1
+      renderLine = (renderLine.int + skipped).Natural
     if actionLine or closeLine:
       # Drawn after the text, so the per-token backgrounds cannot paint over
       # the frame's top and bottom edges -- and so the button occludes a
@@ -2752,6 +2897,8 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     let gripColor = if s.scrollGrabbed: s.theme.scrollBarActiveColor
                     else: s.theme.scrollBarColor
     fillRect(finalGrip, gripColor)
+
+  if s.noWrap: restoreState()
 
 proc draw*(s: var SynEdit; e: Event; area: Rect; focused: bool): EditAction =
   ## Per-frame entry point. When focused, processes input and shows cursor.

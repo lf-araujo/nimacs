@@ -27,6 +27,9 @@ proc configure*(app: var App) =
   bindkey("C-f", "find")                 # incremental find in the buffer
   bindkey("C-h", "replace")             # find & replace
   bindkey("C-j", "org-nav")             # jump to org heading / block / caption
+  bindkey("M-Right", "scroll-right")    # pan a wide table into view
+  bindkey("M-Left", "scroll-left")
+  bindkey("C-c u", "unfold-all")        # reveal every folded src block
   bindkey("C-Space", "complete")        # LSP completion
   bindkey("F1", "show-help")            # help for word at cursor
   bindkey("C-Enter", "run-line")        # send the current line to the session
@@ -41,6 +44,7 @@ proc configure*(app: var App) =
   bindkey("C-c f", "edit-config")       # open this file
   bindkey("C-c r", "reload-config")     # recompile & restart
   bindkey("C-x C-f", "open-file")       # browse & open a file (palette)
+  bindkey("C-x C-r", "recent-files")    # open a recently used file (palette)
   bindkey("C-x b", "list-buffers")      # switch buffers (palette)
   bindkey("C-x k", "kill-buffer")       # close the current buffer
   bindkey("C-=", "zoom-in")             # font size
