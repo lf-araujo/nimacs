@@ -106,6 +106,13 @@ proc configure*(app: var App) =
   gClaudeCmd = "claude --continue"
   # gClaudeCmd = "claude"                # start fresh instead of continuing
 
+  # CriticMarkup (tracked changes) is fontified in org buffers automatically:
+  # {++ins++} green, {--del--} red, {~~old~>new~~} red->green, {>>comment<<}
+  # grey, {==highlight==} yellow. Resolve with M-x criticmarkup-accept-all /
+  # criticmarkup-reject-all (bound here to a C-c prefix for convenience).
+  bindkey("C-c j", "criticmarkup-accept-all")
+  bindkey("C-c l", "criticmarkup-reject-all")
+
   # 4. Hooks fire at editor events -- here, a friendly startup message and a
   #    note after every babel run.
   addHook("startup", proc(a: var App) =

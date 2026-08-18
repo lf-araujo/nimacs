@@ -1161,6 +1161,49 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       inc p
   s.emph('*', cfBold, first, last)
   s.emph('/', cfItalic, first, last)
+  # CriticMarkup (tracked changes, cf. org-tracked-docx): {++ins++} green,
+  # {--del--} red, {~~old~>new~~} red->green, {>>comment<<} grey, {==hi==} yellow.
+  # No per-cell strike/underline here, so colour carries the meaning; markers dim.
+  proc critic(s: var SynEdit; o1, o2, c1, c2: char; body: TokenClass; first, last: int) =
+    var p = first
+    while p + 3 <= last:
+      if s[p] == '{' and s[p+1] == o1 and s[p+2] == o2 and not s.inSrcBlock(p):
+        var q = p + 3
+        while q + 2 <= last and not (s[q] == c1 and s[q+1] == c2 and s[q+2] == '}'): inc q
+        if q + 2 <= last and s[q] == c1 and s[q+1] == c2 and s[q+2] == '}':
+          for k in p + 3 .. q - 1: s.setCellStyle(k, body)
+          for k in p .. p + 2: s.setCellStyle(k, TokenClass.Punctuation)   # {oo
+          for k in q .. q + 2: s.setCellStyle(k, TokenClass.Punctuation)   # cc}
+          p = q + 3
+          continue
+      inc p
+  s.critic('+', '+', '+', '+', TokenClass.Green, first, last)    # insertion
+  s.critic('-', '-', '-', '-', TokenClass.Red, first, last)      # deletion
+  s.critic('=', '=', '=', '=', TokenClass.Yellow, first, last)   # highlight
+  s.critic('>', '>', '<', '<', TokenClass.Comment, first, last)  # comment
+  block:                                   # {~~old~>new~~}: old red, new green
+    var p = first
+    while p + 3 <= last:
+      if s[p] == '{' and s[p+1] == '~' and s[p+2] == '~' and not s.inSrcBlock(p):
+        var q = p + 3
+        while q + 2 <= last and not (s[q] == '~' and s[q+1] == '~' and s[q+2] == '}'): inc q
+        if q + 2 <= last and s[q] == '~' and s[q+1] == '~' and s[q+2] == '}':
+          var arrow = -1
+          var t = p + 3
+          while t < q - 1:
+            if s[t] == '~' and s[t+1] == '>': arrow = t; break
+            inc t
+          for k in p .. p + 2: s.setCellStyle(k, TokenClass.Punctuation)
+          for k in q .. q + 2: s.setCellStyle(k, TokenClass.Punctuation)
+          if arrow >= 0:
+            for k in p + 3 .. arrow - 1: s.setCellStyle(k, TokenClass.Red)
+            s.setCellStyle(arrow, TokenClass.Punctuation); s.setCellStyle(arrow+1, TokenClass.Punctuation)
+            for k in arrow + 2 .. q - 1: s.setCellStyle(k, TokenClass.Green)
+          else:
+            for k in p + 3 .. q - 1: s.setCellStyle(k, TokenClass.Green)
+          p = q + 3
+          continue
+      inc p
   # Drop folds that no longer sit on a block start (edits shifted the buffer).
   var kept: seq[int]
   for f in s.foldedBlocks:

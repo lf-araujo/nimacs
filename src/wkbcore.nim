@@ -823,6 +823,53 @@ proc openLink*(app: var App) =
   else:
     openExternally(t); app.msg = "opening " & extractFilename(t)
 
+# -- CriticMarkup (tracked changes), cf. org-tracked-docx --------------------
+proc applyCriticMarkup*(text: string; accept: bool): string =
+  ## Resolve every CriticMarkup token. accept: keep insertions & the NEW side of
+  ## a substitution, drop deletions. reject: the opposite. Comments are dropped
+  ## either way; a highlight always keeps its text (only the wrapper goes).
+  ##   {++ins++}  {--del--}  {~~old~>new~~}  {>>comment<<}  {==highlight==}
+  result = newStringOfCap(text.len)
+  var i = 0
+  proc closeOf(o, c: char): int =
+    ## Index of the '}' ending `<o><o> ... <c><c>}` starting at i, or -1.
+    var q = i + 3
+    while q + 2 < text.len:
+      if text[q] == c and text[q+1] == c and text[q+2] == '}': return q + 2
+      inc q
+    -1
+  while i < text.len:
+    if i + 4 < text.len and text[i] == '{':
+      let a = text[i+1]; let b = text[i+2]
+      if a == b and a in {'+', '-', '=', '~'}:
+        let e = closeOf(a, a)
+        if e >= 0:
+          let inner = text[i+3 ..< e-2]
+          case a
+          of '+': (if accept: result.add inner)
+          of '-': (if not accept: result.add inner)
+          of '=': result.add inner
+          of '~':
+            let arrow = inner.find("~>")
+            if arrow >= 0: result.add (if accept: inner[arrow+2 .. ^1] else: inner[0 ..< arrow])
+            else: result.add inner
+          else: discard
+          i = e + 1; continue
+      elif a == '>' and b == '>':          # {>>comment<<} -- asymmetric close
+        let e = closeOf('<', '<')
+        if e >= 0: (i = e + 1; continue)   # drop the comment entirely
+    result.add text[i]; inc i
+
+proc criticAcceptAll*(app: var App) =
+  if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
+  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = true))
+  app.ed.markChanged(); app.msg = "accepted all tracked changes"
+
+proc criticRejectAll*(app: var App) =
+  if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
+  app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = false))
+  app.ed.markChanged(); app.msg = "rejected all tracked changes"
+
 proc killBuffer*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   if app.buffers.len <= 1: app.msg = "can't kill the last buffer"; return
@@ -1463,6 +1510,8 @@ proc registerBuiltins*() =
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
+  defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
+  defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)
   defcommand("toggle-vim", "Toggle vim (modal) editing", toggleVim)
   defcommand("terminal", "Open a bash terminal in the bottom panel",
              proc(app: var App) = openTerminal(app, "bash --norc"))
