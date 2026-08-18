@@ -9,3 +9,10 @@ toolchain/
 *.insyncdl
 .~*
 /wkbctl
+# compiled probes/spikes -- keep the sources, not the binaries
+debug/*
+!debug/*.nim
+!debug/*.md
+spike/*
+!spike/*.nim
+!spike/*.md
