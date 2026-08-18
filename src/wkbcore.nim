@@ -774,22 +774,51 @@ proc linkAtCursor*(app: App): string =
   ## The org link target under the cursor, or "" (for plain-click activation).
   orgLinkAt(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
 
-proc openLink*(app: var App) =
-  ## Open the org link at the cursor with the system tool (browser / file
-  ## manager / viewer), like Emacs org-open-at-point.
-  let target = orgLinkAt(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
-  if target.len == 0: app.msg = "no link at cursor"; return
-  var t = target
-  if t.startsWith("file:"): t = t[5 .. ^1]
-  if t.find("://") < 0 and not t.startsWith("mailto:") and
-     not isAbsolute(t) and app.filePath.len > 0:
-    t = parentDir(app.filePath) / t      # resolve relative file links
+const editableExts = [".org", ".md", ".markdown", ".txt", ".text", ".nim", ".nims",
+  ".py", ".pyw", ".r", ".jl", ".el", ".lisp", ".c", ".h", ".cpp", ".hpp", ".cc",
+  ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".cfg", ".conf", ".ini", ".sh",
+  ".bash", ".zsh", ".tex", ".bib", ".csv", ".tsv", ".html", ".css", ".xml", ".rs",
+  ".go", ".lua", ".vim", ".sql", ".rmd", ".qmd", ".log"]
+
+proc openExternally(target: string) =
   when defined(windows):
-    discard execShellCmd("start \"\" " & quoteShell(t))
+    discard execShellCmd("start \"\" " & quoteShell(target))
   else:
     let opener = when defined(macosx): "open" else: "xdg-open"
-    discard execShellCmd(opener & " " & quoteShell(t) & " &")
-  app.msg = "opening " & target
+    discard execShellCmd(opener & " " & quoteShell(target) & " &")
+
+proc openLink*(app: var App) =
+  ## Follow the org link at the cursor. A file link to a text/source file opens
+  ## IN wkbenchless (like org-open-at-point in Emacs); a URL, mailto, or a
+  ## non-text file (pdf, image, ...) hands off to the system opener. `file:` is
+  ## optional -- a bare relative/absolute path is treated as a file link too.
+  let target = orgLinkAt(app.ed.getLineText(app.ed.currentLine), app.ed.currentCol)
+  if target.len == 0: app.msg = "no link at cursor"; return
+
+  # URLs and mailto go straight to the system handler.
+  if target.find("://") >= 0 or target.startsWith("mailto:"):
+    openExternally(target); app.msg = "opening " & target; return
+
+  var t = target
+  if t.startsWith("file:"): t = t[5 .. ^1]
+  # an org `::anchor` selects a line number or a heading within the file
+  var anchor = ""
+  let ai = t.find("::")
+  if ai >= 0: (anchor = t[ai + 2 .. ^1]; t = t[0 ..< ai])
+  t = expandTilde(t)
+  if not isAbsolute(t) and app.filePath.len > 0:
+    t = parentDir(app.filePath) / t      # resolve relative to the current file
+
+  if not fileExists(t):
+    app.msg = "link target not found: " & t; return
+  if t.splitFile.ext.toLowerAscii in editableExts:
+    openFile(app, t)                     # open in the editor
+    if anchor.len > 0:
+      try: app.ed.gotoLine(parseInt(anchor.strip(chars = {'*', ' '})) - 1, 0)
+      except ValueError: discard         # (heading anchors: jump left to future work)
+    app.msg = "opened " & extractFilename(t)
+  else:
+    openExternally(t); app.msg = "opening " & extractFilename(t)
 
 proc killBuffer*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
