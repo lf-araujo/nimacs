@@ -24,6 +24,11 @@ languages are data, and `C-c r` recompiles and restarts in place.
   syntax-highlighted in their language, in place.
 - **RStudio-style panes**: editor · session · objects/environment · help,
   shown in the src-edit view.
+- **Find / replace**: `C-f` finds incrementally (all matches highlighted,
+  `Enter` cycles); `C-h` is find-and-replace (`Enter` replaces the current
+  match, `!` replaces all, `Tab` switches field).
+- **Org navigator**: `C-j` opens a palette of the document's headings, named /
+  captioned src blocks, and figure / table captions — pick one to jump there.
 - **Command palette**: `M-x` (or `C-p`).
 
 ## Build & run

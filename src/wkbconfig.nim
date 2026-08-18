@@ -24,6 +24,9 @@ proc configure*(app: var App) =
   bindkey("C-z", "undo")
   bindkey("C-y", "redo")
   bindkey("C-/", "comment-toggle")
+  bindkey("C-f", "find")                 # incremental find in the buffer
+  bindkey("C-h", "replace")             # find & replace
+  bindkey("C-j", "org-nav")             # jump to org heading / block / caption
   bindkey("C-Space", "complete")        # LSP completion
   bindkey("F1", "show-help")            # help for word at cursor
   bindkey("C-Enter", "run-line")        # send the current line to the session

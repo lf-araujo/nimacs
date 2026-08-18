@@ -41,6 +41,14 @@ type
     completionItems*: seq[string]
     completionSel*: int
     completionPrefix*: string
+    searchActive*: bool                   ## find / find-replace minibuffer shown
+    searchMode*: SearchMode
+    searchField*: SearchField             ## which minibuffer field is being edited
+    searchQuery*: string                  ## the needle
+    searchReplace*: string                ## replacement text (smReplace)
+    searchMatches*: seq[int]              ## buffer offsets of every match
+    searchIdx*: int                       ## index into searchMatches (current)
+    searchCase*: bool                     ## case-sensitive matching
     focus*: string                        ## which pane gets keyboard events
     theme*: AppTheme                      ## active theme (chrome + editor)
     themeIdx*: int                        ## index into gThemes
@@ -53,6 +61,8 @@ type
     hasTerminal*: bool                    ## a standalone terminal tab exists (alive)
     termLabel*: string                    ## its tab label ("claude", "bash", ...)
     termScroll*: int                      ## bottom-pane scrollback: lines up from tail
+    termMaster*: cint                     ## host keeps this synced with the terminal pty
+    termPid*: int                         ## (so a hot reload can hand the terminal off)
     # src-edit (org-edit-special / tangle): the buffer temporarily *becomes* the
     # extracted code; on exit it is spliced/detangled back into the org doc.
     editMode*: EditMode
@@ -64,7 +74,9 @@ type
     run*: proc(app: var App)
   Hook* = proc(app: var App)
   EditMode* = enum emNone, emBlock, emSession
-  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes
+  PaletteMode* = enum pmCommands, pmBuffers, pmFiles, pmThemes, pmOrg
+  SearchMode* = enum smFind, smReplace
+  SearchField* = enum sfQuery, sfReplace
   VimMode* = enum vmNormal, vmInsert
   BufferState* = object
     ed*: SynEdit
@@ -322,6 +334,45 @@ proc openFile*(app: var App; path: string) =
   app.msg = "opened " & extractFilename(path)
 
 # -- palette entries (commands / buffers / files) --------------------------
+proc orgOutline*(app: App): seq[tuple[line: int; label: string]] =
+  ## Navigable landmarks of the current org buffer: section headings, named /
+  ## captioned src blocks, and figure / table captions. `line` is 0-based.
+  var pendingName, pendingCaption = ""
+  var pendingLine = -1
+  let n = app.ed.getLineCount
+  for i in 0 ..< n:
+    let raw = app.ed.getLineText(i)
+    let s = strutils.strip(raw)
+    let low = s.toLowerAscii
+    if s.startsWith("*"):
+      var lvl = 0
+      while lvl < s.len and s[lvl] == '*': inc lvl
+      let title = strutils.strip(s[lvl .. ^1])
+      result.add (i, repeat("  ", max(0, lvl - 1)) & "* " & title)
+      pendingName = ""; pendingCaption = ""; pendingLine = -1
+    elif low.startsWith("#+name:"):
+      pendingName = strutils.strip(s["#+name:".len .. ^1])
+      pendingLine = i
+    elif low.startsWith("#+caption:"):
+      pendingCaption = strutils.strip(s["#+caption:".len .. ^1])
+      pendingLine = i
+    elif low.startsWith("#+begin_src"):
+      let parts = s.splitWhitespace()
+      let lang = if parts.len >= 2: parts[1] else: ""
+      let name = if pendingName.len > 0: pendingName
+                 elif pendingCaption.len > 0: pendingCaption else: "(unnamed)"
+      let jump = if pendingLine >= 0: pendingLine else: i
+      result.add (jump, "  src[" & lang & "] " & name)
+      pendingName = ""; pendingCaption = ""; pendingLine = -1
+    elif low.startsWith("#+begin_") or low.startsWith("[[file:") or
+         low.startsWith("#+results:"):
+      if pendingCaption.len > 0:
+        result.add ((if pendingLine >= 0: pendingLine else: i),
+                    "  caption: " & pendingCaption)
+      pendingName = ""; pendingCaption = ""; pendingLine = -1
+    elif s.len == 0:
+      pendingName = ""; pendingCaption = ""; pendingLine = -1
+
 proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
   let q = app.paletteQuery.toLowerAscii
   case app.paletteMode
@@ -351,6 +402,10 @@ proc paletteEntries*(app: App): seq[tuple[id, label: string]] =
       let nm = gThemes[i].name
       if q.len == 0 or q in nm.toLowerAscii:
         result.add ($i, nm & (if i == app.themeIdx: "  (current)" else: ""))
+  of pmOrg:
+    for (line, label) in orgOutline(app):
+      if q.len == 0 or q in label.toLowerAscii:
+        result.add ($line, label)
 
 # -- objects / help panes --------------------------------------------------
 proc isWordChar(c: char): bool = c in {'a'..'z', 'A'..'Z', '0'..'9', '_', '.'}
@@ -494,6 +549,10 @@ proc openPalette(app: var App; mode: PaletteMode) =
 
 proc paletteCmd*(app: var App) = openPalette(app, pmCommands)
 
+proc orgNavCmd*(app: var App) =
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  openPalette(app, pmOrg)
+
 proc themeCmd*(app: var App) =
   if gThemes.len == 0: app.msg = "no themes registered (see wkbconfig)"; return
   openPalette(app, pmThemes)
@@ -507,6 +566,95 @@ proc openFileCmd*(app: var App) =
   if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
   app.paletteDir = if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
   openPalette(app, pmFiles)
+
+# -- find / replace --------------------------------------------------------
+proc recomputeMatches*(app: var App) =
+  ## Rescan the buffer for the current needle, refresh the highlight markers,
+  ## and pick the match nearest the cursor as current.
+  app.searchMatches.setLen 0
+  app.ed.clearMarkers()
+  if app.searchQuery.len == 0:
+    app.searchIdx = -1
+    return
+  let hay = if app.searchCase: app.ed.fullText else: app.ed.fullText.toLowerAscii
+  let needle = if app.searchCase: app.searchQuery else: app.searchQuery.toLowerAscii
+  var start = 0
+  while true:
+    let p = hay.find(needle, start)
+    if p < 0: break
+    app.searchMatches.add p
+    app.ed.addMarker(p, p + needle.len - 1, app.theme.ed.selBg)
+    start = p + max(1, needle.len)
+  if app.searchMatches.len == 0:
+    app.searchIdx = -1
+    return
+  let cur = app.ed.cursor
+  app.searchIdx = 0
+  for i, p in app.searchMatches:
+    if p >= cur: app.searchIdx = i; break
+    app.searchIdx = i
+
+proc gotoCurrentMatch*(app: var App) =
+  if app.searchIdx < 0 or app.searchIdx >= app.searchMatches.len: return
+  app.ed.gotoPos(app.searchMatches[app.searchIdx])
+  app.msg = "match " & $(app.searchIdx + 1) & "/" & $app.searchMatches.len
+
+proc searchNext*(app: var App) =
+  if app.searchMatches.len == 0: app.msg = "no matches"; return
+  app.searchIdx = (app.searchIdx + 1) mod app.searchMatches.len
+  app.gotoCurrentMatch()
+
+proc searchPrev*(app: var App) =
+  if app.searchMatches.len == 0: app.msg = "no matches"; return
+  app.searchIdx = (app.searchIdx - 1 + app.searchMatches.len) mod app.searchMatches.len
+  app.gotoCurrentMatch()
+
+proc endSearch*(app: var App) =
+  app.searchActive = false
+  app.ed.clearMarkers()
+
+proc openFind*(app: var App) =
+  if app.editMode != emNone: app.msg = "exit src-edit first (C-c e)"; return
+  app.searchActive = true
+  app.searchMode = smFind
+  app.searchField = sfQuery
+  app.searchQuery = ""
+  app.searchReplace = ""
+  app.searchIdx = -1
+  app.searchMatches.setLen 0
+  app.ed.clearMarkers()
+
+proc openReplace*(app: var App) =
+  openFind(app)
+  app.searchMode = smReplace
+
+proc replaceCurrent*(app: var App) =
+  ## Replace the current match, then rescan (offsets shift) and advance.
+  if app.searchIdx < 0 or app.searchIdx >= app.searchMatches.len:
+    app.msg = "no match"; return
+  let p = app.searchMatches[app.searchIdx]
+  app.ed.selectRange(p, p + app.searchQuery.len - 1)
+  app.ed.deleteSelection()
+  app.ed.gotoPos(p)
+  app.ed.insertText(app.searchReplace)
+  app.ed.markChanged()
+  app.recomputeMatches()
+  app.gotoCurrentMatch()
+
+proc replaceAll*(app: var App) =
+  if app.searchQuery.len == 0: return
+  var n = 0
+  while app.searchMatches.len > 0:
+    let p = app.searchMatches[0]
+    app.ed.selectRange(p, p + app.searchQuery.len - 1)
+    app.ed.deleteSelection()
+    app.ed.gotoPos(p)
+    app.ed.insertText(app.searchReplace)
+    inc n
+    app.recomputeMatches()
+  app.ed.markChanged()
+  app.msg = "replaced " & $n
+  app.endSearch()
 
 proc orgLinkAt(line: string; col: int): string =
   ## The TARGET of the [[TARGET]] / [[TARGET][DESC]] link under `col`, or "".
@@ -841,6 +989,51 @@ proc detectRebuildCmd*(): string =
   else:
     result = nimExe & " " & base
 
+proc writeHandoff(app: var App): string =
+  ## Preserve live REPL sessions and the terminal across the re-exec: clear
+  ## FD_CLOEXEC on each pty master so it survives execv (the child processes stay
+  ## alive on the slave side), and record fd+pid+identity in a temp file the new
+  ## image adopts. Returns the file path ("" if nothing to hand off).
+  when defined(posix):
+    var blob = ""
+    for key, s in app.sessions:
+      if s != nil and s.pty.alive:
+        discard fcntl(s.pty.master, F_SETFD, 0.cint)     # clear CLOEXEC
+        let parts = key.split('/')
+        blob.add "S\t" & $s.pty.master & "\t" & $s.pty.pid & "\t" &
+                 parts[0] & "\t" & (if parts.len > 1: parts[1] else: "default") & "\n"
+    if app.termMaster >= 0 and app.hasTerminal:
+      discard fcntl(app.termMaster, F_SETFD, 0.cint)
+      blob.add "T\t" & $app.termMaster & "\t" & $app.termPid & "\t" &
+               app.termLabel & "\t" & $app.termActive & "\n"
+    if blob.len == 0: return ""
+    let path = getTempDir() / ("wkbenchless-handoff." & $getpid())
+    writeFile(path, blob)
+    path
+  else: ""
+
+proc adoptHandoff*(app: var App): tuple[master: cint; pid: int; label: string; active: bool] =
+  ## If a hot reload handed off sessions/terminal (WKB_HANDOFF), rebuild the REPL
+  ## sessions here and return the terminal's inherited fd/pid for the host to
+  ## adopt. Called once at startup after configure() (so gRepls is populated).
+  result = (master: cint(-1), pid: 0, label: "", active: false)
+  when defined(posix):
+    let path = getEnv("WKB_HANDOFF")
+    if path.len == 0 or not fileExists(path): return
+    let blob = readFile(path)
+    removeFile(path); delEnv("WKB_HANDOFF")
+    for line in blob.splitLines():
+      let f = line.split('\t')
+      if f.len < 5: continue
+      let fd = cint(parseInt(f[1]))
+      discard fcntl(fd, F_SETFL, O_NONBLOCK)
+      discard fcntl(fd, F_SETFD, FD_CLOEXEC)             # re-arm for the next reload
+      if f[0] == "S" and gRepls.hasKey(f[3]):
+        app.sessions[f[3] & "/" & f[4]] =
+          Session(pty: Pty(master: fd, pid: Pid(parseInt(f[2]))), spec: gRepls[f[3]])
+      elif f[0] == "T":
+        result = (master: fd, pid: parseInt(f[2]), label: f[3], active: f[4] == "true")
+
 proc recompileConfig*(app: var App) =
   ## Hot-reload the config the honest way for compiled Nim (the xmonad model):
   ## rebuild the binary -- which recompiles wkbconfig.nim with it -- and, on
@@ -870,7 +1063,10 @@ proc recompileConfig*(app: var App) =
     elif app.ed.changed:
       app.ed.saveToFile(app.filePath); app.ed.markSaved()
     let line = app.ed.currentLine
-    for s in app.sessions.values: closeSession(s)   # reap child REPLs first
+    # Hand the live sessions + terminal off to the new image instead of killing
+    # them: their pty masters survive execv (CLOEXEC cleared) and, because execv
+    # keeps our PID, we stay the parent of those child processes.
+    let handoff = writeHandoff(app)
     # Exec the freshly built binary by its known path, NOT getAppFilename():
     # the rebuild replaced our on-disk file, so /proc/self/exe now reads
     # ".../wkbenchless (deleted)", which would make execv fail with ENOENT. `dir` was
@@ -878,6 +1074,7 @@ proc recompileConfig*(app: var App) =
     let bin = dir / "wkbenchless"
     if not fileExists(bin):
       app.msg = "recompile: built binary not found at " & bin; return
+    if handoff.len > 0: putEnv("WKB_HANDOFF", handoff)
     let argv = allocCStringArray(@[bin, fileArg, "--goto", $line])
     discard execv(bin.cstring, argv)
     app.msg = "recompile: exec failed (" & bin & ")"   # only if execv failed
@@ -1110,6 +1307,9 @@ proc registerBuiltins*() =
   defcommand("theme", "Theme: pick a base16 / sixteen color theme", themeCmd)
   defcommand("list-buffers", "List / switch buffers", listBuffers)
   defcommand("open-file", "Open file (browse)", openFileCmd)
+  defcommand("find", "Find in buffer", openFind)
+  defcommand("replace", "Find & replace in buffer", openReplace)
+  defcommand("org-nav", "Org: navigate headings / named blocks / captions", orgNavCmd)
   defcommand("kill-buffer", "Kill the current buffer", killBuffer)
   defcommand("zoom-in", "Increase font size", zoomIn)
   defcommand("zoom-out", "Decrease font size", zoomOut)

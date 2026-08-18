@@ -1782,6 +1782,15 @@ proc deleteSelection*(s: var SynEdit) =
   if s.selected.b >= 0:
     s.removeSelectedText()
 
+proc selectRange*(s: var SynEdit; a, b: int) =
+  ## Select the inclusive character range [a, b] and place the cursor at b+1.
+  if a < 0 or b >= s.len or b < a: return
+  inc s.version
+  s.selected = (a, b)
+  s.cursor = (b + 1).Natural
+  s.setCurrentLine()
+  s.desiredCol = s.getColumn().Natural
+
 proc selectLine*(s: var SynEdit) =
   inc s.version
   let lineStart = s.getLineOffset(s.currentLine.int)
@@ -2245,6 +2254,11 @@ proc getBg(s: SynEdit; i: int): Color =
     if i in r: return s.srcBlockBg
   return s.theme.bg
 
+proc inSrcBlock(s: SynEdit; offset: int): bool =
+  for r in s.srcBlockRanges:
+    if offset in r: return true
+  false
+
 proc underline*(s: var SynEdit; a, b: int) =
   ## Set the underline range. Call before the draw/render that should show it.
   ## Pass (-1, -1) to clear.
@@ -2675,6 +2689,10 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
     let closeLine = s.closeLines >= 0 and thisLine >= s.closeLines
     let lineY = dim.y
     let lineStart = i
+    if s.inSrcBlock(lineStart):
+      # Shade the whole row width (not just behind the glyphs) so org src
+      # blocks read as full-width panels, like the GTK version.
+      fillRect(rect(dim.x, dim.y, endX - dim.x, lineH), s.srcBlockBg)
     let savedFont = s.font
     if isBigOrgLine(s, i): s.font = s.bigFont   # taller row, bigger glyphs
     i = s.drawTextLine(i, dim, blink)

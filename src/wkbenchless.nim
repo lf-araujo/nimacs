@@ -59,6 +59,7 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     of pmBuffers: "buffer: "
     of pmFiles: app.paletteDir & "/ "
     of pmThemes: "theme: "
+    of pmOrg: "org: "
   discard drawText(app.font, bx + 10, by + 8, prompt & app.paletteQuery,
                    app.theme.boxFg, boxBg)
   var y = by + 8 + lineH + 4
@@ -67,6 +68,54 @@ proc drawPalette(app: App; area: Rect; lineH: int) =
     fillRect(rect(bx + 4, y, boxW - 8, lineH), rowBg)
     discard drawText(app.font, bx + 12, y, items[i][1], app.theme.boxFg, rowBg)
     y += lineH
+
+proc drawSearch(app: App; sr: Rect; lineH: int) =
+  ## The find / replace minibuffer, drawn over the status bar row.
+  let bg = app.theme.boxBg
+  fillRect(sr, bg)
+  let count =
+    if app.searchQuery.len == 0: ""
+    elif app.searchMatches.len == 0: "  (no matches)"
+    else: "  " & $(app.searchIdx + 1) & "/" & $app.searchMatches.len
+  var line: string
+  if app.searchMode == smFind:
+    line = "find: " & app.searchQuery & "\u2503" & count
+  else:
+    let qCur = if app.searchField == sfQuery: "\u2503" else: ""
+    let rCur = if app.searchField == sfReplace: "\u2503" else: ""
+    line = "replace: " & app.searchQuery & qCur & "  \u2192  " &
+           app.searchReplace & rCur & count &
+           "   [Enter: replace  ! : all  Tab: field  Esc: done]"
+  discard drawText(app.font, sr.x + 6, sr.y, line, app.theme.boxFg, bg)
+
+proc handleSearch(app: var App; e: Event) =
+  if e.kind == KeyDownEvent:
+    case e.key
+    of KeyEsc: app.endSearch()
+    of KeyEnter:
+      if app.searchMode == smReplace and app.searchField == sfReplace:
+        replaceCurrent(app)
+      else:
+        searchNext(app)
+    of KeyTab:
+      if app.searchMode == smReplace:
+        app.searchField = if app.searchField == sfQuery: sfReplace else: sfQuery
+    of KeyBackspace:
+      if app.searchField == sfReplace:
+        if app.searchReplace.len > 0: app.searchReplace.setLen(app.searchReplace.len - 1)
+      elif app.searchQuery.len > 0:
+        app.searchQuery.setLen(app.searchQuery.len - 1)
+        recomputeMatches(app); gotoCurrentMatch(app)
+    else: discard
+  elif e.kind == TextInputEvent:
+    for ch in e.text:
+      if ch == '\0': break
+      if app.searchMode == smReplace and app.searchField == sfReplace:
+        app.searchReplace.add ch
+      elif app.searchMode == smReplace and ch == '!':
+        replaceAll(app); return
+      else:
+        app.searchQuery.add ch; recomputeMatches(app); gotoCurrentMatch(app)
 
 proc paletteAccept(app: var App) =
   let items = paletteEntries(app)
@@ -90,6 +139,9 @@ proc paletteAccept(app: var App) =
   of pmThemes:
     app.paletteActive = false
     applyTheme(app, parseInt(id))
+  of pmOrg:
+    app.paletteActive = false
+    app.ed.gotoLine(parseInt(id) + 1, 0)
 
 proc handlePalette(app: var App; e: Event) =
   if e.kind == KeyDownEvent:
@@ -162,6 +214,8 @@ proc dispatch(app: var App; e: Event): bool =
 proc feedTerminalKey(t: var Pty; e: Event): bool =
   ## Translate a keystroke into the bytes a PTY expects. Shared by the standalone
   ## terminal and the live REPL-session terminal (both are just a `Pty`).
+  if t.vt != nil and e.kind in {TextInputEvent, KeyDownEvent}:
+    t.vt.viewOffset = 0          # any typing snaps the viewport back to the tail
   case e.kind
   of TextInputEvent:
     for ch in e.text:
@@ -256,6 +310,16 @@ proc main() =
   var lastMouse = (x: 0, y: 0)
   var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
+  var termRepaintFrames = 0              # after a reload, nudge the TUI to repaint
+  block:                                 # adopt sessions/terminal from a hot reload
+    let ti = adoptHandoff(app)
+    if ti.master >= 0:
+      pty = adoptTerminal(ti.master, ti.pid, app.theme.termFg, app.theme.panelBg)
+      app.hasTerminal = true; app.termLabel = ti.label; app.termActive = ti.active
+      termRepaintFrames = 3              # repaint over the first few sized frames
+    if app.sessions.len > 0 or ti.master >= 0:
+      app.sessionHidden = false
+      app.msg = "reloaded -- sessions & terminal preserved"
   # Terminal text selection (drag to select, copy on release). Coords are
   # (row, col) within the drawn terminal body.
   var selecting = false
@@ -288,6 +352,7 @@ proc main() =
     # Retire the terminal tab once its process has ended and we've moved off it.
     if app.hasTerminal and not pty.alive and not app.termActive:
       app.hasTerminal = false
+    app.termMaster = pty.master; app.termPid = pty.pid.int   # so a hot reload can hand it off
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])
@@ -298,11 +363,13 @@ proc main() =
       suppressText = false
       if e.kind == TextInputEvent: consumed = true   # the char after e.g. "C-c e"
     if not consumed:
-      if app.paletteActive:
+      if app.searchActive:
+        handleSearch(app, e); consumed = true
+      elif app.paletteActive:
         handlePalette(app, e); consumed = true
       elif app.completionActive:
         consumed = handleCompletion(app, e)
-    if not consumed and not app.paletteActive:
+    if not consumed and not app.paletteActive and not app.searchActive:
       if dispatch(app, e):
         consumed = true
         # A command/prefix ran from this keystroke; swallow the TextInput it may
@@ -311,13 +378,13 @@ proc main() =
 
     # Vim modal editing (after commands, so bound chords still work).
     if not consumed and app.vimEnabled and app.focus == "editor" and
-       not app.paletteActive and not app.completionActive:
+       not app.paletteActive and not app.completionActive and not app.searchActive:
       consumed = vimHandle(app, e)
 
     # Session-focused input goes straight to the live pane's pty (the standalone
     # terminal, or the current REPL session -- both are a Pty).
     if not consumed and not app.paletteActive and not app.completionActive and
-       app.focus == "session":
+       not app.searchActive and app.focus == "session":
       let ap = activePtyPtr()
       if ap != nil and ap[].alive:
         consumed = feedTerminalKey(ap[], e)
@@ -371,7 +438,7 @@ proc main() =
     var editorRect = rect(0, 0, screen.width, screen.height)
     # Route: a wheel goes to the pane under the pointer; other unconsumed input
     # goes to the focused pane. Everything else gets noEvent.
-    let overlay = app.paletteActive or app.completionActive
+    let overlay = app.paletteActive or app.completionActive or app.searchActive
     proc evFor(name: string): Event =
       if overlay: return noEvent
       if e.kind == MouseWheelEvent:
@@ -432,15 +499,37 @@ proc main() =
         # TUIs like claude render here). Colored cell runs + block cursor.
         let vt = ap[].vt
         if ap[].alive: setPtySize(ap[], rows, max(1, body.w div charW))
+        if termRepaintFrames > 0:          # post-reload: repaint once sized
+          nudgeRepaint(ap[]); dec termRepaintFrames
         setVtColors(ap[], app.theme.termFg, app.theme.panelBg)
+        # Wheel: on the primary screen scroll our own scrollback; on the alt
+        # screen (TUIs) hand the wheel to the app -- as an encoded mouse event
+        # if it asked for mouse reporting, else as arrow keys ("alt scroll").
+        let overBody = lastMouse.x >= body.x and lastMouse.x < body.x + body.w and
+                       lastMouse.y >= body.y and lastMouse.y < body.y + body.h
+        if e.kind == MouseWheelEvent and overBody and ap[].alive:
+          if vt.mouseRep:
+            let btn = if e.y > 0: 64 else: 65      # 64 = wheel up, 65 = wheel down
+            let col = max(1, (lastMouse.x - body.x) div charW + 1)
+            let row = max(1, (lastMouse.y - body.y) div lineH + 1)
+            let ev = if vt.mouseSgr: "\e[<" & $btn & ";" & $col & ";" & $row & "M"
+                     else: "\e[M" & $chr(32 + btn) & $chr(32 + col) & $chr(32 + row)
+            for _ in 0 ..< 3 * abs(e.y): feed(ap[], ev)
+          elif vt.inAlt:
+            let arrow = if e.y > 0: "\e[A" else: "\e[B"
+            for _ in 0 ..< 3 * abs(e.y): feed(ap[], arrow)
+          else:
+            vt.scrollView(e.y * 3)
+        let atTail = vt.viewOffset == 0
         for ry in 0 ..< vt.rows:
+          let vrow = vt.viewRow(ry)
           var cxp = 0
           while cxp < vt.cols:                  # coalesce same-attribute cells
-            let c0 = vt.grid[ry][cxp]
+            let c0 = vrow[cxp]
             var run = ""
             var cxe = cxp
             while cxe < vt.cols:
-              let c = vt.grid[ry][cxe]
+              let c = vrow[cxe]
               if c.fg != c0.fg or c.bg != c0.bg or c.inv != c0.inv: break
               run.add (if c.ch.len == 0: " " else: c.ch)
               inc cxe
@@ -449,16 +538,19 @@ proc main() =
             discard drawText(app.font, body.x + cxp * charW, body.y + ry * lineH, run, fg, bg)
             cxp = cxe
           var rowStr = ""                       # full-width row text (for selection)
-          for c in vt.grid[ry]: rowStr.add (if c.ch.len == 0: " " else: c.ch)
+          for c in vrow: rowStr.add (if c.ch.len == 0: " " else: c.ch)
           visText.add rowStr
-        if ap[].alive:                          # block cursor (inverse cell)
+        if ap[].alive and atTail:               # block cursor (inverse cell)
           let cc = vt.grid[vt.cy][vt.cx]
           let cxr = body.x + vt.cx * charW
           let cyr = body.y + vt.cy * lineH
           fillRect(rect(cxr, cyr, charW, lineH), app.theme.termFg)
           discard drawText(app.font, cxr, cyr, (if cc.ch.len == 0: " " else: cc.ch),
                            app.theme.panelBg, app.theme.termFg)
-        else:
+        if vt.viewOffset > 0:                    # scrollback indicator
+          discard drawText(app.font, body.x + body.w - 7 * charW, body.y,
+            "[+" & $vt.viewOffset & "]", app.theme.dimFg, app.theme.panelBg)
+        if not ap[].alive:
           discard drawText(app.font, body.x + 4, body.y + (vt.rows) * lineH,
             "[process ended -- Esc-hide, reopen with M-x terminal]", app.theme.dimFg, sessBg)
       elif ap != nil:
@@ -516,7 +608,9 @@ proc main() =
       discard app.help.draw(evFor("help"), cells["help"], focused = app.focus == "help")
     for dn in dividerNames:
       if cells.hasKey(dn): fillRect(cells[dn], app.theme.dividerColor)
-    if cells.hasKey("status"):
+    if cells.hasKey("status") and app.searchActive:
+      drawSearch(app, cells["status"], lineH)
+    elif cells.hasKey("status"):
       let sr = cells["status"]
       fillRect(sr, statusBg)
       let name = if app.filePath.len > 0: extractFilename(app.filePath) else: "*scratch*"
