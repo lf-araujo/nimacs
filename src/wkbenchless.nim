@@ -518,7 +518,10 @@ proc main() =
     var editorRect = rect(0, 0, screen.width, screen.height)
     # Route: a wheel goes to the pane under the pointer; other unconsumed input
     # goes to the focused pane. Everything else gets noEvent.
-    let overlay = app.paletteActive or app.completionActive or app.searchActive
+    # The completion popup is NON-MODAL: it floats over the editor but must not
+    # block typing (you keep typing and it refines). Only the palette and search
+    # minibuffers are true modal overlays that capture editor input.
+    let overlay = app.paletteActive or app.searchActive
     proc evFor(name: string): Event =
       if overlay: return noEvent
       if e.kind == MouseWheelEvent:
@@ -587,13 +590,12 @@ proc main() =
       # Always-on completion: after a printable edit reaches the editor, refresh
       # the suggestion popup (LSP languages only; no popup while overlays show).
       if not overlay and app.focus == "editor" and app.docLang.len > 0:
+        # Refresh (or open) the popup after a typed char / backspace; autoComplete
+        # closes itself when there's nothing to show, so no explicit dismiss.
         let edited =
           (e.kind == TextInputEvent and not consumed) or
           (e.kind == KeyDownEvent and e.key == KeyBackspace)
         if edited: autoComplete(app)
-        elif e.kind == KeyDownEvent and e.key notin
-             {KeyUp, KeyDown, KeyEnter, KeyTab, KeyLeft, KeyRight}:
-          app.completionActive = false
     if cells.hasKey("session"):
       let r = cells["session"]
       fillRect(r, sessBg)
