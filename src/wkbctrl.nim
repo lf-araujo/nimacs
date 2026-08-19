@@ -77,9 +77,13 @@ proc handle(app: var App; req: string): string =
   of "run-block":                        # run the src block at/containing 1-based <line>
     # Position + run in ONE request (so the cursor is right when babel runs), the
     # editor's own C-c C-c: executes in the block's :session and writes #+RESULTS.
-    let ln = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else:
+    var ln = (if parts.len > 1: (try: parseInt(parts[1]) except: 1) else:
                 app.ed.currentLine + 1) - 1
-    app.ed.gotoLine(clamp(ln, 0, app.ed.getLineCount() - 1), 0)
+    ln = clamp(ln, 0, app.ed.getLineCount() - 1)
+    # `blocks` reports the #+begin_src header line; babel wants a body line.
+    if strutils.strip(app.ed.getLineText(ln)).toLowerAscii.startsWith("#+begin_src"):
+      ln = min(ln + 1, app.ed.getLineCount() - 1)
+    app.ed.gotoLine(ln, 0)
     babelExecute(app)
     result = "ok: " & app.msg
   of "blocks":
