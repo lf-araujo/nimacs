@@ -168,10 +168,13 @@ proc unstash(s: string; tokens: seq[string]): string =
 # ---- commands --------------------------------------------------------------
 
 proc docxOf(app: App): string =
+  ## The docx path from a #+OTD_DOCX: header, or a sibling <file>.docx of the
+  ## open .org, or "" if neither is available.
   for i in 0 ..< app.ed.getLineCount():
     let ln = strutils.strip(app.ed.getLineText(i))
     if ln.toLowerAscii.startsWith("#+otd_docx:"):
       return expandTilde(strutils.strip(ln[ln.find(':') + 1 .. ^1]))
+  if app.filePath.len > 0: return app.filePath.changeFileExt("docx")
   ""
 
 proc otdImport(app: var App) =
@@ -195,7 +198,9 @@ proc otdImport(app: var App) =
 
 proc otdExport(app: var App) =
   let docx = docxOf(app)
-  if docx.len == 0: (app.msg = "add a  #+OTD_DOCX: /path.docx  line first"; return)
+  if docx.len == 0:
+    app.msg = "otd: save the .org first, or add a  #+OTD_DOCX: /path.docx  line"; return
+  if findExe(gPandoc).len == 0: (app.msg = "otd: pandoc not on PATH"; return)
   # strip the OTD header line from the org we feed pandoc
   var lines: seq[string]
   for i in 0 ..< app.ed.getLineCount():
