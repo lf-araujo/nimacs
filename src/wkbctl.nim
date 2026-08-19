@@ -9,6 +9,7 @@
 ##   echo TEXT | wkbctl insert <line>     # insert before 1-based <line>
 ##   echo TEXT | wkbctl replace <from> <to>   # replace 1-based lines [from..to]
 ##   wkbctl goto <line>                   # move the cursor
+##   wkbctl run-block [line]              # run the src block at <line> (writes #+RESULTS)
 ##   wkbctl diff <oldfile> <newfile> [title]  # show a side-by-side diff
 ##
 ## Verbs that take text read it from stdin. lang/session default to r/default.
@@ -45,6 +46,8 @@ when defined(posix):
     of "goto":
       if args.len < 2: quit("wkbctl goto <line>", 1)
       req = "goto\t" & args[1]
+    of "run-block":                        # run the src block at/containing <line>
+      req = "run-block" & (if args.len > 1: "\t" & args[1] else: "")
     of "diff":                             # diff <oldfile> <newfile> [title]
       if args.len < 3: quit("wkbctl diff <oldfile> <newfile> [title]", 1)
       let title = if args.len > 3: args[3] else: extractFilename(args[2])
