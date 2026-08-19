@@ -40,20 +40,23 @@ proc awaitResponse(c: LspClient; id: int): JsonNode =
       return m
   nil
 
-proc request(c: LspClient; meth: string; params: JsonNode): JsonNode =
+proc request*(c: LspClient; meth: string; params: JsonNode): JsonNode =
+  ## Send a JSON-RPC request and block for its reply (public so extensions can
+  ## drive server-specific methods, e.g. Copilot's signIn / inlineCompletion).
   inc c.nextId
   let id = c.nextId
   c.send(%*{"jsonrpc": "2.0", "id": id, "method": meth, "params": params})
   c.awaitResponse(id)
 
-proc notify(c: LspClient; meth: string; params: JsonNode) =
+proc notify*(c: LspClient; meth: string; params: JsonNode) =
   c.send(%*{"jsonrpc": "2.0", "method": meth, "params": params})
 
 proc uriOf*(path: string): string = "file://" & path
 
-proc startLsp*(command, rootUri: string): LspClient =
+proc startLsp*(command, rootUri: string; initOptions: JsonNode = nil): LspClient =
   ## Spawn `command` (space-split argv) and run the initialize handshake.
-  ## Returns nil if the server isn't found or the handshake fails.
+  ## `initOptions` (if given) is passed as `initializationOptions` -- Copilot
+  ## needs editorInfo there. Returns nil if the server isn't found / handshake fails.
   let parts = command.splitWhitespace()
   if parts.len == 0: return nil
   let exe = findExe(parts[0])
@@ -65,12 +68,14 @@ proc startLsp*(command, rootUri: string): LspClient =
     return nil
   result = LspClient(process: p, nextId: 0, initialized: false,
                      opened: initHashSet[string](), version: initTable[string, int]())
-  let resp = result.request("initialize", %*{
+  var initParams = %*{
     "processId": getCurrentProcessId(),
     "rootUri": rootUri,
     "capabilities": {"textDocument": {
       "synchronization": {"didSave": true},
-      "completion": {"completionItem": {"snippetSupport": false}}}}})
+      "completion": {"completionItem": {"snippetSupport": false}}}}}
+  if initOptions != nil: initParams["initializationOptions"] = initOptions
+  let resp = result.request("initialize", initParams)
   if resp != nil and resp.hasKey("result"):
     result.notify("initialized", %*{})
     result.initialized = true
