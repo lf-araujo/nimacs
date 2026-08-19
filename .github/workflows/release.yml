@@ -31,10 +31,10 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.0.8' }
-          - { os: macos-13,       label: macos_x86_64,  exe: '',     nim: '2.0.8' }
-          - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.0.8' }
-          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.0.8' }
+          - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.2.6' }
+          - { os: macos-13,       label: macos_x86_64,  exe: '',     nim: '2.2.6' }
+          - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.2.6' }
+          - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
 
     steps:
       - uses: actions/checkout@v4
