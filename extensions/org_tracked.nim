@@ -12,7 +12,7 @@
 ## revisions; comments are emitted best-effort as Word comments.
 
 import wkbcore
-import std/[osproc, os, strutils, times]
+import std/[osproc, os, strutils, times, tables, sequtils]
 
 var
   gPandoc* = "pandoc"
@@ -206,6 +206,54 @@ proc unescapeRefs(md: string): string =
   ## so pandoc-crossref (and citeproc for `[@cite]`) can see them.
   md.replace("\\@", "@")
 
+proc authorBlock(app: App): string =
+  ## Port of org-tracked-docx's otd--generate-author-block: turn
+  ##   #+AFFIL: key :: institution
+  ##   #+AUTHOR_LIST: Name :: key1, key2 :: corresponding
+  ##   #+AUTHOR_GROUP: for the ... Group
+  ## into a #+begin_export markdown block with pandoc superscript affiliation
+  ## letters (a, b, ... in #+AFFIL declaration order) and a numbered affil list.
+  var affils: seq[(string, string)]                 # (key, description), in order
+  var authors: seq[tuple[name: string; keys: seq[string]; corr: bool]]
+  var group = ""
+  for i in 0 ..< app.ed.getLineCount():
+    let ln = strutils.strip(app.ed.getLineText(i))
+    let low = ln.toLowerAscii
+    if low.startsWith("#+affil:"):
+      let rest = strutils.strip(ln[ln.find(':') + 1 .. ^1])
+      let sep = rest.find("::")
+      if sep >= 0:
+        affils.add (strutils.strip(rest[0 ..< sep]), strutils.strip(rest[sep + 2 .. ^1]))
+    elif low.startsWith("#+author_list:"):
+      let parts = strutils.strip(ln[ln.find(':') + 1 .. ^1]).split("::")
+      if parts.len >= 2:
+        var keys: seq[string]
+        for k in parts[1].split(','):
+          let kk = strutils.strip(k)
+          if kk.len > 0: keys.add kk
+        authors.add (strutils.strip(parts[0]), keys,
+                     parts.len >= 3 and "corresponding" in parts[2].toLowerAscii)
+    elif low.startsWith("#+author_group:"):
+      group = strutils.strip(ln[ln.find(':') + 1 .. ^1])
+  if authors.len == 0: return ""
+  var letter: Table[string, string]
+  for idx, a in affils: letter[a[0]] = $chr(ord('a') + (idx mod 26))
+  var authorStrs: seq[string]
+  for au in authors:
+    var sups: seq[string]
+    for k in au.keys:
+      if letter.hasKey(k): sups.add letter[k]
+    if au.corr: sups.add "*"
+    authorStrs.add (if sups.len > 0: au.name & "^" & sups.join(",") & "^" else: au.name)
+  var authorLine = authorStrs.join(", ")
+  if group.len > 0: authorLine.add ", " & group
+  var affilLines: seq[string]
+  for idx, a in affils: affilLines.add $(idx + 1) & ". " & a[1]
+  result = "#+begin_export markdown\n" & authorLine & "\n\n" &
+           affilLines.join("\n\n") & "\n\n" &
+           (if authors.anyIt(it.corr): "*Corresponding author.\n" else: "") &
+           "#+end_export"
+
 proc otdImport(app: var App) =
   let docx = docxOf(app)
   if docx.len == 0: (app.msg = "add a  #+OTD_DOCX: /path.docx  line first"; return)
@@ -230,11 +278,21 @@ proc otdExport(app: var App) =
   if docx.len == 0:
     app.msg = "otd: save the .org first, or add a  #+OTD_DOCX: /path.docx  line"; return
   if findExe(gPandoc).len == 0: (app.msg = "otd: pandoc not on PATH"; return)
-  # strip the OTD header line from the org we feed pandoc
+  # Feed pandoc the org with the OTD header dropped and the #+AFFIL/#+AUTHOR_LIST/
+  # #+AUTHOR_GROUP headers replaced (once, in place) by a generated author block.
+  let authors = authorBlock(app)
   var lines: seq[string]
+  var authorsDone = false
   for i in 0 ..< app.ed.getLineCount():
     let ln = app.ed.getLineText(i)
-    if not strutils.strip(ln).toLowerAscii.startsWith("#+otd_docx:"): lines.add ln
+    let low = strutils.strip(ln).toLowerAscii
+    if low.startsWith("#+otd_docx:"): continue
+    if low.startsWith("#+affil:") or low.startsWith("#+author_list:") or
+       low.startsWith("#+author_group:"):
+      if not authorsDone and authors.len > 0: lines.add authors
+      authorsDone = true
+      continue
+    lines.add ln
   var toks: seq[string]
   let orgStashed = stash(lines.join("\n"), toks)
   let orgTmp = getTempDir() / "otd-export.org"
