@@ -352,7 +352,7 @@ proc main() =
   let layPlain = parseLayout(layoutPlain)
   let laySrc = parseLayout(layoutSrc)
   var lastMouse = (x: 0, y: 0)
-  var pty = PtyTerm(master: -1)          # thread-free in-pane terminal
+  var pty = notRunningPty()               # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
   let termGridPath = getTempDir() / "wkbenchless-termgrid"
   var termRepaintFrames = 0              # fallback nudge if no grid snapshot exists
@@ -401,7 +401,8 @@ proc main() =
     # Retire the terminal tab once its process has ended and we've moved off it.
     if app.hasTerminal and not pty.alive and not app.termActive:
       app.hasTerminal = false
-    app.termMaster = pty.master; app.termPid = pty.pid.int   # so a hot reload can hand it off
+    when defined(posix):
+      app.termMaster = pty.master; app.termPid = pty.pid.int  # so a hot reload can hand it off
     block:                                    # drain the live pane's pty each frame
       let ap = activePtyPtr()
       if ap != nil: pump(ap[])

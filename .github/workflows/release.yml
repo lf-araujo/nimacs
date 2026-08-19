@@ -3,16 +3,14 @@ name: Build and release binaries
 # Adapted from the fastsem release-rlib.yml pattern, but for wkbenchless'
 # application binaries (wkbenchless + wkbctl) across Linux / macOS / Windows.
 #
-# NOTE on portability:
-#   * Linux  -- builds now (uirelays X11 driver + POSIX PTY).
-#   * macOS  -- expected to build: uirelays selects its native Cocoa driver, and
-#     the PTY/control layer (fork/execv/posix_openpt/sockaddr_un) is POSIX, which
-#     macOS provides. No XQuartz needed.
-#   * Windows-- uirelays HAS a winapi UI driver, but wkbpty/wkbctrl/wkbctl are
-#     POSIX-only, so they will NOT compile until they gain a ConPTY variant and a
-#     winsock control socket. Kept in the matrix as best-effort.
-# `fail-fast: false` means a green Linux/macOS build still ships a release even
-# while Windows is being brought up.
+# NOTE on portability -- all three now build:
+#   * Linux   -- uirelays X11 driver + POSIX PTY (openpt/fork).
+#   * macOS   -- native Cocoa driver + POSIX PTY. No XQuartz needed.
+#   * Windows -- winapi UI driver + a ConPTY terminal (CreatePseudoConsole).
+#     The AF_UNIX control socket + hot-reload fd-handoff are POSIX-only, so on
+#     Windows `wkbctl` and agent-control are stubbed for now (the editor,
+#     sessions, and terminal work; C-c r reload is manual).
+# `fail-fast: false` still lets the other platforms publish if one regresses.
 
 on:
   push:
@@ -69,7 +67,11 @@ jobs:
       - name: Build wkbenchless + wkbctl
         shell: bash
         run: |
-          nim c -d:release -d:danger --opt:size \
+          # On Windows the editor is a GUI-subsystem app (no console window);
+          # wkbctl stays a console tool.
+          GUI=""
+          if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui"; fi
+          nim c -d:release -d:danger --opt:size $GUI \
             -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
           nim c -d:release -d:danger --opt:size \
             -o:wkbctl${{ matrix.config.exe }} src/wkbctl.nim

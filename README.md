@@ -124,9 +124,11 @@ git push origin v0.1.0
 ```
 
 or run it manually from the repo's **Actions** tab (“Build and release
-binaries” → *Run workflow*), giving the release tag as input. Linux (X11) and
-macOS (Cocoa) build today; the Windows job is best-effort until the PTY/socket
-layer gains a ConPTY + winsock port.
+binaries” → *Run workflow*), giving the release tag as input. All three
+platforms build: Linux (X11) and macOS (Cocoa) with a POSIX PTY, and Windows
+with a ConPTY terminal and the winapi UI driver. On Windows the AF_UNIX control
+socket / `wkbctl` and the fd-handoff hot reload are stubbed for now (the editor,
+sessions, and terminal work; the control socket needs a named-pipe port).
 
 ## License
 

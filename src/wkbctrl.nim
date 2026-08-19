@@ -1,44 +1,26 @@
 ## Control server: a Unix-domain socket the editor polls (non-blocking, from the
 ## main loop -- NO thread) so external tools (e.g. Claude running in the terminal
 ## via `wkbctl`) can drive the editor: run code in a live session, read the
-## buffer, or run a named command.
+## buffer, show a diff, or run a named command.
 ##
 ## Protocol (one request per connection; client half-closes after sending):
 ##   "buffer"                      -> the current buffer text
 ##   "eval\t<lang>\t<session>\n<code>" -> run <code> in that session, return output
-##   "command\t<name>"             -> run a registered command, return "ok"/"?"
-##   "blocks"                      -> list #+begin_src blocks (lang, session, lines)
+##   "command\t<name>"             -> run a registered command
+##   "diff\t<title>\n<OLD>\x1e<NEW>" -> open the side-by-side diff view
+##   "blocks"                      -> list #+begin_src blocks
+##
+## The transport is POSIX-only for now (AF_UNIX); on Windows it's a no-op stub
+## (a named-pipe/AF_UNIX port is future work). The request `handle` itself is
+## portable.
 
-import std/[posix, strutils, os, tables]
+import std/[strutils, tables]
 import wkbcore
 
-type Sockaddr_un {.importc: "struct sockaddr_un", header: "<sys/un.h>", pure, final.} = object
-  sun_family: cushort
-  sun_path: array[108, char]
-
 type ControlServer* = object
-  listenFd*: cint
-  clientFd*: cint
-  inbuf*: string
-
-proc controlPath*(): string = getCacheDir() / "wkbenchless" / "control.sock"
-
-proc startControl*(): ControlServer =
-  result = ControlServer(listenFd: -1, clientFd: -1)
-  let path = controlPath()
-  try: createDir(path.parentDir) except CatchableError: discard
-  removeFile(path)
-  let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-  if fd.cint < 0: return
-  var sa: Sockaddr_un
-  sa.sun_family = AF_UNIX.cushort
-  if path.len >= sa.sun_path.len: return
-  copyMem(addr sa.sun_path[0], unsafeAddr path[0], path.len)
-  if bindSocket(fd, cast[ptr SockAddr](addr sa), sizeof(sa).SockLen) != 0: return
-  if listen(fd, 4) != 0: return
-  discard fcntl(fd.cint, F_SETFL, O_NONBLOCK)
-  discard fcntl(fd.cint, F_SETFD, FD_CLOEXEC)   # don't leak into forked sessions
-  result.listenFd = fd.cint
+  when defined(posix):
+    listenFd*, clientFd*: cint
+    inbuf*: string
 
 proc handle(app: var App; req: string): string =
   let nl = req.find('\n')
@@ -104,24 +86,54 @@ proc handle(app: var App; req: string): string =
   else:
     result = "unknown verb: " & parts[0]
 
-proc poll*(cs: var ControlServer; app: var App) =
-  if cs.listenFd < 0: return
-  if cs.clientFd < 0:
-    let c = accept(cs.listenFd.SocketHandle, nil, nil)
-    if c.cint >= 0:
-      discard fcntl(c.cint, F_SETFL, O_NONBLOCK)
-      discard fcntl(c.cint, F_SETFD, FD_CLOEXEC)   # so a forked session can't hold it open
-      cs.clientFd = c.cint; cs.inbuf = ""
-  if cs.clientFd >= 0:
-    var b {.noinit.}: array[4096, char]
-    while true:
-      let n = read(cs.clientFd, addr b[0], b.len)
-      if n > 0:
-        for i in 0 ..< n: cs.inbuf.add b[i]
-      elif n == 0:                       # client half-closed: request complete
-        let resp = handle(app, cs.inbuf)
-        if resp.len > 0: discard write(cs.clientFd, unsafeAddr resp[0], resp.len)
-        discard close(cs.clientFd); cs.clientFd = -1
-        break
-      else:
-        break                            # EAGAIN: nothing more yet
+when defined(posix):
+  import std/[posix, os]
+
+  type Sockaddr_un {.importc: "struct sockaddr_un", header: "<sys/un.h>", pure, final.} = object
+    sun_family: cushort
+    sun_path: array[108, char]
+
+  proc controlPath*(): string = getCacheDir() / "wkbenchless" / "control.sock"
+
+  proc startControl*(): ControlServer =
+    result = ControlServer(listenFd: -1, clientFd: -1)
+    let path = controlPath()
+    try: createDir(path.parentDir) except CatchableError: discard
+    removeFile(path)
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    if fd.cint < 0: return
+    var sa: Sockaddr_un
+    sa.sun_family = AF_UNIX.cushort
+    if path.len >= sa.sun_path.len: return
+    copyMem(addr sa.sun_path[0], unsafeAddr path[0], path.len)
+    if bindSocket(fd, cast[ptr SockAddr](addr sa), sizeof(sa).SockLen) != 0: return
+    if listen(fd, 4) != 0: return
+    discard fcntl(fd.cint, F_SETFL, O_NONBLOCK)
+    discard fcntl(fd.cint, F_SETFD, FD_CLOEXEC)   # don't leak into forked sessions
+    result.listenFd = fd.cint
+
+  proc poll*(cs: var ControlServer; app: var App) =
+    if cs.listenFd < 0: return
+    if cs.clientFd < 0:
+      let c = accept(cs.listenFd.SocketHandle, nil, nil)
+      if c.cint >= 0:
+        discard fcntl(c.cint, F_SETFL, O_NONBLOCK)
+        discard fcntl(c.cint, F_SETFD, FD_CLOEXEC)   # so a forked session can't hold it open
+        cs.clientFd = c.cint; cs.inbuf = ""
+    if cs.clientFd >= 0:
+      var b {.noinit.}: array[4096, char]
+      while true:
+        let n = read(cs.clientFd, addr b[0], b.len)
+        if n > 0:
+          for i in 0 ..< n: cs.inbuf.add b[i]
+        elif n == 0:                       # client half-closed: request complete
+          let resp = handle(app, cs.inbuf)
+          if resp.len > 0: discard write(cs.clientFd, unsafeAddr resp[0], resp.len)
+          discard close(cs.clientFd); cs.clientFd = -1
+          break
+        else:
+          break                            # EAGAIN: nothing more yet
+
+else:                                      # Windows: no control transport yet
+  proc startControl*(): ControlServer = ControlServer()
+  proc poll*(cs: var ControlServer; app: var App) = discard

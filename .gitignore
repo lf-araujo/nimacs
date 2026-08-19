@@ -16,3 +16,4 @@ debug/*
 spike/*
 !spike/*.nim
 !spike/*.md
+*.exe
