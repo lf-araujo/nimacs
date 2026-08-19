@@ -189,9 +189,10 @@ proc base16Theme*(name: string; b: Base16): AppTheme =
   t.fg[TokenClass.EscapeSequence] = b[0xC]
   t.fg[TokenClass.RegularExpression] = b[0xC]
   t.fg[TokenClass.Link] = b[0xD]
+  t.fg[TokenClass.Command] = b[0xD]     # function names / calls: blue
   t.fg[TokenClass.Rule] = b[0xA]
   for tc in [TokenClass.TagStart, TokenClass.TagStandalone, TokenClass.TagEnd,
-             TokenClass.Command, TokenClass.Assembler]:
+             TokenClass.Assembler]:
     t.fg[tc] = b[0xA]
   t.fg[TokenClass.Green] = b[0xB]
   t.fg[TokenClass.Yellow] = b[0xA]

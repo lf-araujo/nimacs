@@ -531,6 +531,8 @@ proc nimNextToken(g: var GeneralTokenizer) =
           if g.buf[pos] == '\"': inc(pos)
       else:
         g.kind = nimGetKeyword(id)
+        if g.kind == TokenClass.Identifier and g.buf[pos] == '(':
+          g.kind = TokenClass.Command              # function name / call
     of '0':
       inc(pos)
       case g.buf[pos]
@@ -643,6 +645,8 @@ proc clikeNextToken(g: var GeneralTokenizer; keywords: openArray[string]) =
       g.kind = TokenClass.Identifier
       for kw in keywords:
         if kw == id: g.kind = TokenClass.Keyword; break
+      if g.kind == TokenClass.Identifier and g.buf[pos] == '(':
+        g.kind = TokenClass.Command                # function name / call
     of '0':
       inc(pos)
       case g.buf[pos]
@@ -713,6 +717,8 @@ proc pythonNextToken(g: var GeneralTokenizer) =
       g.kind = TokenClass.Identifier
       for kw in pythonKeywords:
         if kw == id: g.kind = TokenClass.Keyword; break
+      if g.kind == TokenClass.Identifier and g.buf[pos] == '(':
+        g.kind = TokenClass.Command                # function name / call
     of '0':
       inc(pos)
       case g.buf[pos]
@@ -788,6 +794,8 @@ proc rustNextToken(g: var GeneralTokenizer) =
       g.kind = TokenClass.Identifier
       for kw in rustKeywords:
         if kw == id: g.kind = TokenClass.Keyword; break
+      if g.kind == TokenClass.Identifier and g.buf[pos] == '(':
+        g.kind = TokenClass.Command                # function name / call
     of '0':
       inc(pos)
       case g.buf[pos]
@@ -857,6 +865,8 @@ proc rNextToken(g: var GeneralTokenizer) =
       g.kind = TokenClass.Identifier
       for kw in rKeywords:
         if kw == id: g.kind = TokenClass.Keyword; break
+      if g.kind == TokenClass.Identifier and g.buf[pos] == '(':
+        g.kind = TokenClass.Command                # function name / call
     of '0'..'9':
       g.kind = TokenClass.DecNumber
       inc(pos)
@@ -1161,6 +1171,25 @@ proc highlightOrg(s: var SynEdit; first, last: int) =
       inc p
   s.emph('*', cfBold, first, last)
   s.emph('/', cfItalic, first, last)
+  # =verbatim= and ~code~: colour the content in the code face, hide the markers.
+  proc emphCode(s: var SynEdit; ch: char; tc: TokenClass; first, last: int) =
+    var p = first
+    while p < last:
+      if s[p] == ch and not s.inSrcBlock(p) and
+         (p == first or s[p - 1] in {' ', '\t', '\L', '(', '{', '\''}) and
+         p + 1 <= last and s[p + 1] notin {' ', '\t', '\L'}:
+        var q = p + 1
+        while q <= last and s[q] != '\L':
+          if s[q] == ch and s[q - 1] notin {' ', '\t'}: break
+          inc q
+        if q <= last and s[q] == ch and q > p + 1:
+          s.addCellFlags(p, {cfHidden}); s.addCellFlags(q, {cfHidden})
+          for k in p + 1 .. q - 1: s.setCellStyle(k, tc)
+          p = q + 1
+          continue
+      inc p
+  s.emphCode('=', TokenClass.StringLit, first, last)
+  s.emphCode('~', TokenClass.StringLit, first, last)
   # CriticMarkup (tracked changes, cf. org-tracked-docx): {++ins++} green,
   # {--del--} red, {~~old~>new~~} red->green, {>>comment<<} grey, {==hi==} yellow.
   # No per-cell strike/underline here, so colour carries the meaning; markers dim.
