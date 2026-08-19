@@ -118,6 +118,7 @@ var
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
   gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
   gClaudeCmd* = "claude --continue"       ## command the `claude` action runs (config)
+  gSshPersist* = "600"                    ## seconds an ssh master connection persists
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -274,13 +275,22 @@ proc setState*(key, val: string) =
     writeFile(statePath(), s)
   except CatchableError: discard
 
+proc sshControlPath*(): string =
+  ## A per-user/host/port master socket shared by the interactive login and the
+  ## marker sessions, so a password host is authenticated ONCE.
+  getHomeDir() / ".ssh" / "wkb-cm-%C"
+
 proc remoteSpec(base: ReplSpec; host: string): ReplSpec =
   ## Wrap a REPL spec to run on `host` over ssh, so an org block executes on a
   ## remote machine and its output is captured the same way. `ssh -tt` forces a
-  ## remote pty (the interpreter runs interactively); the spec's env vars (PS1=,
-  ## PYTHON_BASIC_REPL=1, ...) are set on the remote via `env`.
+  ## remote pty; the spec's env (PS1=, PYTHON_BASIC_REPL=1) is set remotely via
+  ## `env`; ControlPath reuses an already-authenticated master (no password
+  ## prompt -- see ensureSshMaster / the interactive login step).
   result = base
-  var argv = @["ssh", "-tt", host]
+  var argv = @["ssh", "-tt",
+               "-o", "ControlPath=" & sshControlPath(),
+               "-o", "ControlMaster=auto",
+               "-o", "ControlPersist=" & gSshPersist, host]
   if base.env.len > 0:
     argv.add "env"
     for (k, v) in base.env: argv.add k & "=" & v
@@ -1190,6 +1200,25 @@ proc focusNext*(app: var App) =
   app.focus = order[(i + 1) mod order.len]
   app.msg = "focus: " & app.focus
 
+proc openTerminal*(app: var App; cmd: string)   # forward decl (defined below)
+
+proc sshMasterUp(host: string): bool =
+  ## Is there a live, authenticated ssh master connection to `host`?
+  let (_, code) = execCmdEx("ssh -O check -o ControlPath=" &
+    quoteShell(sshControlPath()) & " " & quoteShell(host) & " 2>/dev/null")
+  code == 0
+
+proc ensureSshMaster(app: var App; host: string): bool =
+  ## True if a master to `host` is up. Otherwise open a terminal to log in (where
+  ## the password prompt actually works) and return false -- the user authenticates
+  ## once, then re-runs the block, and the marker session reuses the master.
+  if sshMasterUp(host): return true
+  try: createDir(getHomeDir() / ".ssh") except CatchableError: discard
+  openTerminal(app, "ssh -tt -o ControlMaster=auto -o ControlPath=" & sshControlPath() &
+                    " -o ControlPersist=" & gSshPersist & " " & host)
+  app.msg = "log in to " & host & " in the terminal, then run the block again"
+  false
+
 proc babelExecute*(app: var App) =
   let total = app.ed.getLineCount()
   let cur = app.ed.currentLine
@@ -1221,6 +1250,7 @@ proc babelExecute*(app: var App) =
       host = (if c >= 0: d[0 ..< c] else: d)
     inc k
   if host.len > 0 and '@' notin sessName: sessName = sessName & "@" & host
+  if host.len > 0 and not ensureSshMaster(app, host): return   # authenticate first
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
