@@ -16,7 +16,10 @@ import std/[osproc, os, strutils, times]
 
 var
   gPandoc* = "pandoc"
-  gAuthor* = ""     ## blank -> git user.name, else "wkbenchless"
+  gAuthor* = ""       ## blank -> git user.name, else "wkbenchless"
+  gBib* = ""          ## bibliography path; else #+bibliography: header, else sibling .bib
+  gCsl* = ""          ## CSL citation-style file (optional)
+  gRefDoc* = ""       ## Word reference-doc / template (optional)
 
 proc trackAuthor(): string =
   if gAuthor.len > 0: return gAuthor
@@ -177,6 +180,32 @@ proc docxOf(app: App): string =
   if app.filePath.len > 0: return app.filePath.changeFileExt("docx")
   ""
 
+proc orgHeaders(app: App; key: string): seq[string] =
+  ## Values of every `#+<key>: value` line (case-insensitive).
+  let k = "#+" & key.toLowerAscii & ":"
+  for i in 0 ..< app.ed.getLineCount():
+    let ln = strutils.strip(app.ed.getLineText(i))
+    if ln.toLowerAscii.startsWith(k):
+      result.add strutils.strip(ln[ln.find(':') + 1 .. ^1])
+
+proc resolveRel(app: App; p: string): string =
+  let e = expandTilde(p)
+  if isAbsolute(e) or app.filePath.len == 0: e else: parentDir(app.filePath) / e
+
+proc findBib(app: App): string =
+  ## gBib, else a #+bibliography: header, else the first sibling *.bib.
+  if gBib.len > 0: return resolveRel(app, gBib)
+  let h = orgHeaders(app, "bibliography")
+  if h.len > 0: return resolveRel(app, h[0])
+  if app.filePath.len > 0:
+    for f in walkFiles(parentDir(app.filePath) / "*.bib"): return f
+  ""
+
+proc unescapeRefs(md: string): string =
+  ## pandoc's org reader escapes cross-ref keys `@fig:x` as `\@fig:x`; unescape
+  ## so pandoc-crossref (and citeproc for `[@cite]`) can see them.
+  md.replace("\\@", "@")
+
 proc otdImport(app: var App) =
   let docx = docxOf(app)
   if docx.len == 0: (app.msg = "add a  #+OTD_DOCX: /path.docx  line first"; return)
@@ -211,12 +240,24 @@ proc otdExport(app: var App) =
   let orgTmp = getTempDir() / "otd-export.org"
   writeFile(orgTmp, orgStashed)
   let md = getTempDir() / "otd-export.md"
-  var (code, outp) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", orgTmp, "-o", md])
+  # -s carries #+TITLE etc. as YAML metadata into the markdown.
+  var (code, outp) = pandoc(@["-f", "org", "-t", "markdown", "--wrap=none", "-s", orgTmp, "-o", md])
   if code != 0: (app.msg = "pandoc org->md failed: " & outp.strip(); return)
-  writeFile(md, criticToSpans(unstash(readFile(md), toks)))
-  (code, outp) = pandoc(@["-f", "markdown", "-t", "docx", md, "-o", docx])
+  writeFile(md, unescapeRefs(criticToSpans(unstash(readFile(md), toks))))
+  # md -> docx: standalone (title), citeproc + bibliography (references),
+  # pandoc-crossref (fig:/tbl: cross-refs), optional CSL + reference-doc.
+  var dargs = @["-f", "markdown", "-t", "docx", "-s"]
+  if findExe("pandoc-crossref").len > 0: (dargs.add "--filter"; dargs.add "pandoc-crossref")
+  dargs.add "--citeproc"
+  let bib = findBib(app)
+  if bib.len > 0 and fileExists(bib): dargs.add "--bibliography=" & bib
+  if gCsl.len > 0: dargs.add "--csl=" & resolveRel(app, gCsl)
+  if gRefDoc.len > 0: dargs.add "--reference-doc=" & resolveRel(app, gRefDoc)
+  dargs.add md; dargs.add "-o"; dargs.add docx
+  (code, outp) = pandoc(dargs)
   if code != 0: (app.msg = "pandoc md->docx failed: " & outp.strip(); return)
-  app.msg = "otd: exported tracked changes -> " & extractFilename(docx)
+  app.msg = "otd: exported -> " & extractFilename(docx) &
+            (if bib.len > 0: "  [refs: " & extractFilename(bib) & "]" else: "")
 
 proc extend*(app: var App) =
   defcommand("otd-import", "Tracked: import .docx -> org (CriticMarkup)", otdImport)
