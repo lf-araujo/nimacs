@@ -10,6 +10,7 @@ import uirelays
 import uirelays/layout
 import wkbcore
 import wkbconfig
+import wkbextensions
 import wkbpty
 import wkbctrl
 import std/[os, tables, strutils]
@@ -338,6 +339,7 @@ proc main() =
       except ValueError: discard
 
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
+  loadExtensions(app)       # extensions/*.nim, each with proc extend*(app)
   setupExecPath()           # seed PATH from the login shell (+ config paths)
   # Themes come from the config; guarantee one so the chrome is never unstyled,
   # and honor a default the config may already have applied.
