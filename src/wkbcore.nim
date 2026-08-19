@@ -274,12 +274,32 @@ proc setState*(key, val: string) =
     writeFile(statePath(), s)
   except CatchableError: discard
 
+proc remoteSpec(base: ReplSpec; host: string): ReplSpec =
+  ## Wrap a REPL spec to run on `host` over ssh, so an org block executes on a
+  ## remote machine and its output is captured the same way. `ssh -tt` forces a
+  ## remote pty (the interpreter runs interactively); the spec's env vars (PS1=,
+  ## PYTHON_BASIC_REPL=1, ...) are set on the remote via `env`.
+  result = base
+  var argv = @["ssh", "-tt", host]
+  if base.env.len > 0:
+    argv.add "env"
+    for (k, v) in base.env: argv.add k & "=" & v
+  argv.add base.argv
+  result.argv = argv
+  result.env = @[]           # applied remotely via `env` above, not locally
+
 proc getSession*(app: var App; lang, name: string): Session =
+  ## A session named "name@host" runs on `host` over ssh (remote REPL); a plain
+  ## name runs locally.
   let key = lang.toLowerAscii & "/" & name
   if app.sessions.hasKey(key) and app.sessions[key] != nil:
     return app.sessions[key]
   if not gRepls.hasKey(lang.toLowerAscii): return nil
-  let s = startSession(gRepls[lang.toLowerAscii])
+  let base = gRepls[lang.toLowerAscii]
+  let at = name.rfind('@')
+  let spec = if at >= 0 and at < name.len - 1: remoteSpec(base, name[at + 1 .. ^1])
+             else: base
+  let s = startSession(spec)
   if s != nil: app.sessions[key] = s
   s
 
@@ -1190,10 +1210,17 @@ proc babelExecute*(app: var App) =
   let hdr = strutils.splitWhitespace(header)
   let lang = if hdr.len >= 2: hdr[1] else: ""
   var sessName = "default"
+  var host = ""
   var k = 2
   while k < hdr.len:
     if hdr[k] == ":session" and k + 1 < hdr.len: sessName = hdr[k + 1]
+    elif hdr[k] == ":ssh" and k + 1 < hdr.len: host = hdr[k + 1]
+    elif hdr[k] == ":dir" and k + 1 < hdr.len and hdr[k + 1].startsWith("/ssh:"):
+      let d = hdr[k + 1][5 .. ^1]                  # /ssh:user@host:/path -> user@host
+      let c = d.find(':')
+      host = (if c >= 0: d[0 ..< c] else: d)
     inc k
+  if host.len > 0 and '@' notin sessName: sessName = sessName & "@" & host
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
