@@ -418,9 +418,13 @@ proc main() =
       app.reloadPending = false
 
     var consumed = false
-    if app.diffActive:                        # diff view captures input while open
+    if app.diffActive and app.focus != "session":
+      # The diff occupies the editor pane. Esc/q closes it; other editor-directed
+      # keys are swallowed so the hidden buffer isn't edited. Mouse events pass
+      # through (so you can click the session pane), and once focus is the
+      # session, this is skipped -- you keep talking to the terminal/Claude.
       if e.kind == KeyDownEvent and e.key in {KeyEsc, KeyQ}: closeDiff(app)
-      consumed = true
+      if e.kind in {KeyDownEvent, TextInputEvent}: consumed = true
     if not consumed and suppressText:
       suppressText = false
       if e.kind == TextInputEvent: consumed = true   # the char after e.g. "C-c e"
@@ -509,41 +513,6 @@ proc main() =
     let statusFg = app.theme.statusFg
     fillRect(rect(0, 0, screen.width, screen.height), bg)
 
-    if app.diffActive:                        # two-pane side-by-side diff view
-      let charW = max(1, measureText(app.font, "0").w)
-      fillRect(rect(0, 0, screen.width, lineH), app.theme.tabBarBg)
-      discard drawText(app.font, 6, 0,
-        "DIFF  " & app.diffTitle & "     Esc/q to close · wheel to scroll",
-        app.theme.chipActiveFg, app.theme.tabBarBg)
-      let bodyY = lineH
-      let rows = max(1, (screen.height - bodyY - lineH) div lineH)
-      if e.kind == MouseWheelEvent: app.diffScroll += e.y * 3
-      let total = app.diffL.len
-      app.diffScroll = max(0, min(app.diffScroll, max(0, total - rows)))
-      let colW = (screen.width - 6) div 2
-      let rightX = colW + 6
-      let removedBg = blend(bg, app.theme.ed.fg[TokenClass.Red], 24)
-      let addedBg = blend(bg, app.theme.ed.fg[TokenClass.Green], 24)
-      let gapBg = blend(bg, app.theme.dimFg, 14)
-      fillRect(rect(colW + 2, bodyY, 2, screen.height - bodyY - lineH), app.theme.dividerColor)
-      var y = bodyY
-      for idx in app.diffScroll ..< min(total, app.diffScroll + rows):
-        let lk = app.diffLK[idx]; let rk = app.diffRK[idx]
-        let lbg = if lk == '-': removedBg elif rk == '+': gapBg else: bg
-        let rbg = if rk == '+': addedBg elif lk == '-': gapBg else: bg
-        fillRect(rect(0, y, colW, lineH), lbg)
-        fillRect(rect(rightX, y, screen.width - rightX, lineH), rbg)
-        let lmark = if lk == '-': "-" else: " "
-        let rmark = if rk == '+': "+" else: " "
-        discard drawText(app.font, 4, y, lmark & app.diffL[idx], app.theme.ed.fg[TokenClass.None], lbg)
-        discard drawText(app.font, rightX + 4, y, rmark & app.diffR[idx], app.theme.ed.fg[TokenClass.None], rbg)
-        y += lineH
-      # status line
-      fillRect(rect(0, screen.height - lineH, screen.width, lineH), statusBg)
-      discard drawText(app.font, 6, screen.height - lineH, "  " & app.msg, statusFg, statusBg)
-      refresh()
-      continue
-
     var editorRect = rect(0, 0, screen.width, screen.height)
     # Route: a wheel goes to the pane under the pointer; other unconsumed input
     # goes to the focused pane. Everything else gets noEvent.
@@ -559,7 +528,49 @@ proc main() =
       if not consumed and name == app.focus: return e
       return noEvent
 
-    if cells.hasKey("editor"):
+    if cells.hasKey("editor") and app.diffActive:
+      # Two-pane diff, drawn INTO the editor cell (the session/terminal pane
+      # below stays live so you can keep interacting). Removed lines red (left),
+      # added green (right); wheel over it scrolls; Esc/q closes.
+      let r = cells["editor"]
+      editorRect = r
+      let charW = max(1, measureText(app.font, "0").w)
+      fillRect(r, bg)
+      fillRect(rect(r.x, r.y, r.w, lineH), app.theme.tabBarBg)
+      discard drawText(app.font, r.x + 6, r.y,
+        "DIFF  " & app.diffTitle & "     Esc/q close · wheel scroll",
+        app.theme.chipActiveFg, app.theme.tabBarBg)
+      let bodyY = r.y + lineH
+      let rows = max(1, (r.h - lineH) div lineH)
+      if e.kind == MouseWheelEvent and lastMouse.x >= r.x and lastMouse.x < r.x + r.w and
+         lastMouse.y >= r.y and lastMouse.y < r.y + r.h:
+        app.diffScroll += e.y * 3
+      let total = app.diffL.len
+      app.diffScroll = max(0, min(app.diffScroll, max(0, total - rows)))
+      let colW = (r.w - 4) div 2
+      let leftX = r.x
+      let rightX = r.x + colW + 4
+      let redFg = app.theme.ed.fg[TokenClass.Red]
+      let greenFg = app.theme.ed.fg[TokenClass.Green]
+      let removedBg = blend(bg, redFg, 22)
+      let addedBg = blend(bg, greenFg, 22)
+      let gapBg = blend(bg, app.theme.dimFg, 12)
+      fillRect(rect(r.x + colW + 1, bodyY, 2, r.h - lineH), app.theme.dividerColor)
+      var y = bodyY
+      for idx in app.diffScroll ..< min(total, app.diffScroll + rows):
+        let lk = app.diffLK[idx]; let rk = app.diffRK[idx]
+        let lbg = if lk == '-': removedBg elif rk == '+': gapBg else: bg
+        let rbg = if rk == '+': addedBg elif lk == '-': gapBg else: bg
+        let lfg = if lk == '-': redFg else: app.theme.ed.fg[TokenClass.None]
+        let rfg = if rk == '+': greenFg else: app.theme.ed.fg[TokenClass.None]
+        fillRect(rect(leftX, y, colW, lineH), lbg)
+        fillRect(rect(rightX, y, r.x + r.w - rightX, lineH), rbg)
+        discard drawText(app.font, leftX + 4, y,
+          (if lk == '-': "- " else: "  ") & app.diffL[idx], lfg, lbg)
+        discard drawText(app.font, rightX + 4, y,
+          (if rk == '+': "+ " else: "  ") & app.diffR[idx], rfg, rbg)
+        y += lineH
+    elif cells.hasKey("editor"):
       editorRect = cells["editor"]
       let act = app.ed.draw(evFor("editor"), editorRect, focused = app.focus == "editor" and not overlay)
       if act.kind == ctrlClick:              # Ctrl+click an org link -> open it
