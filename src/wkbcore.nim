@@ -280,38 +280,78 @@ proc sshControlPath*(): string =
   ## marker sessions, so a password host is authenticated ONCE.
   getHomeDir() / ".ssh" / "wkb-cm-%C"
 
-proc remoteSpec(base: ReplSpec; host: string): ReplSpec =
+proc remoteSpec(base: ReplSpec; host: string; dir = ""): ReplSpec =
   ## Wrap a REPL spec to run on `host` over ssh, so an org block executes on a
   ## remote machine and its output is captured the same way. `ssh -tt` forces a
   ## remote pty; the spec's env (PS1=, PYTHON_BASIC_REPL=1) is set remotely via
   ## `env`; ControlPath reuses an already-authenticated master (no password
-  ## prompt -- see ensureSshMaster / the interactive login step).
+  ## prompt). `dir` (if given) is the remote working directory (cd + exec).
   result = base
-  var argv = @["ssh", "-tt",
+  let ctrl = @["ssh", "-tt",
                "-o", "ControlPath=" & sshControlPath(),
                "-o", "ControlMaster=auto",
                "-o", "ControlPersist=" & gSshPersist, host]
+  var remote: seq[string]
   if base.env.len > 0:
-    argv.add "env"
-    for (k, v) in base.env: argv.add k & "=" & v
-  argv.add base.argv
-  result.argv = argv
+    remote.add "env"
+    for (k, v) in base.env: remote.add k & "=" & v
+  remote.add base.argv
+  if dir.len > 0:
+    var cmd = "cd " & quoteShell(dir) & " && exec"
+    for a in remote: cmd.add " " & quoteShell(a)
+    result.argv = ctrl & @["sh", "-c", cmd]
+  else:
+    result.argv = ctrl & remote
   result.env = @[]           # applied remotely via `env` above, not locally
 
-proc getSession*(app: var App; lang, name: string): Session =
-  ## A session named "name@host" runs on `host` over ssh (remote REPL); a plain
-  ## name runs locally.
+proc getSession*(app: var App; lang, name: string; dir = ""): Session =
+  ## A session named "name@host" runs on `host` over ssh (remote REPL, in `dir`
+  ## if given); a plain name runs locally. `dir` is used only when creating.
   let key = lang.toLowerAscii & "/" & name
   if app.sessions.hasKey(key) and app.sessions[key] != nil:
     return app.sessions[key]
   if not gRepls.hasKey(lang.toLowerAscii): return nil
   let base = gRepls[lang.toLowerAscii]
   let at = name.rfind('@')
-  let spec = if at >= 0 and at < name.len - 1: remoteSpec(base, name[at + 1 .. ^1])
+  let spec = if at >= 0 and at < name.len - 1: remoteSpec(base, name[at + 1 .. ^1], dir)
              else: base
   let s = startSession(spec)
   if s != nil: app.sessions[key] = s
   s
+
+const headerArgKeys = ["session", "dir", "results", "exports", "tangle", "eval",
+  "var", "cache", "noweb", "comments", "padline", "hlines", "colnames",
+  "rownames", "wrap", "file", "output-dir", "mkdirp", "ssh"]
+
+proc parseSshDir*(v: string): tuple[host, path: string] =
+  ## `/ssh:user@host:/path` -> (user@host, /path); a plain path -> ("", path).
+  if v.startsWith("/ssh:"):
+    let d = v[5 .. ^1]
+    let c = d.find(':')
+    if c >= 0: (d[0 ..< c], d[c + 1 .. ^1]) else: (d, "")
+  else: ("", v)
+
+proc headerArgTokens*(app: App; lang: string): seq[string] =
+  ## Default header args for `lang` from `#+PROPERTY: header-args[:LANG| LANG] ...`
+  ## lines (both "header-args:R" and the "header-args R" spacing are accepted;
+  ## all-language props first, language-specific appended so they win).
+  var allLang, langSpec: seq[string]
+  for i in 0 ..< app.ed.getLineCount():
+    let ln = strutils.strip(app.ed.getLineText(i))
+    if not ln.toLowerAscii.startsWith("#+property:"): continue
+    var rest = strutils.strip(ln[ln.find(':') + 1 .. ^1])
+    if not rest.toLowerAscii.startsWith("header-args"): continue
+    rest = strutils.strip(rest["header-args".len .. ^1])
+    let toks = strutils.splitWhitespace(rest)
+    if toks.len == 0: continue
+    var propLang = ""
+    var start = 0
+    let key0 = toks[0].strip(chars = {':'}).toLowerAscii
+    if not (toks[0].startsWith(":") and key0 in headerArgKeys):
+      propLang = key0; start = 1                 # a language token (":R" or "R")
+    if propLang.len == 0: allLang.add toks[start .. ^1]
+    elif propLang == lang.toLowerAscii: langSpec.add toks[start .. ^1]
+  allLang & langSpec
 
 proc currentSession*(app: var App): Session =
   ## The session the bottom pane tracks as a live terminal, or nil.
@@ -1238,23 +1278,32 @@ proc babelExecute*(app: var App) =
 
   let hdr = strutils.splitWhitespace(header)
   let lang = if hdr.len >= 2: hdr[1] else: ""
-  var sessName = "default"
-  var host = ""
-  var k = 2
-  while k < hdr.len:
-    if hdr[k] == ":session" and k + 1 < hdr.len: sessName = hdr[k + 1]
-    elif hdr[k] == ":ssh" and k + 1 < hdr.len: host = hdr[k + 1]
-    elif hdr[k] == ":dir" and k + 1 < hdr.len and hdr[k + 1].startsWith("/ssh:"):
-      let d = hdr[k + 1][5 .. ^1]                  # /ssh:user@host:/path -> user@host
-      let c = d.find(':')
-      host = (if c >= 0: d[0 ..< c] else: d)
-    inc k
+  var sessName, host, dir = ""
+  # Parse :session / :ssh / :dir from a token list; only fill unset fields (so
+  # the BLOCK header wins over document #+PROPERTY defaults, applied after).
+  proc apply(toks: seq[string]) =
+    var k = 0
+    while k < toks.len:
+      if toks[k] == ":session" and k + 1 < toks.len and sessName.len == 0:
+        sessName = toks[k + 1]
+      elif toks[k] == ":ssh" and k + 1 < toks.len and host.len == 0:
+        host = toks[k + 1]
+      elif toks[k] == ":dir" and k + 1 < toks.len and dir.len == 0 and host.len == 0:
+        let (h, p) = parseSshDir(toks[k + 1])
+        if h.len > 0: host = h
+        dir = p
+      inc k
+  apply(strutils.splitWhitespace(header)[2 .. ^1])   # the block header first
+  apply(headerArgTokens(app, lang))                  # then document defaults
+  if sessName.len == 0: sessName = "default"
   if host.len > 0 and '@' notin sessName: sessName = sessName & "@" & host
   if host.len > 0 and not ensureSshMaster(app, host): return   # authenticate first
 
   var bodyLines: seq[string]
   for i in b + 1 ..< e: bodyLines.add app.ed.getLineText(i)
   app.curLang = lang.toLowerAscii; app.curSession = sessName   # keys are lower-lang
+  # `dir` (remote cwd) is parsed from :dir only to recover the host; running the
+  # block IN that dir is deferred -- for now we just send code and capture results.
   let s = getSession(app, lang, sessName)
   if s == nil: app.msg = "no session for '" & lang & "'"; return
   let outp = s.runBlock(dedentBody(bodyLines))
