@@ -26,15 +26,20 @@ jobs:
   build:
     name: Build ${{ matrix.config.label }}
     runs-on: ${{ matrix.config.os }}
+    timeout-minutes: 45          # fail a hung build instead of blocking the release
 
     strategy:
       fail-fast: false
       matrix:
         config:
           - { os: ubuntu-22.04,   label: linux_x86_64,  exe: '',     nim: '2.2.6' }
-          - { os: macos-13,       label: macos_x86_64,  exe: '',     nim: '2.2.6' }
           - { os: macos-latest,   label: macos_arm64,   exe: '',     nim: '2.2.6' }
           - { os: windows-latest, label: windows_x86_64, exe: '.exe', nim: '2.2.6' }
+          # NOTE: the macOS x86_64 leg (runs-on: macos-13, Intel) is dropped --
+          # that runner never got scheduled and left every release job stuck in
+          # `needs: build`, so no release ever published. macos-latest (Apple
+          # Silicon / arm64) covers current Macs; Intel Mac users build from
+          # source until a reliable Intel runner is available.
 
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +106,9 @@ jobs:
   release:
     name: Create GitHub Release
     needs: build
+    # Publish whatever built even if a platform leg fails/regresses -- don't let
+    # one broken platform block the release. (Skips only if the run is cancelled.)
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
