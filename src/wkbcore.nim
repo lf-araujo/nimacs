@@ -122,6 +122,8 @@ var
   gInlineImageWidth* = 0                   ## default inline image width in px
                                            ## (org #+ATTR_* :width overrides it);
                                            ## 0 = use each image's native size
+  gLatexDpi* = 140                         ## dvipng resolution for M-x latex-preview
+                                           ## math images (higher = larger/crisper)
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -969,6 +971,57 @@ proc applyCriticMarkup*(text: string; accept: bool): string =
         if e >= 0: (i = e + 1; continue)   # drop the comment entirely
     result.add text[i]; inc i
 
+proc collectLatexHeader(app: App): string =
+  ## Extra preamble from the buffer's `#+LATEX_HEADER:` lines (org convention),
+  ## so user macros / packages are available to previews.
+  for i in 0 ..< app.ed.getLineCount():
+    let s = strutils.strip(app.ed.getLineText(i))
+    if s.toLowerAscii.startsWith("#+latex_header:"):
+      result.add strutils.strip(s[s.find(':') + 1 .. ^1]) & "\n"
+
+proc renderLatexFragment(inner, header, outPng: string): bool =
+  ## Compile one display-math fragment to `outPng` via latex -> dvipng (black on
+  ## white). Returns false if the toolchain is missing or compilation fails.
+  let tmp = getTempDir() / "wkbenchless-ltx"
+  try: createDir(tmp) except CatchableError: return false
+  let tex = tmp / "frag.tex"
+  writeFile(tex,
+    "\\documentclass[12pt]{article}\n" &
+    "\\usepackage{amsmath,amssymb,amsfonts}\n" & header &
+    "\\pagestyle{empty}\n\\begin{document}\n\\[\n" & inner &
+    "\n\\]\n\\end{document}\n")
+  let (_, c1) = execCmdEx("latex -interaction=nonstopmode -halt-on-error " &
+                          quoteShell(tex), workingDir = tmp)
+  if c1 != 0: return false
+  let (_, c2) = execCmdEx("dvipng -q -T tight -D " & $gLatexDpi &
+                          " -bg White -o " & quoteShell(outPng) & " " &
+                          quoteShell(tmp / "frag.dvi"), workingDir = tmp)
+  result = c2 == 0 and fileExists(outPng)
+
+proc latexPreview*(app: var App) =
+  ## Toggle inline LaTeX previews (org-latex-preview style). On enable, render
+  ## every whole-line display-math fragment ($$..$$, \[..\], \(..\), $..$) to a
+  ## cached PNG the buffer then shows in place; the source returns while the
+  ## cursor is on that line, or when toggled off.
+  let on = rfLatexPreview notin app.ed.flags
+  app.ed.setRenderFlag(rfLatexPreview, on)
+  if not on:
+    app.msg = "latex preview off"; return
+  if findExe("latex").len == 0 or findExe("dvipng").len == 0:
+    app.ed.setRenderFlag(rfLatexPreview, false)
+    app.msg = "latex preview needs `latex` and `dvipng` on PATH"; return
+  let header = collectLatexHeader(app)
+  try: createDir(getCacheDir() / "wkbenchless" / "ltximg") except CatchableError: discard
+  var made, failed = 0
+  for i in 0 ..< app.ed.getLineCount():
+    var inner = ""
+    if parseMathLine(app.ed.getLineText(i), inner):
+      let outPng = ltxCachePath(app.ed.getLineText(i))
+      if not fileExists(outPng):
+        if renderLatexFragment(inner, header, outPng): inc made else: inc failed
+  app.msg = "latex preview on (" & $made & " rendered" &
+            (if failed > 0: ", " & $failed & " failed" else: "") & ")"
+
 proc cancelOverlays*(app: var App) =
   ## Keyboard-quit (C-g): dismiss the command palette / find minibuffer overlays.
   app.paletteActive = false
@@ -1753,7 +1806,8 @@ proc registerBuiltins*() =
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
-  defcommand("toggle-inline-images", "Images: toggle inline [[file:x.bmp]] rendering", toggleInlineImages)
+  defcommand("toggle-inline-images", "Images: toggle inline [[file:x.png]] rendering", toggleInlineImages)
+  defcommand("latex-preview", "LaTeX: toggle inline previews of display math", latexPreview)
   defcommand("cancel", "Cancel / dismiss the palette or find overlay (C-g)", cancelOverlays)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
   defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)

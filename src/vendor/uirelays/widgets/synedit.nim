@@ -45,6 +45,7 @@ import uirelays/[coords, screen, input]
 import widgets/theme
 import std/strutils
 import std/os
+import std/[osproc, hashes]   # convert non-BMP images to a cached BMP on load
 export theme
 
 const
@@ -63,6 +64,8 @@ type
   RenderFlag* = enum
     rfInlineImages,     ## Render whole-line image links inline: Markdown
                         ## ![alt](path) and org [[file:path]] / [[path]]
+    rfLatexPreview,     ## Render whole-line LaTeX math ($$..$$, \[..\], $..$)
+                        ## as the cached image produced by M-x latex-preview
     rfColorLiterals     ## Draw color chips for #RGB/#RRGGBB/#RRGGBBAA
 
 const
@@ -2341,6 +2344,26 @@ proc tryParseHexColor(text: string; start: int; c: var Color; consumed: var int)
   consumed = n + 1
   result = true
 
+proc toLoadableBmp(src: string): string =
+  ## The driver decodes BMP; for any other format (PNG, JPG, …) convert to a
+  ## cached 24-bit BMP with ImageMagick (transparency flattened over white),
+  ## keyed by path + size so it converts once. Returns "" if the source is
+  ## missing or conversion fails (ImageMagick absent, unreadable, …).
+  if not fileExists(src): return ""
+  if src.toLowerAscii.endsWith(".bmp"): return src
+  var key = src
+  try: key.add ":" & $getFileSize(src) except CatchableError: discard
+  let cacheDir = getCacheDir() / "wkbenchless" / "imgcache"
+  let outp = cacheDir / (toHex(hash(key).uint64) & ".bmp")
+  if fileExists(outp): return outp
+  try: createDir(cacheDir) except CatchableError: discard
+  let args = " -background white -flatten -type TrueColor " &
+             quoteShell("BMP3:" & outp)
+  for tool in ["magick ", "convert "]:            # IMv7 `magick`, else legacy
+    let (_, code) = execCmdEx(tool & quoteShell(src) & args)
+    if code == 0 and fileExists(outp): return outp
+  result = ""
+
 proc getCachedImage(s: var SynEdit; path: string): Image =
   for e in s.imageCache:
     if e.path == path:
@@ -2350,13 +2373,15 @@ proc getCachedImage(s: var SynEdit; path: string): Image =
   if resolved.len > 0 and resolved[0] == '~': resolved = expandTilde(resolved)
   elif not isAbsolute(resolved) and s.imageBaseDir.len > 0:
     resolved = s.imageBaseDir / resolved
-  let img = loadImage(resolved)
+  let loadable = toLoadableBmp(resolved)          # PNG/JPG/… -> cached BMP
+  let img = if loadable.len > 0: loadImage(loadable) else: Image(0)
   s.imageCache.add ImageCacheEntry(path: path, img: img)
   result = img
 
 proc isImagePath(path: string): bool =
-  ## Path with a recognised raster/vector image extension. (Only BMP renders
-  ## today; others still reserve space and show a labelled placeholder.)
+  ## Path with a recognised raster/vector image extension. BMP loads directly;
+  ## other formats are converted on load (see toLoadableBmp). If conversion is
+  ## unavailable the line still reserves space and shows a labelled placeholder.
   const exts = [".bmp", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
                 ".tif", ".tiff", ".ppm"]
   let low = path.toLowerAscii
@@ -2404,6 +2429,32 @@ proc parseImageLinkPath(line: string; path: var string): bool =
     if inner.startsWith("file:"): inner = inner[5 .. ^1]
     path = inner
     return path.len > 0 and isImagePath(path)
+
+proc parseMathLine*(line: string; inner: var string): bool =
+  ## A whole line that is a single display-math fragment; sets `inner` to the
+  ## math body with delimiters stripped. Recognises $$..$$, \[..\], \(..\) and
+  ## a whole-line $..$.
+  let t = line.strip
+  if t.len < 3: return
+  template body(a, b: string): string =
+    (if t.startsWith(a) and t.endsWith(b) and t.len >= a.len + b.len:
+       t[a.len ..< t.len - b.len].strip else: "")
+  var m = body("$$", "$$")
+  if m.len == 0: m = body("\\[", "\\]")
+  if m.len == 0: m = body("\\(", "\\)")
+  if m.len == 0 and t.len >= 3 and t[0] == '$' and t[^1] == '$' and
+     not t.startsWith("$$"):
+    m = t[1 ..< t.len - 1].strip
+  if m.len == 0: return
+  inner = m
+  result = true
+
+proc ltxCachePath*(lineText: string): string =
+  ## Deterministic PNG cache path for a math line's rendered image -- identical
+  ## for the renderer (lookup) and `M-x latex-preview` (generation), so no
+  ## shared state is needed, only the line's (trimmed) text.
+  getCacheDir() / "wkbenchless" / "ltximg" /
+    (toHex(hash(lineText.strip).uint64) & ".png")
 
 proc attrDim(line, key: string): int =
   ## Leading integer after `:key` in an org attribute line (units ignored), or 0.
@@ -2466,7 +2517,15 @@ proc renderMarkdownImageLine(
     line.add s[p]
 
   var imgPath = ""
-  if not parseImageLinkPath(line, imgPath):
+  var handled = false
+  if rfInlineImages in s.flags and parseImageLinkPath(line, imgPath):
+    handled = true                                  # image link (relative ok)
+  if not handled and rfLatexPreview in s.flags:     # cached LaTeX math preview
+    var inner = ""
+    if parseMathLine(line, inner):
+      let cp = ltxCachePath(line)
+      if fileExists(cp): imgPath = cp; handled = true   # else: show source
+  if not handled:
     return
 
   # Keep source visible while actively editing this line.
@@ -2497,8 +2556,8 @@ proc renderMarkdownImageLine(
     if tw > maxW: th = max(1, th * maxW div tw); tw = maxW   # fit width, keep aspect
     if th > maxH: tw = max(1, tw * maxH div th); th = maxH   # fit height, keep aspect
   else:
-    # Placeholder box (backend without image relays, or a not-yet-decodable
-    # format like PNG): no native aspect to honour.
+    # Placeholder box (backend without image relays, or a format that could not
+    # be loaded/converted): no native aspect to honour.
     tw = if wantW > 0: min(wantW, maxW) else: min(maxW, max(240, maxW div 2))
     th = min(maxH, if wantH > 0: wantH else: lineH * 6)
 
@@ -2989,7 +3048,7 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
 
     var nextI = i
     var consumedRows = 1
-    if rfInlineImages in s.flags:
+    if rfInlineImages in s.flags or rfLatexPreview in s.flags:
       if s.renderMarkdownImageLine(i, dim, endX, endY, lineH, showCursor, nextI, consumedRows):
         i = nextI
         inc s.span, consumedRows

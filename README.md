@@ -29,10 +29,9 @@ languages, and themes are data, and `C-c r` recompiles and restarts *in place*,
   bottom pane is a live terminal — type at it interactively *and* run blocks
   against the same process (shared state). `C-c s` cycles sessions/terminals,
   `C-c k` opens a bash session.
-- **Embedded terminal + Claude**: `M-t` opens a bash terminal in the bottom
-  pane; `C-c a` runs Claude Code in it (continuing your last conversation). A
-  built-in **VT/ANSI screen emulator** renders cursor-addressed TUIs — `claude`,
-  `top`, `vim` — correctly, with colors, mouse text-selection (drag to copy),
+- **Embedded terminal**: `M-t` opens a bash terminal in the bottom pane. A
+  built-in **VT/ANSI screen emulator** renders cursor-addressed TUIs — `top`,
+  `htop`, `vim` — correctly, with colors, mouse text-selection (drag to copy),
   and wheel scrollback. Terminals are first-class tabs alongside sessions.
 - **Src-edit** (`C-c e` / `C-c b`): zoom into a block as a real code file with
   LSP + highlighting, then splice it back. `C-c t` tangles a whole session.
@@ -45,11 +44,15 @@ languages, and themes are data, and `C-c r` recompiles and restarts *in place*,
   label. Click (or `C-c C-o`) follows a link — **`[[file:…]]` to a text/source
   file opens it in the editor**, URLs and other files hand off to the system.
 - **Inline figures**: whole-line image links render right in the buffer, Emacs
-  org-mode style — `[[file:fig.bmp]]` or `![](fig.bmp)`. Shown at the image's
+  org-mode style — `[[file:fig.png]]` or `![](fig.png)`. Shown at the image's
   own dimensions by default; size a figure with a preceding `#+ATTR_ORG: :width
   N` (aspect ratio preserved) or set a default with `gInlineImageWidth`. Toggle
-  with `M-x toggle-inline-images`. (BMP decodes today; other formats show a
-  labelled placeholder — more to come.)
+  with `M-x toggle-inline-images`. PNG/JPG/GIF/… load via a cached conversion
+  (needs ImageMagick); BMP decodes natively.
+- **LaTeX previews**: `M-x latex-preview` renders whole-line display math —
+  `$$…$$`, `\[…\]`, `\(…\)`, `$…$` — to images shown in place (org-latex-preview
+  style), via `latex` + `dvipng`. `#+LATEX_HEADER:` lines feed the preamble; the
+  source returns while the cursor is on the line. `gLatexDpi` sets the size.
 - **Remote sessions over SSH**: a `:session name@host` header — or a
   document-level `#+PROPERTY: header-args LANG :session … :ssh host` — runs
   blocks on a remote interpreter over a multiplexed SSH connection and captures
@@ -107,13 +110,12 @@ proc configure*(app: var App) =
   bindkey("C-c d", "insert-date")
   registerRepl("python", pySpec)                 # teach it a language
   registerTheme("mine", [rgb(0x1e1e2e), …16…])   # add a base16 theme
-  gClaudeCmd = "claude --continue"               # what C-c a runs
   addExecPath("~/.local/bin")                    # extend PATH for sessions
   addHook("startup", proc(a: var App) = a.msg = "ready")
 ```
 
 Sessions and terminals inherit a PATH seeded from your **login shell**
-(`$SHELL -lc`), so they find R / python / claude even when launched from a GUI;
+(`$SHELL -lc`), so they find R / python / latex even when launched from a GUI;
 add more with `addExecPath`.
 
 `C-c r` needs a Nim + C compiler. To work without a system toolchain, bundle one
@@ -123,7 +125,7 @@ next to the binary: `nimble bundle -- /path/to/zig` (see
 ## Agent control (`wkbctl`)
 
 `wkbctl` is a tiny CLI that drives a running editor over a Unix-domain control
-socket — handy for scripts and for **Claude running in the embedded terminal**:
+socket — handy for scripts and for agents running in the embedded terminal:
 
 ```sh
 wkbctl buffer                          # print the current buffer
