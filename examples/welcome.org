@@ -64,16 +64,32 @@ friends load via a cached conversion (needs ImageMagick); BMP decodes natively.
 
 * LaTeX previews
 
-=M-x latex-preview= renders whole-line display math to images shown in place
+=M-x latex-preview= renders display math to images shown in place
 (org-latex-preview style), via =latex= + =dvipng=. Put the cursor on a formula
-line to edit its source; toggle the command again to turn previews off.
-
-\[
-\hat{\beta} = (X^\top X)^{-1} X^\top y, \qquad
-\sigma^2 = \frac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2
-\]
+line to edit its source; toggle the command again to turn previews off. Each
+fragment must sit on its **own line**, delimited by =$$..$$=, =\[..\]=,
+=\(..\)= or =$..$=:
 
 $$ e^{i\pi} + 1 = 0 $$
+
+$$ \hat{\beta} = (X^\top X)^{-1} X^\top y, \qquad \sigma^2 = \tfrac{1}{n}\sum_{i=1}^{n}(y_i - \hat{y}_i)^2 $$
+
+The classic ACE twin model -- phenotypic variance split into additive-genetic,
+shared-environment and unique-environment components, with the implied MZ/DZ
+correlations and Falconer's heritability:
+
+$$ V_P = V_A + V_C + V_E $$
+
+$$ r_{MZ} = a^2 + c^2, \qquad r_{DZ} = \tfrac{1}{2}a^2 + c^2 $$
+
+$$ h^2 = \frac{V_A}{V_P} = 2\,(r_{MZ} - r_{DZ}) $$
+
+Anything in a =#+LATEX_HEADER:= line joins the preamble, so your macros and
+packages are available:
+
+#+LATEX_HEADER: \newcommand{\E}{\mathbb{E}}
+
+$$ \E[Y \mid X] = X\beta $$
 
 * Editing code with LSP
 
