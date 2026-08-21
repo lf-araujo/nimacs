@@ -335,10 +335,10 @@ proc main() =
     app.ed.lang = langOrg                  # before setText, so org highlights now
     app.docLang = ""
     app.ed.setText(welcomeOrg)
-    app.ed.setRenderFlag(rfInlineImages)   # the welcome shows its demo figure
     app.ed.imageDefaultWidth = gInlineImageWidth
     const exDir = currentSourcePath().parentDir.parentDir / "examples"
     if dirExists(exDir): app.ed.imageBaseDir = exDir   # so [[file:figure.bmp]] resolves
+    app.applyOrgStartup()                  # welcome's #+STARTUP: inlineimages / latexpreview
     app.ed.foldAllPending = true
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0

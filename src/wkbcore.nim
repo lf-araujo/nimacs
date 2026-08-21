@@ -448,6 +448,8 @@ proc noteRecentFile*(path: string) =
     writeFile(recentFilesPath(), seen.join("\n"))
   except CatchableError: discard
 
+proc applyOrgStartup*(app: var App)   # fwd decl: honours #+STARTUP: on open
+
 proc openFile*(app: var App; path: string) =
   noteRecentFile(path)
   for i, b in app.buffers:
@@ -472,6 +474,7 @@ proc openFile*(app: var App; path: string) =
   app.syncActive()
   app.buffers.add BufferState(ed: ed, filePath: path, docLang: extToLangId(ext))
   app.activate(app.buffers.high)
+  applyOrgStartup(app)                         # #+STARTUP: latexpreview / inlineimages
   app.msg = "opened " & extractFilename(path)
 
 # -- palette entries (commands / buffers / files) --------------------------
@@ -998,18 +1001,13 @@ proc renderLatexFragment(inner, header, outPng: string): bool =
                           quoteShell(tmp / "frag.dvi"), workingDir = tmp)
   result = c2 == 0 and fileExists(outPng)
 
-proc latexPreview*(app: var App) =
-  ## Toggle inline LaTeX previews (org-latex-preview style). On enable, render
-  ## every whole-line display-math fragment ($$..$$, \[..\], \(..\), $..$) to a
-  ## cached PNG the buffer then shows in place; the source returns while the
-  ## cursor is on that line, or when toggled off.
-  let on = rfLatexPreview notin app.ed.flags
-  app.ed.setRenderFlag(rfLatexPreview, on)
-  if not on:
-    app.msg = "latex preview off"; return
+proc enableLatexPreview(app: var App): bool =
+  ## Turn on LaTeX previews and render every whole-line display-math fragment
+  ## ($$..$$, \[..\], \(..\), $..$) to a cached PNG. Returns false (and leaves
+  ## the flag off) when the toolchain is missing.
   if findExe("latex").len == 0 or findExe("dvipng").len == 0:
-    app.ed.setRenderFlag(rfLatexPreview, false)
-    app.msg = "latex preview needs `latex` and `dvipng` on PATH"; return
+    app.msg = "latex preview needs `latex` and `dvipng` on PATH"; return false
+  app.ed.setRenderFlag(rfLatexPreview, true)
   let header = collectLatexHeader(app)
   try: createDir(getCacheDir() / "wkbenchless" / "ltximg") except CatchableError: discard
   var made, failed = 0
@@ -1021,6 +1019,28 @@ proc latexPreview*(app: var App) =
         if renderLatexFragment(inner, header, outPng): inc made else: inc failed
   app.msg = "latex preview on (" & $made & " rendered" &
             (if failed > 0: ", " & $failed & " failed" else: "") & ")"
+  true
+
+proc latexPreview*(app: var App) =
+  ## Toggle inline LaTeX previews (org-latex-preview style); the source returns
+  ## while the cursor is on a line, or when toggled off.
+  if rfLatexPreview in app.ed.flags:
+    app.ed.setRenderFlag(rfLatexPreview, false); app.msg = "latex preview off"
+  else:
+    discard enableLatexPreview(app)
+
+proc applyOrgStartup*(app: var App) =
+  ## Honour Emacs `#+STARTUP:` toggles when a document is opened:
+  ## `inlineimages` / `noinlineimages` and `latexpreview` (rendered on open,
+  ## like org-startup-with-latex-preview). Unknown tokens are ignored.
+  var toks: seq[string]
+  for i in 0 ..< app.ed.getLineCount():
+    let s = strutils.strip(app.ed.getLineText(i)).toLowerAscii
+    if s.startsWith("#+startup:"):
+      for t in strutils.splitWhitespace(s["#+startup:".len .. ^1]): toks.add t
+  if "noinlineimages" in toks: app.ed.setRenderFlag(rfInlineImages, false)
+  elif "inlineimages" in toks: app.ed.setRenderFlag(rfInlineImages, true)
+  if "latexpreview" in toks: discard enableLatexPreview(app)
 
 proc cancelOverlays*(app: var App) =
   ## Keyboard-quit (C-g): dismiss the command palette / find minibuffer overlays.

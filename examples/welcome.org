@@ -1,5 +1,6 @@
 #+TITLE: Welcome to wkbenchless
 #+AUTHOR: wkbenchless
+#+STARTUP: latexpreview inlineimages
 
 * Getting started
 
@@ -68,7 +69,9 @@ friends load via a cached conversion (needs ImageMagick); BMP decodes natively.
 (org-latex-preview style), via =latex= + =dvipng=. Put the cursor on a formula
 line to edit its source; toggle the command again to turn previews off. Each
 fragment must sit on its **own line**, delimited by =$$..$$=, =\[..\]=,
-=\(..\)= or =$..$=:
+=\(..\)= or =$..$=. (This buffer opens with previews already on, from the
+=#+STARTUP: latexpreview inlineimages= line at the top -- just like Emacs
+org-mode.)
 
 $$ e^{i\pi} + 1 = 0 $$
 
