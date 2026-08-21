@@ -5,15 +5,15 @@
 ## SynEdit types the host uses. Commands are Nim procs; keys and languages are
 ## data; hooks fire at editor events.
 
-import uirelays
-import vendor/synedit          # our patched copy of uirelays' SynEdit (adds langR/langOrg)
+import uirelays              # vendored: src/vendor/uirelays (see config.nims path)
+import widgets/synedit          # our patched SynEdit (langR/langOrg, inline images)
 import wkbsession
 import wkblsp                    # pure std/json LSP client -- portable, no GTK
-import std/[tables, strutils, os, osproc, algorithm]
+import std/[tables, strutils, os, osproc, algorithm, times]
 when defined(posix): import std/posix
 
 export uirelays, synedit, wkbsession, wkblsp   # config sees Event/SynEdit/ReplSpec/LspClient/...
-  # `synedit` above is src/vendor/synedit
+  # uirelays + `synedit` above come from the vendored tree in src/vendor/uirelays
 
 type
   App* = object
@@ -117,8 +117,11 @@ var
   gThemes*: seq[AppTheme]                 ## themes the config registers (palette picks one)
   gExtraPaths*: seq[string]               ## dirs to prepend to PATH (config; ~ ok)
   gLoadLoginPath* = true                  ## seed PATH from the login shell at startup
-  gClaudeCmd* = "claude --continue"       ## command the `claude` action runs (config)
+  gClaudeCmd* = "claude --continue || claude"  ## command the `claude` action runs (config)
   gSshPersist* = "600"                    ## seconds an ssh master connection persists
+  gInlineImageWidth* = 0                   ## default inline image width in px
+                                           ## (org #+ATTR_* :width overrides it);
+                                           ## 0 = use each image's native size
 
 # -- registry (the config surface) -----------------------------------------
 proc defcommand*(name, label: string; run: proc(app: var App)) =
@@ -458,6 +461,10 @@ proc openFile*(app: var App; path: string) =
   try: ed.loadFromFile(path)
   except CatchableError:
     app.msg = "could not open " & path; return
+  if ed.lang in {langOrg, langMarkdown}:
+    ed.setRenderFlag(rfInlineImages)          # [[file:x.bmp]] / ![](x.bmp) inline
+    ed.imageBaseDir = parentDir(path)         # resolve relative image paths here
+    ed.imageDefaultWidth = gInlineImageWidth  # 0 = native size
   if ed.lang == langOrg:
     ed.foldAllPending = true
   app.syncActive()
@@ -962,6 +969,23 @@ proc applyCriticMarkup*(text: string; accept: bool): string =
         if e >= 0: (i = e + 1; continue)   # drop the comment entirely
     result.add text[i]; inc i
 
+proc cancelOverlays*(app: var App) =
+  ## Keyboard-quit (C-g): dismiss the command palette / find minibuffer overlays.
+  app.paletteActive = false
+  app.searchActive = false
+  app.msg = ""
+
+proc toggleInlineImages*(app: var App) =
+  ## Toggle inline rendering of whole-line image links ([[file:x.bmp]] /
+  ## ![](x.bmp)) in the current buffer, resolving relative paths against the
+  ## file's directory (or the cwd for an unsaved buffer).
+  let on = rfInlineImages notin app.ed.flags
+  app.ed.setRenderFlag(rfInlineImages, on)
+  app.ed.imageBaseDir =
+    if app.filePath.len > 0: parentDir(app.filePath) else: getCurrentDir()
+  app.ed.imageDefaultWidth = gInlineImageWidth
+  app.msg = "inline images " & (if on: "on" else: "off")
+
 proc criticAcceptAll*(app: var App) =
   if app.ed.lang != langOrg: app.msg = "CriticMarkup is for org files"; return
   app.ed.setText(applyCriticMarkup(app.ed.fullText(), accept = true))
@@ -1397,6 +1421,37 @@ proc adoptHandoff*(app: var App): tuple[master: cint; pid: int; label: string; a
       elif f[0] == "T":
         result = (master: fd, pid: parseInt(f[2]), label: f[3], active: f[4] == "true")
 
+proc nimblePkgSourceDir(): string =
+  ## For a binary put on PATH by `nimble install <github-url>` (which lands in
+  ## ~/.nimble/bin while the sources live under ~/.nimble/pkgs2/<pkg>-<hash>/):
+  ## the newest wkbenchless-* package dir that actually carries the source.
+  for base in [getHomeDir() / ".nimble" / "pkgs2",
+               getHomeDir() / ".nimble" / "pkgs"]:
+    if not dirExists(base): continue
+    var best = ""
+    var bestT: times.Time
+    for kind, path in walkDir(base):
+      if kind == pcDir and lastPathPart(path).startsWith("wkbenchless-") and
+         fileExists(path / "src" / "wkbenchless.nim"):
+        let t = getLastModificationTime(path / "src" / "wkbenchless.nim")
+        if best.len == 0 or t > bestT: best = path; bestT = t
+    if best.len > 0: return best
+
+proc resolveBuildDir(): string =
+  ## Directory to run the reload rebuild in -- one that actually has src/.
+  ## In order: alongside the binary (working tree, or an install that kept its
+  ## source); the git checkout this binary was compiled from; else the nimble
+  ## package source dir (installed via a github URL). Falls back to getAppDir()
+  ## so the caller's existing "no src -> fail" message still fires if all miss.
+  if dirExists(getAppDir() / "src"): return getAppDir()
+  const SourceRoot = currentSourcePath().parentDir.parentDir  # <repo>/src/.. = <repo>
+  if dirExists(SourceRoot / ".git") and dirExists(SourceRoot / "src"):
+    return SourceRoot
+  let nimbleSrc = nimblePkgSourceDir()
+  if nimbleSrc.len > 0: return nimbleSrc
+  if dirExists(SourceRoot / "src"): return SourceRoot   # last resort: no .git, still there
+  return getAppDir()
+
 proc recompileConfig*(app: var App) =
   ## Hot-reload the config the honest way for compiled Nim (the xmonad model):
   ## rebuild the binary -- which recompiles wkbconfig.nim with it -- and, on
@@ -1407,7 +1462,11 @@ proc recompileConfig*(app: var App) =
     return
   else:
     app.msg = "recompiling..."
-    let dir = getAppDir()
+    # Rebuild from a directory that actually has the source (see resolveBuildDir).
+    # When the binary was `nimble install`ed, getAppDir() can be a binary-only
+    # dir with no src/, where rebuilding fails silently. This self-heals: a
+    # successful reload re-execs the freshly built binary from the resolved dir.
+    let dir = resolveBuildDir()
     if gRebuildCmd.len == 0: gRebuildCmd = detectRebuildCmd()
     let (outp, code) = execCmdEx(gRebuildCmd, workingDir = dir)
     if code != 0:
@@ -1694,6 +1753,8 @@ proc registerBuiltins*() =
   defcommand("zoom-out", "Decrease font size", zoomOut)
   defcommand("zoom-reset", "Reset font size", zoomReset)
   defcommand("open-link", "Open org link at cursor", openLink)
+  defcommand("toggle-inline-images", "Images: toggle inline [[file:x.bmp]] rendering", toggleInlineImages)
+  defcommand("cancel", "Cancel / dismiss the palette or find overlay (C-g)", cancelOverlays)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
   defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)
   defcommand("diff-buffer", "Diff: buffer vs saved file (two panes)", diffBuffer)

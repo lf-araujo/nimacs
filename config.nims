@@ -4,6 +4,11 @@ import std/os
 ## `import wkbcore` by name.
 switch("path", "src")
 
+## uirelays is vendored in-tree (src/vendor/uirelays) -- patched for inline
+## images and so releases build with no external UI dependency. This path makes
+## `import uirelays`, `import uirelays/…`, and `import widgets/…` resolve to it.
+switch("path", "src/vendor/uirelays")
+
 ## GTK4/libadwaita here come from a conda-forge env (this network's Zscaler
 ## proxy blocks gnu.org, which brew's from-source build of these needs --
 ## see DESIGN.md). Their dylibs use @rpath install names, so the binary

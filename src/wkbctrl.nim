@@ -40,7 +40,10 @@ proc handle(app: var App; req: string): string =
     result = s.runBlock(code)
   of "command":
     if parts.len > 1 and gCommands.hasKey(parts[1]):
-      gCommands[parts[1]].run(app); result = "ok: " & parts[1]
+      app.msg = ""
+      gCommands[parts[1]].run(app)
+      # Echo the resulting status line so scripts/agents can read outcome/state.
+      result = "ok: " & parts[1] & (if app.msg.len > 0: " -- " & app.msg else: "")
     else: result = "unknown command"
   of "diff":                             # show a side-by-side diff: body = OLD \x1e NEW
     let title = if parts.len > 1: parts[1] else: "diff"

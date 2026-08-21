@@ -28,14 +28,22 @@ proc facePath(suffix: string): string =
 
 const layoutBare =                         # no session yet: just the editor
   "(layout (editor) (divS (px 2)) (status (lines 1)))"
-const layoutPlain =                        # a session exists
-  "(layout (editor) (divH1 (px 2)) (session (lines 12)) (divS (px 2)) (status (lines 1)))"
-const layoutSrc =                          # the 4-quadrant src-edit env
+
+# The bottom (session) pane and the src-mode side column are user-resizable, so
+# their sizes arrive as pixels and the layout string is rebuilt whenever a
+# divider is dragged. The draggable dividers are divH1 (editor/session split),
+# divH2 (objects/help split) and divV (width of the objects/help column). divS
+# (above the status bar) stays a plain separator.
+proc layoutPlainStr(sessionH: int): string =   # a session exists
+  "(layout (editor) (divH1 (px 2)) (session (px " & $sessionH & "))" &
+  " (divS (px 2)) (status (lines 1)))"
+
+proc layoutSrcStr(sessionH, rightW, objectsH: int): string =   # 4-quadrant src env
   "(layout" &
   "  (cols" &
-  "    (rows (stretch 7) (editor (stretch 3)) (divH1 (px 2)) (session (stretch 2)))" &
+  "    (rows (editor (stretch 3)) (divH1 (px 2)) (session (px " & $sessionH & ")))" &
   "    (divV (px 2))" &
-  "    (rows (stretch 3) (objects (stretch 1)) (divH2 (px 2)) (help (stretch 1))))" &
+  "    (rows (px " & $rightW & ") (objects (px " & $objectsH & ")) (divH2 (px 2)) (help (stretch 1))))" &
   "  (divS (px 2))" &
   "  (status (lines 1)))"
 
@@ -350,9 +358,26 @@ proc main() =
     applyThemeByName(app, gState["theme"])
   app.runHooks("startup")
 
+  # Resizable panels (the host owns the layout): pixel sizes for the draggable
+  # panes, seeded from persisted UI state so they survive a restart and a hot
+  # reload, and written back when a drag ends.
+  proc stateInt(key: string; fallback: int): int =
+    if gState.hasKey(key):
+      try: return max(1, parseInt(gState[key]))
+      except ValueError: discard
+    fallback
+  proc clampi(v, lo, hi: int): int = max(lo, min(v, hi))
+  var paneSessionH = stateInt("pane.sessionH", 12 * lineH + 12)  # ~ old (lines 12)
+  var paneRightW   = stateInt("pane.rightW", 320)
+  var paneObjectsH = stateInt("pane.objectsH", 6 * lineH)
+  var dragDiv = ""                                     # divider being dragged, "" = none
+
   let layBare = parseLayout(layoutBare)
-  let layPlain = parseLayout(layoutPlain)
-  let laySrc = parseLayout(layoutSrc)
+  var layPlain = parseLayout(layoutPlainStr(paneSessionH))
+  var laySrc   = parseLayout(layoutSrcStr(paneSessionH, paneRightW, paneObjectsH))
+  proc rebuildLayouts() =
+    layPlain = parseLayout(layoutPlainStr(paneSessionH))
+    laySrc   = parseLayout(layoutSrcStr(paneSessionH, paneRightW, paneObjectsH))
   var lastMouse = (x: 0, y: 0)
   var pty = notRunningPty()               # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
@@ -489,7 +514,40 @@ proc main() =
               else: layBare
     let cells = resolve(lay, screen.width, screen.height, lineH)
 
-    if e.kind == MouseDownEvent:          # click a pane to focus it
+    # --- Draggable panel dividers -------------------------------------------
+    # Grab a divider (with a few px of tolerance around the 2px hairline), drag
+    # to resize the fixed pane, and persist the sizes on release. `cells` still
+    # holds this frame's geometry, so a move computes the new pixel size from
+    # the pane edge that stays put; the rebuilt layout tracks the pointer.
+    if e.kind == MouseDownEvent and e.button == LeftButton and dragDiv.len == 0:
+      for dn in ["divH1", "divH2", "divV"]:
+        if cells.hasKey(dn):
+          let r = cells[dn]
+          if e.x >= r.x - 3 and e.x < r.x + r.w + 3 and
+             e.y >= r.y - 3 and e.y < r.y + r.h + 3:
+            dragDiv = dn; consumed = true; break
+    elif e.kind == MouseUpEvent and dragDiv.len > 0:
+      setState("pane.sessionH", $paneSessionH)
+      setState("pane.rightW", $paneRightW)
+      setState("pane.objectsH", $paneObjectsH)
+      dragDiv = ""; consumed = true
+    elif e.kind == MouseMoveEvent and dragDiv.len > 0:
+      case dragDiv
+      of "divH1":                         # editor/session split: bottom pane height
+        if cells.hasKey("session"):
+          let s = cells["session"]
+          paneSessionH = clampi((s.y + s.h) - e.y, 3 * lineH, screen.height - 6 * lineH)
+      of "divH2":                         # objects/help split: objects height
+        if cells.hasKey("objects"):
+          let o = cells["objects"]
+          paneObjectsH = clampi(e.y - o.y, 2 * lineH, screen.height - 6 * lineH)
+      of "divV":                          # left/right split: side-column width
+        paneRightW = clampi(screen.width - e.x, 160, screen.width - 240)
+      else: discard
+      rebuildLayouts()
+      consumed = true
+
+    if e.kind == MouseDownEvent and dragDiv.len == 0:  # click a pane to focus it
       for nm in ["editor", "session", "objects", "help"]:
         if cells.hasKey(nm):
           let r = cells[nm]
@@ -747,7 +805,8 @@ proc main() =
       fillRect(cells["help"], sessBg)
       discard app.help.draw(evFor("help"), cells["help"], focused = app.focus == "help")
     for dn in dividerNames:
-      if cells.hasKey(dn): fillRect(cells[dn], app.theme.dividerColor)
+      if cells.hasKey(dn):
+        fillRect(cells[dn], if dn == dragDiv: statusFg else: app.theme.dividerColor)
     if cells.hasKey("status") and app.searchActive:
       drawSearch(app, cells["status"], lineH)
     elif cells.hasKey("status"):

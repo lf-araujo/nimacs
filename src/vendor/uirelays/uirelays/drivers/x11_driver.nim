@@ -1,0 +1,1189 @@
+# X11 + Xft backend driver. Sets all hooks from core/input and core/screen.
+# Uses Xlib for windowing/events, Xft for antialiased font rendering.
+# Double-buffered via X Pixmap.
+
+import ../coords, ../input, ../screen
+import std/[strutils, os]
+when defined(nimony):
+  {.feature: "lenientnils".}
+  import std/syncio  # for `quit`
+
+# All X11/Xft entry points below are loaded at runtime via the `dynlib`
+# pragma (dlopen of libX11.so / libXft.so), so no link-time `-lX11 -lXft`
+# is required and the dev packages need not be installed to build.
+
+# ---- Cross-compiler helpers ----
+# Nimony needs `toCString` for runtime string -> cstring; Nim uses the
+# `cstring` converter.
+
+proc cstr(s: var string): cstring =
+  when defined(nimony): toCString(s)
+  else: s.cstring
+
+# ---- POSIX timing (libc; works under Nim and Nimony) ----
+
+type
+  ClockId {.importc: "clockid_t", header: "<time.h>".} = distinct cint
+  Timespec {.importc: "struct timespec", header: "<time.h>".} = object
+    tv_sec: clong
+    tv_nsec: clong
+
+proc clock_gettime(clk: ClockId; tp: var Timespec): cint
+  {.importc, header: "<time.h>".}
+proc nanosleep(req: var Timespec; rem: var Timespec): cint
+  {.importc, header: "<time.h>".}
+
+proc sleepMs(ms: int) =
+  var req = Timespec(tv_sec: clong(ms div 1000),
+                     tv_nsec: clong((ms mod 1000) * 1_000_000))
+  var rem = Timespec(tv_sec: 0, tv_nsec: 0)
+  discard nanosleep(req, rem)
+
+# ---- X11 type definitions ----
+
+const
+  libX11 = "libX11.so(|.6)"
+  libXft = "libXft.so(|.2)"
+
+type
+  XID = culong
+  Atom = culong
+  XTime = culong
+  XKeySym = culong
+  XBool = cint
+  XStatus = cint
+
+  XRectangle {.pure.} = object
+    x, y: cshort
+    width, height: cushort
+
+  XColor {.pure, used.} = object
+    pixel: culong
+    red, green, blue: cushort
+    flags: uint8
+    pad: uint8
+
+  # ---- Event types ----
+
+  XAnyEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+
+  XKeyEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    root: XID
+    subwindow: XID
+    time: XTime
+    x, y: cint
+    x_root, y_root: cint
+    state: cuint
+    keycode: cuint
+    same_screen: XBool
+
+  XButtonEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    root: XID
+    subwindow: XID
+    time: XTime
+    x, y: cint
+    x_root, y_root: cint
+    state: cuint
+    button: cuint
+    same_screen: XBool
+
+  XMotionEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    root: XID
+    subwindow: XID
+    time: XTime
+    x, y: cint
+    x_root, y_root: cint
+    state: cuint
+    is_hint: uint8
+    same_screen: XBool
+
+  XConfigureEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    event: XID
+    window: XID
+    x, y: cint
+    width, height: cint
+    border_width: cint
+    above: XID
+    override_redirect: XBool
+
+  XExposeEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    x, y: cint
+    width, height: cint
+    count: cint
+
+  XClientMessageEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    message_type: Atom
+    format: cint
+    data: array[5, clong]
+
+  XFocusChangeEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    window: XID
+    mode: cint
+    detail: cint
+
+  XSelectionRequestEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    owner: XID
+    requestor: XID
+    selection: Atom
+    target: Atom
+    property: Atom
+    time: XTime
+
+  XSelectionEvent {.pure.} = object
+    theType: cint
+    serial: culong
+    send_event: XBool
+    display: pointer
+    requestor: XID
+    selection: Atom
+    target: Atom
+    property: Atom
+    time: XTime
+
+  XEvent {.union.} = object
+    theType: cint
+    xany: XAnyEvent
+    xkey: XKeyEvent
+    xbutton: XButtonEvent
+    xmotion: XMotionEvent
+    xconfigure: XConfigureEvent
+    xexpose: XExposeEvent
+    xclient: XClientMessageEvent
+    xfocus: XFocusChangeEvent
+    xselection: XSelectionEvent
+    xselectionrequest: XSelectionRequestEvent
+    pad: array[24, clong]  # XEvent is 192 bytes on 64-bit
+
+  # ---- Xft types ----
+
+  XRenderColor {.pure.} = object
+    red, green, blue, alpha: cushort
+
+  XftColor {.pure.} = object
+    pixel: culong
+    color: XRenderColor
+
+  XftFont {.pure.} = object
+    ascent: cint
+    descent: cint
+    height: cint
+    max_advance_width: cint
+    charset: pointer
+    pattern: pointer
+
+  XGlyphInfo {.pure.} = object
+    width, height: cushort
+    x, y: cshort
+    xOff, yOff: cshort
+
+# ---- X11 constants ----
+
+const
+  None = 0.XID
+  CurrentTime = 0.XTime
+  XA_ATOM = 4.Atom
+  XA_STRING = 31.Atom
+  PropModeReplace = 0.cint
+
+  # Event types
+  KeyPress = 2.cint
+  KeyRelease = 3.cint
+  ButtonPress = 4.cint
+  ButtonRelease = 5.cint
+  MotionNotify = 6.cint
+  FocusIn = 9.cint
+  FocusOut = 10.cint
+  Expose = 12.cint
+  ConfigureNotify = 22.cint
+  SelectionNotify = 31.cint
+  SelectionRequest = 30.cint
+  ClientMessage = 33.cint
+
+  # Event masks
+  ExposureMask = 1 shl 15
+  KeyPressMask = 1 shl 0
+  KeyReleaseMask = 1 shl 1
+  ButtonPressMask = 1 shl 2
+  ButtonReleaseMask = 1 shl 3
+  PointerMotionMask = 1 shl 6
+  StructureNotifyMask = 1 shl 17
+  FocusChangeMask = 1 shl 21
+
+  # Modifier masks
+  ShiftMask = 1'u32
+  ControlMask = 4'u32
+  Mod1Mask = 8'u32   # Alt
+  Mod4Mask = 64'u32  # Super/GUI
+
+  # Mouse buttons
+  Button1 = 1'u32
+  Button2 = 2'u32
+  Button3 = 3'u32
+  Button4 = 4'u32  # scroll up
+  Button5 = 5'u32  # scroll down
+  Button1Mask {.used.} = 1'u32 shl 8
+  Button2Mask {.used.} = 1'u32 shl 9
+  Button3Mask {.used.} = 1'u32 shl 10
+
+  # Cursor shapes
+  XC_left_ptr = 68'u32
+  XC_xterm = 152'u32
+  XC_watch = 150'u32
+  XC_crosshair = 34'u32
+  XC_hand2 = 60'u32
+  XC_sb_v_double_arrow = 116'u32
+  XC_sb_h_double_arrow = 108'u32
+
+  # KeySyms
+  XK_a = 0x61'u
+  XK_z = 0x7a'u
+  XK_0 = 0x30'u
+  XK_9 = 0x39'u
+  XK_F1 = 0xffbe'u
+  XK_F12 = 0xffc9'u
+  XK_Return = 0xff0d'u
+  XK_space = 0x20'u
+  XK_Escape = 0xff1b'u
+  XK_Tab = 0xff09'u
+  XK_ISO_Left_Tab = 0xfe20'u
+  XK_BackSpace = 0xff08'u
+  XK_Delete = 0xffff'u
+  XK_Insert = 0xff63'u
+  XK_Left = 0xff51'u
+  XK_Up = 0xff52'u
+  XK_Right = 0xff53'u
+  XK_Down = 0xff54'u
+  XK_Page_Up = 0xff55'u
+  XK_Page_Down = 0xff56'u
+  XK_Home = 0xff50'u
+  XK_End = 0xff57'u
+  XK_Caps_Lock = 0xffe5'u
+  XK_plus = 0x2b'u
+  XK_comma = 0x2c'u
+  XK_period = 0x2e'u
+  XK_minus = 0x2d'u
+  XK_equal = 0x3d'u
+
+# ---- POSIX select for timeout waiting ----
+
+proc ConnectionNumber(dpy: pointer): cint
+  {.cdecl, dynlib: libX11, importc: "XConnectionNumber".}
+
+type
+  XFdSet {.importc: "fd_set", header: "<sys/select.h>".} = object
+  XTimeval {.importc: "struct timeval", header: "<sys/time.h>".} = object
+    tv_sec {.importc.}: clong
+    tv_usec {.importc.}: clong
+
+proc xFdZero(s: ptr XFdSet)
+  {.importc: "FD_ZERO", header: "<sys/select.h>".}
+proc xFdSet(fd: cint; s: ptr XFdSet)
+  {.importc: "FD_SET", header: "<sys/select.h>".}
+proc xSelect(nfds: cint; readfds, writefds, exceptfds: ptr XFdSet;
+             timeout: ptr XTimeval): cint
+  {.importc: "select", header: "<sys/select.h>".}
+
+# ---- X11 function imports ----
+
+proc XOpenDisplay(name: cstring): pointer
+  {.cdecl, dynlib: libX11, importc.}
+proc XResourceManagerString(dpy: pointer): cstring
+  {.cdecl, dynlib: libX11, importc.}
+proc XDefaultScreen(dpy: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XDisplayWidth(dpy: pointer; screen: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XDisplayHeight(dpy: pointer; screen: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XRootWindow(dpy: pointer; screen: cint): XID
+  {.cdecl, dynlib: libX11, importc.}
+proc XDefaultVisual(dpy: pointer; screen: cint): pointer
+  {.cdecl, dynlib: libX11, importc.}
+proc XDefaultColormap(dpy: pointer; screen: cint): XID
+  {.cdecl, dynlib: libX11, importc.}
+proc XDefaultDepth(dpy: pointer; screen: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XBlackPixel(dpy: pointer; screen: cint): culong
+  {.cdecl, dynlib: libX11, importc.}
+proc XWhitePixel(dpy: pointer; screen: cint): culong
+  {.cdecl, dynlib: libX11, importc, used.}
+proc XCreateSimpleWindow(dpy: pointer; parent: XID;
+  x, y: cint; w, h, border: cuint; borderColor, bgColor: culong): XID
+  {.cdecl, dynlib: libX11, importc.}
+proc XMapWindow(dpy: pointer; w: XID): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XDestroyWindow(dpy: pointer; w: XID): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSelectInput(dpy: pointer; w: XID; mask: clong): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XCreatePixmap(dpy: pointer; d: XID; w, h, depth: cuint): XID
+  {.cdecl, dynlib: libX11, importc.}
+proc XFreePixmap(dpy: pointer; p: XID): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XCreateGC(dpy: pointer; d: XID; mask: culong; values: pointer): pointer
+  {.cdecl, dynlib: libX11, importc.}
+proc XFreeGC(dpy: pointer; gc: pointer): cint
+  {.cdecl, dynlib: libX11, importc, used.}
+proc XSetForeground(dpy: pointer; gc: pointer; pixel: culong): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XFillRectangle(dpy: pointer; d: XID; gc: pointer;
+  x, y: cint; w, h: cuint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XDrawLine(dpy: pointer; d: XID; gc: pointer;
+  x1, y1, x2, y2: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XDrawPoint(dpy: pointer; d: XID; gc: pointer; x, y: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XCopyArea(dpy: pointer; src, dst: XID; gc: pointer;
+  srcX, srcY: cint; w, h: cuint; dstX, dstY: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XPutImage(dpy: pointer; d: XID; gc: pointer; image: pointer;
+  srcX, srcY, dstX, dstY: cint; w, h: cuint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetClipRectangles(dpy: pointer; gc: pointer;
+  x, y: cint; rects: ptr XRectangle; n, ordering: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetClipMask(dpy: pointer; gc: pointer; pixmap: XID): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XNextEvent(dpy: pointer; ev: ptr XEvent): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XPending(dpy: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XFlush(dpy: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XStoreName(dpy: pointer; w: XID; name: cstring): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XInternAtom(dpy: pointer; name: cstring; onlyIfExists: XBool): Atom
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetWMProtocols(dpy: pointer; w: XID; protocols: ptr Atom; count: cint): XStatus
+  {.cdecl, dynlib: libX11, importc.}
+proc XCreateFontCursor(dpy: pointer; shape: cuint): XID
+  {.cdecl, dynlib: libX11, importc.}
+proc XDefineCursor(dpy: pointer; w: XID; cursor: XID): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XLookupString(ev: ptr XKeyEvent; buf: cstring; bufSize: cint;
+  keysym: ptr XKeySym; compose: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSetSelectionOwner(dpy: pointer; selection: Atom; owner: XID; time: XTime): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XConvertSelection(dpy: pointer; selection, target, property: Atom;
+  requestor: XID; time: XTime): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XChangeProperty(dpy: pointer; w: XID; property, propType: Atom;
+  format, mode: cint; data: pointer; nelements: cint): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XGetWindowProperty(dpy: pointer; w: XID; property: Atom;
+  offset, length: clong; delete: XBool; reqType: Atom;
+  actualType: ptr Atom; actualFormat: ptr cint;
+  nitems, bytesAfter: ptr culong; prop: ptr pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XSendEvent(dpy: pointer; w: XID; propagate: XBool;
+  mask: clong; ev: ptr XEvent): XStatus
+  {.cdecl, dynlib: libX11, importc.}
+proc XFree(data: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+proc XCloseDisplay(dpy: pointer): cint
+  {.cdecl, dynlib: libX11, importc.}
+
+# ---- Xft function imports ----
+
+proc XftFontOpenName(dpy: pointer; screen: cint; name: cstring): ptr XftFont
+  {.cdecl, dynlib: libXft, importc.}
+proc XftFontClose(dpy: pointer; font: ptr XftFont): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawCreate(dpy: pointer; d: XID; visual: pointer; cmap: XID): pointer
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawDestroy(draw: pointer): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawChange(draw: pointer; d: XID): void
+  {.cdecl, dynlib: libXft, importc, used.}
+proc XftDrawStringUtf8(draw: pointer; color: ptr XftColor; font: ptr XftFont;
+  x, y: cint; text: cstring; len: cint): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftTextExtentsUtf8(dpy: pointer; font: ptr XftFont;
+  text: cstring; len: cint; extents: ptr XGlyphInfo): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawRect(draw: pointer; color: ptr XftColor;
+  x, y: cint; w, h: cuint): void
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawSetClipRectangles(draw: pointer; x, y: cint;
+  rects: ptr XRectangle; n: cint): XBool
+  {.cdecl, dynlib: libXft, importc.}
+proc XftDrawSetClip(draw: pointer; region: pointer): XBool
+  {.cdecl, dynlib: libXft, importc.}
+
+# ---- Helpers ----
+
+proc toXftColor(c: screen.Color): XftColor =
+  result = XftColor(
+    pixel: (c.r.culong shl 16) or (c.g.culong shl 8) or c.b.culong,
+    color: XRenderColor(
+      red: c.r.cushort * 257,
+      green: c.g.cushort * 257,
+      blue: c.b.cushort * 257,
+      alpha: c.a.cushort * 257))
+
+proc toPixel(c: screen.Color): culong {.inline.} =
+  (c.r.culong shl 16) or (c.g.culong shl 8) or c.b.culong
+
+# ---- Font handle management ----
+
+type
+  FontSlot = object
+    xftFont: ptr XftFont
+    metrics: FontMetrics
+
+var fonts: seq[FontSlot]
+
+proc getFontPtr(f: screen.Font): ptr XftFont {.inline.} =
+  let idx = f.int - 1
+  if idx >= 0 and idx < fonts.len: fonts[idx].xftFont
+  else: nil
+
+# ---- Driver state ----
+
+var
+  gDisplay: pointer
+  gScreen: cint
+  gVisual: pointer
+  gColormap: XID
+  gDepth: cint
+  gWindow: XID
+  gGC: pointer         # Xlib GC for primitives
+  gBackPixmap: XID     # double buffer
+  gXftDraw: pointer    # Xft draw context on back pixmap
+  gWidth, gHeight: cint
+  gWmDeleteWindow: Atom
+  gClipboard: Atom
+  gUtf8String: Atom
+  gTargets: Atom
+  gClipboardText: string
+  gClipProperty: Atom
+  gUiScale: int = 100
+
+var eventQueue: seq[input.Event]
+
+proc pushEvent(e: input.Event) =
+  eventQueue.add e
+
+# ---- Back-buffer management ----
+
+proc recreateBackBuffer() =
+  if gBackPixmap != None:
+    XftDrawDestroy(gXftDraw)
+    discard XFreePixmap(gDisplay, gBackPixmap)
+  gBackPixmap = XCreatePixmap(gDisplay, gWindow,
+    gWidth.cuint, gHeight.cuint, gDepth.cuint)
+  gXftDraw = XftDrawCreate(gDisplay, gBackPixmap, gVisual, gColormap)
+  # Clear to black
+  discard XSetForeground(gDisplay, gGC, 0)
+  discard XFillRectangle(gDisplay, gBackPixmap, gGC, 0, 0,
+    gWidth.cuint, gHeight.cuint)
+
+# ---- Key translation ----
+
+proc translateKeySym(ks: XKeySym): input.KeyCode =
+  if ks >= XK_a and ks <= XK_z:
+    return input.KeyCode(ord(KeyA) + (ks.int - XK_a.int))
+  if ks >= XK_0 and ks <= XK_9:
+    return input.KeyCode(ord(Key0) + (ks.int - XK_0.int))
+  if ks >= XK_F1 and ks <= XK_F12:
+    return input.KeyCode(ord(KeyF1) + (ks.int - XK_F1.int))
+  case ks.uint
+  of XK_Return: KeyEnter
+  of XK_space: KeySpace
+  of XK_Escape: KeyEsc
+  of XK_Tab, XK_ISO_Left_Tab: KeyTab
+  of XK_BackSpace: KeyBackspace
+  of XK_Delete: KeyDelete
+  of XK_Insert: KeyInsert
+  of XK_Left: KeyLeft
+  of XK_Right: KeyRight
+  of XK_Up: KeyUp
+  of XK_Down: KeyDown
+  of XK_Page_Up: KeyPageUp
+  of XK_Page_Down: KeyPageDown
+  of XK_Home: KeyHome
+  of XK_End: KeyEnd
+  of XK_Caps_Lock: KeyCapslock
+  of XK_plus: KeyPlus
+  of XK_comma: KeyComma
+  of XK_period: KeyPeriod
+  of XK_minus: KeyMinus
+  of XK_equal: KeyEqual
+  else: KeyNone
+
+proc translateMods(state: cuint): set[Modifier] =
+  result = {}
+  if (state and ShiftMask) != 0: result.incl ShiftPressed
+  if (state and ControlMask) != 0: result.incl CtrlPressed
+  if (state and Mod1Mask) != 0: result.incl AltPressed
+  if (state and Mod4Mask) != 0: result.incl GuiPressed
+
+proc translateButton(button: cuint): MouseButton =
+  case button
+  of Button1: LeftButton
+  of Button3: RightButton
+  of Button2: MiddleButton
+  else: LeftButton
+
+# ---- Clipboard handling ----
+
+proc handleSelectionRequest(req: XSelectionRequestEvent) =
+  var ev {.noinit.}: XEvent
+  zeroMem(addr ev, sizeof(XEvent))
+  ev.xselection.theType = SelectionNotify
+  ev.xselection.requestor = req.requestor
+  ev.xselection.selection = req.selection
+  ev.xselection.target = req.target
+  ev.xselection.time = req.time
+
+  if req.target == gUtf8String or req.target == XA_STRING:
+    discard XChangeProperty(gDisplay, req.requestor, req.property,
+      gUtf8String, 8, PropModeReplace,
+      cast[pointer](cstr(gClipboardText)), gClipboardText.len.cint)
+    ev.xselection.property = req.property
+  elif req.target == gTargets:
+    var targets = [gUtf8String, XA_STRING, gTargets]
+    discard XChangeProperty(gDisplay, req.requestor, req.property,
+      XA_ATOM, 32, PropModeReplace,
+      addr targets[0], 3)
+    ev.xselection.property = req.property
+  else:
+    ev.xselection.property = None
+
+  discard XSendEvent(gDisplay, req.requestor, 0, 0, addr ev)
+
+# ---- Event processing ----
+
+var lastClickTime: XTime
+var lastClickX, lastClickY: int
+var clickCount: int
+
+proc processXEvent(xev: XEvent) =
+  case xev.theType
+  of Expose:
+    if xev.xexpose.count == 0 and gBackPixmap != None:
+      discard XCopyArea(gDisplay, gBackPixmap, gWindow, gGC,
+        0, 0, gWidth.cuint, gHeight.cuint, 0, 0)
+
+  of ConfigureNotify:
+    let newW = xev.xconfigure.width
+    let newH = xev.xconfigure.height
+    if newW > 0 and newH > 0 and (newW != gWidth or newH != gHeight):
+      gWidth = newW
+      gHeight = newH
+      recreateBackBuffer()
+      var e = input.Event(kind: WindowMetricsEvent)
+      e.x = gWidth
+      e.y = gHeight
+      e.scaleX = 1
+      e.scaleY = 1
+      e.uiScale = gUiScale
+      pushEvent(e)
+
+  of ClientMessage:
+    if xev.xclient.data[0] == gWmDeleteWindow.clong:
+      pushEvent(input.Event(kind: WindowCloseEvent))
+
+  of FocusIn:
+    pushEvent(input.Event(kind: WindowFocusGainedEvent))
+
+  of FocusOut:
+    pushEvent(input.Event(kind: WindowFocusLostEvent))
+
+  of KeyPress:
+    var buf {.noinit.}: array[8, char]
+    var ks {.noinit.}: XKeySym
+    let textLen = XLookupString(unsafeAddr xev.xkey, cast[cstring](addr buf[0]),
+      8, addr ks, nil)
+    # Key event
+    var e = input.Event(kind: KeyDownEvent)
+    e.key = translateKeySym(ks)
+    e.mods = translateMods(xev.xkey.state)
+    pushEvent(e)
+    # Text input (if printable)
+    if textLen > 0 and buf[0].uint8 >= 32 and buf[0].uint8 != 127:
+      var te = input.Event(kind: TextInputEvent)
+      for i in 0 ..< min(textLen, 4):
+        te.text[i] = buf[i]
+      pushEvent(te)
+
+  of KeyRelease:
+    var ks {.noinit.}: XKeySym
+    discard XLookupString(unsafeAddr xev.xkey, nil, 0, addr ks, nil)
+    var e = input.Event(kind: KeyUpEvent)
+    e.key = translateKeySym(ks)
+    e.mods = translateMods(xev.xkey.state)
+    pushEvent(e)
+
+  of ButtonPress:
+    let btn = xev.xbutton.button
+    if btn == Button4 or btn == Button5:
+      # Scroll wheel
+      var e = input.Event(kind: MouseWheelEvent)
+      e.y = if btn == Button4: 1 else: -1
+      pushEvent(e)
+    else:
+      var e = input.Event(kind: MouseDownEvent)
+      e.x = xev.xbutton.x
+      e.y = xev.xbutton.y
+      e.button = translateButton(btn)
+      e.mods = translateMods(xev.xbutton.state)
+      # Click counting for double/triple click
+      let now = xev.xbutton.time
+      if now - lastClickTime < 500 and
+         abs(e.x - lastClickX) < 4 and abs(e.y - lastClickY) < 4:
+        inc clickCount
+      else:
+        clickCount = 1
+      lastClickTime = now
+      lastClickX = e.x
+      lastClickY = e.y
+      e.clicks = clickCount
+      pushEvent(e)
+
+  of ButtonRelease:
+    let btn = xev.xbutton.button
+    if btn != Button4 and btn != Button5:
+      var e = input.Event(kind: MouseUpEvent)
+      e.x = xev.xbutton.x
+      e.y = xev.xbutton.y
+      e.button = translateButton(btn)
+      pushEvent(e)
+
+  of MotionNotify:
+    var e = input.Event(kind: MouseMoveEvent)
+    e.x = xev.xmotion.x
+    e.y = xev.xmotion.y
+    pushEvent(e)
+
+  of SelectionRequest:
+    handleSelectionRequest(xev.xselectionrequest)
+
+  else:
+    discard
+
+proc drainXEvents() =
+  while XPending(gDisplay) > 0:
+    var xev {.noinit.}: XEvent
+    discard XNextEvent(gDisplay, addr xev)
+    processXEvent(xev)
+
+# ---- Display density ----
+
+proc matchesAt(s: string; i: int; prefix: string): bool =
+  if i + prefix.len > s.len: return false
+  for k in 0 ..< prefix.len:
+    if s[i + k] != prefix[k]: return false
+  result = true
+
+proc dpiFromResources(): int =
+  ## `Xft.dpi` from the root window's resource manager string, 0 if unset.
+  ## The server's own idea of the physical size is no use here -- Xwayland
+  ## reports a flat 96 dpi no matter the monitor -- so this resource, which is
+  ## what the desktop environment writes, is the only honest source.
+  result = 0
+  let rm = XResourceManagerString(gDisplay)
+  if rm == nil: return
+  let db = $rm
+  const key = "Xft.dpi:"
+  var i = 0
+  while i < db.len:
+    var lineEnd = i
+    while lineEnd < db.len and db[lineEnd] != '\n': inc lineEnd
+    if db.matchesAt(i, key):
+      var j = i + key.len
+      while j < lineEnd and (db[j] == ' ' or db[j] == '\t'): inc j
+      var dpi = 0
+      while j < lineEnd and db[j] in {'0'..'9'}:
+        dpi = dpi * 10 + (ord(db[j]) - ord('0'))
+        inc j
+      if dpi > 0: return dpi
+    i = lineEnd + 1
+
+proc computeUiScale(): int =
+  ## X11 coordinates are raw device pixels and nothing on the way to the screen
+  ## scales them, so the display's full density has to land in `uiScale`.
+  ## Never below 100: shrinking an app's hardcoded sizes is more likely to make
+  ## it unusable than to be what the user meant.
+  let dpi = dpiFromResources()
+  result = if dpi <= 0: 100 else: max(100, dpi * 100 div 96)
+
+# ---- Screen hook implementations ----
+
+proc x11CreateWindow(layout: var ScreenLayout) =
+  gDisplay = XOpenDisplay(nil)
+  if gDisplay == nil:
+    quit("Cannot open X11 display")
+  gUiScale = computeUiScale()
+  gScreen = XDefaultScreen(gDisplay)
+  gVisual = XDefaultVisual(gDisplay, gScreen)
+  gColormap = XDefaultColormap(gDisplay, gScreen)
+  gDepth = XDefaultDepth(gDisplay, gScreen)
+
+  if layout.fullScreen:
+    layout.width = XDisplayWidth(gDisplay, gScreen)
+    layout.height = XDisplayHeight(gDisplay, gScreen)
+
+  gWindow = XCreateSimpleWindow(gDisplay, XRootWindow(gDisplay, gScreen),
+    0, 0, layout.width.cuint, layout.height.cuint, 0,
+    XBlackPixel(gDisplay, gScreen), XBlackPixel(gDisplay, gScreen))
+
+  discard XSelectInput(gDisplay, gWindow,
+    (ExposureMask or KeyPressMask or KeyReleaseMask or
+     ButtonPressMask or ButtonReleaseMask or PointerMotionMask or
+     StructureNotifyMask or FocusChangeMask).clong)
+
+  # Register WM_DELETE_WINDOW
+  gWmDeleteWindow = XInternAtom(gDisplay, "WM_DELETE_WINDOW", 0)
+  discard XSetWMProtocols(gDisplay, gWindow, addr gWmDeleteWindow, 1)
+
+  # Clipboard atoms
+  gClipboard = XInternAtom(gDisplay, "CLIPBOARD", 0)
+  gUtf8String = XInternAtom(gDisplay, "UTF8_STRING", 0)
+  gTargets = XInternAtom(gDisplay, "TARGETS", 0)
+  gClipProperty = XInternAtom(gDisplay, "NIMEDIT_CLIP", 0)
+
+  discard XStoreName(gDisplay, gWindow, "NimEdit")
+  discard XMapWindow(gDisplay, gWindow)
+
+  gGC = XCreateGC(gDisplay, gWindow, 0, nil)
+
+  # Wait for the first Expose/ConfigureNotify to get actual size
+  gWidth = layout.width.cint
+  gHeight = layout.height.cint
+  recreateBackBuffer()
+
+  layout.scaleX = 1
+  layout.scaleY = 1
+  layout.uiScale = gUiScale
+
+proc x11GetWindowLayout(): ScreenLayout =
+  ## Re-reads `Xft.dpi`: X11 has no event for a density change, so an app that
+  ## cares has to ask. `WindowMetricsEvent` carries the value cached at
+  ## startup.
+  if gDisplay != nil:
+    gUiScale = computeUiScale()
+  ScreenLayout(width: gWidth.int, height: gHeight.int,
+               scaleX: 1, scaleY: 1, uiScale: gUiScale)
+
+proc x11Refresh() =
+  if gBackPixmap != None:
+    discard XCopyArea(gDisplay, gBackPixmap, gWindow, gGC,
+      0, 0, gWidth.cuint, gHeight.cuint, 0, 0)
+  discard XFlush(gDisplay)
+
+proc x11SaveState() = discard
+proc x11RestoreState() =
+  # Reset clip on both GC and XftDraw
+  discard XSetClipMask(gDisplay, gGC, None)
+  discard XftDrawSetClip(gXftDraw, nil)
+
+proc x11SetClipRect(r: coords.Rect) =
+  var xr = XRectangle(
+    x: r.x.cshort, y: r.y.cshort,
+    width: r.w.cushort, height: r.h.cushort)
+  discard XSetClipRectangles(gDisplay, gGC, 0, 0, addr xr, 1, 0)
+  discard XftDrawSetClipRectangles(gXftDraw, 0, 0, addr xr, 1)
+
+proc x11OpenFont(path: string; size: int;
+                 metrics: var FontMetrics): screen.Font =
+  # Detect bold/italic from filename.
+  # Note: `substr in str` is avoided on purpose -- Nimony's system `in`
+  # template early-binds `contains` and never sees strutils' string overload,
+  # so we call `.contains` explicitly here.
+  let lpath = path.toLowerAscii()
+  let isBold = lpath.contains("bold")
+  let isItalic = lpath.contains("italic") or lpath.contains("oblique")
+
+  # Map known font filenames to fontconfig names
+  var faceName = "monospace"  # safe default
+  let baseName = path.extractFilename.toLowerAscii
+  if baseName.contains("dejavu") and baseName.contains("mono"):
+    faceName = "DejaVu Sans Mono"
+  elif baseName.contains("dejavu"):
+    faceName = "DejaVu Sans"
+  elif baseName.contains("consola"):
+    faceName = "Consolas"
+  elif baseName.contains("courier"):
+    faceName = "Courier New"
+  elif baseName.contains("arial"):
+    faceName = "Arial"
+  elif baseName.contains("cascadia"):
+    if baseName.contains("mono"): faceName = "Cascadia Mono"
+    else: faceName = "Cascadia Code"
+  elif baseName.contains("hack"):
+    faceName = "Hack"
+  elif baseName.contains("fira") and baseName.contains("code"):
+    faceName = "Fira Code"
+  elif baseName.contains("roboto") and baseName.contains("mono"):
+    faceName = "Roboto Mono"
+  elif baseName.contains("source") and baseName.contains("code"):
+    faceName = "Source Code Pro"
+  elif baseName.contains("jetbrains"):
+    faceName = "JetBrains Mono"
+
+  # Build Xft/fontconfig pattern
+  var pattern = faceName & ":pixelsize=" & $size
+  if isBold: pattern &= ":weight=bold"
+  if isItalic: pattern &= ":slant=italic"
+
+  let f = XftFontOpenName(gDisplay, gScreen, cstr(pattern))
+  if f == nil: return screen.Font(0)
+
+  metrics.ascent = f.ascent
+  metrics.descent = f.descent
+  metrics.lineHeight = f.height
+  fonts.add FontSlot(xftFont: f, metrics: metrics)
+  result = screen.Font(fonts.len)
+
+proc x11CloseFont(f: screen.Font) =
+  let idx = f.int - 1
+  if idx >= 0 and idx < fonts.len and fonts[idx].xftFont != nil:
+    XftFontClose(gDisplay, fonts[idx].xftFont)
+    fonts[idx].xftFont = nil
+
+proc x11MeasureText(f: screen.Font; text: string): TextExtent =
+  result = TextExtent(w: 0, h: 0)
+  let fp = getFontPtr(f)
+  if fp != nil and text.len > 0:
+    var t = text
+    var extents {.noinit.}: XGlyphInfo
+    XftTextExtentsUtf8(gDisplay, fp, cstr(t), text.len.cint, addr extents)
+    result = TextExtent(w: extents.xOff.int, h: fp.height.int)
+
+proc x11DrawText(f: screen.Font; x, y: int; text: string;
+                 fg, bg: screen.Color): TextExtent =
+  result = TextExtent(w: 0, h: 0)
+  let fp = getFontPtr(f)
+  if fp == nil or text.len == 0: return
+  var t = text
+  # Measure first for background fill
+  var extents {.noinit.}: XGlyphInfo
+  XftTextExtentsUtf8(gDisplay, fp, cstr(t), text.len.cint, addr extents)
+  result = TextExtent(w: extents.xOff.int, h: fp.height.int)
+  # Fill background
+  var bgColor = toXftColor(bg)
+  XftDrawRect(gXftDraw, addr bgColor, x.cint, y.cint,
+    extents.xOff.cuint, fp.height.cuint)
+  # Draw text (y is baseline, not top)
+  var fgColor = toXftColor(fg)
+  XftDrawStringUtf8(gXftDraw, addr fgColor, fp,
+    x.cint, (y + fp.ascent).cint, cstr(t), text.len.cint)
+
+proc x11GetFontMetrics(f: screen.Font): FontMetrics =
+  let idx = f.int - 1
+  if idx >= 0 and idx < fonts.len: fonts[idx].metrics
+  else: screen.FontMetrics()
+
+proc x11FillRect(r: coords.Rect; color: screen.Color) =
+  var c = toXftColor(color)
+  XftDrawRect(gXftDraw, addr c, r.x.cint, r.y.cint, r.w.cuint, r.h.cuint)
+
+proc x11DrawLine(x1, y1, x2, y2: int; color: screen.Color) =
+  discard XSetForeground(gDisplay, gGC, toPixel(color))
+  discard XDrawLine(gDisplay, gBackPixmap, gGC,
+    x1.cint, y1.cint, x2.cint, y2.cint)
+
+proc x11DrawPoint(x, y: int; color: screen.Color) =
+  discard XSetForeground(gDisplay, gGC, toPixel(color))
+  discard XDrawPoint(gDisplay, gBackPixmap, gGC, x.cint, y.cint)
+
+# ---- Images (BMP decode -> server Pixmap, blitted with XCopyArea) ----
+#
+# We construct the XImage struct by hand (never XCreateImage/XDestroyImage) so
+# its `data` is a plain Nim seq we own -- XPutImage only reads the struct, it
+# never frees anything. Pixels are stored as uint32 0x00RRGGBB, which on a
+# little-endian TrueColor 24-bit visual is exactly the BGRX byte order the
+# server wants. A per-size scaled Pixmap is cached so redraws are a cheap
+# server-side XCopyArea rather than re-uploading pixels every frame.
+
+const
+  ZPixmap = 2.cint
+  LSBFirst = 0.cint
+
+type
+  XImage {.pure.} = object      # field order/offsets must match Xlib's _XImage
+    width, height: cint
+    xoffset: cint
+    format: cint
+    data: pointer
+    byteOrder: cint
+    bitmapUnit: cint
+    bitmapBitOrder: cint
+    bitmapPad: cint
+    depth: cint
+    bytesPerLine: cint
+    bitsPerPixel: cint
+    redMask, greenMask, blueMask: culong
+    obdata: pointer
+    funcs: array[6, pointer]    # the `f` substruct; unused by XPutImage
+
+  ImageSlot = object
+    pixels: seq[uint32]         # native size, 0x00RRGGBB
+    w, h: int                   # native dimensions
+    pixmap: XID                 # cached scaled buffer (None until first draw)
+    pw, ph: int                 # scaled pixmap dimensions
+
+var images: seq[ImageSlot]
+
+proc rd32(b: openArray[byte]; i: int): int =   # little-endian u32
+  b[i].int or (b[i+1].int shl 8) or (b[i+2].int shl 16) or (b[i+3].int shl 24)
+proc rd16(b: openArray[byte]; i: int): int =
+  b[i].int or (b[i+1].int shl 8)
+
+proc decodeBmp(path: string): tuple[pixels: seq[uint32]; w, h: int] =
+  ## Uncompressed 24/32-bit BI_RGB BMP -> top-down 0x00RRGGBB pixels.
+  var raw: string
+  try: raw = readFile(path)
+  except CatchableError: return
+  if raw.len < 54 or raw[0] != 'B' or raw[1] != 'M': return
+  let b = cast[seq[byte]](raw)
+  let offBits = rd32(b, 10)
+  let w = rd32(b, 18)
+  var h = rd32(b, 22)
+  let bpp = rd16(b, 28)
+  let compression = rd32(b, 30)
+  if w <= 0 or h == 0 or compression != 0 or (bpp != 24 and bpp != 32): return
+  let topDown = h < 0
+  if topDown: h = -h
+  let bytesPP = bpp div 8
+  let rowSize = ((w * bytesPP + 3) div 4) * 4   # rows padded to 4 bytes
+  if offBits + rowSize * h > b.len: return
+  result.pixels = newSeq[uint32](w * h)
+  result.w = w; result.h = h
+  for row in 0 ..< h:
+    let srcRow = if topDown: row else: h - 1 - row   # BMP is bottom-up by default
+    var p = offBits + srcRow * rowSize
+    let dstBase = row * w
+    for x in 0 ..< w:
+      let bl = b[p].uint32; let gr = b[p+1].uint32; let re = b[p+2].uint32
+      result.pixels[dstBase + x] = (re shl 16) or (gr shl 8) or bl
+      p += bytesPP
+
+proc getImageSlot(img: screen.Image): ptr ImageSlot {.inline.} =
+  let idx = img.int - 1
+  if idx >= 0 and idx < images.len: addr images[idx] else: nil
+
+proc x11LoadImage(path: string): screen.Image =
+  let (pix, w, h) = decodeBmp(path)
+  if pix.len == 0: return screen.Image(0)
+  images.add ImageSlot(pixels: pix, w: w, h: h, pixmap: None, pw: 0, ph: 0)
+  screen.Image(images.len)
+
+proc x11ImageSize(img: screen.Image): tuple[w, h: int] =
+  let s = getImageSlot(img)
+  if s == nil or s.pixels.len == 0: (0, 0) else: (s.w, s.h)
+
+proc x11FreeImage(img: screen.Image) =
+  let s = getImageSlot(img)
+  if s == nil: return
+  if s.pixmap != None: discard XFreePixmap(gDisplay, s.pixmap); s.pixmap = None
+  s.pixels = @[]; s.w = 0; s.h = 0; s.pw = 0; s.ph = 0
+
+proc buildScaledPixmap(s: ptr ImageSlot; dw, dh: int) =
+  ## (Re)build the cached Pixmap at dw x dh via nearest-neighbour scaling.
+  if s.pixmap != None: discard XFreePixmap(gDisplay, s.pixmap)
+  s.pixmap = XCreatePixmap(gDisplay, gWindow, dw.cuint, dh.cuint, gDepth.cuint)
+  s.pw = dw; s.ph = dh
+  var buf = newSeq[uint32](dw * dh)
+  for y in 0 ..< dh:
+    let sy = (y * s.h) div dh
+    for x in 0 ..< dw:
+      let sx = (x * s.w) div dw
+      buf[y * dw + x] = s.pixels[sy * s.w + sx]
+  var ximg = XImage(
+    width: dw.cint, height: dh.cint, format: ZPixmap, data: addr buf[0],
+    byteOrder: LSBFirst, bitmapUnit: 32, bitmapBitOrder: LSBFirst,
+    bitmapPad: 32, depth: gDepth, bytesPerLine: (dw * 4).cint, bitsPerPixel: 32,
+    redMask: 0xFF0000, greenMask: 0x00FF00, blueMask: 0x0000FF)
+  discard XPutImage(gDisplay, s.pixmap, gGC, addr ximg, 0, 0, 0, 0,
+    dw.cuint, dh.cuint)
+
+proc x11DrawImage(img: screen.Image; src, dst: coords.Rect) =
+  ## `src` is ignored (we blit the whole image); `dst` gives position + size.
+  let s = getImageSlot(img)
+  if s == nil or s.pixels.len == 0 or dst.w <= 0 or dst.h <= 0: return
+  if gDepth != 24: return                    # first cut: TrueColor 24-bit only
+  if s.pixmap == None or s.pw != dst.w or s.ph != dst.h:
+    buildScaledPixmap(s, dst.w, dst.h)
+  discard XCopyArea(gDisplay, s.pixmap, gBackPixmap, gGC,
+    0, 0, dst.w.cuint, dst.h.cuint, dst.x.cint, dst.y.cint)
+
+proc x11SetCursor(c: CursorKind) =
+  let shape = case c
+    of curDefault, curArrow: XC_left_ptr
+    of curIbeam: XC_xterm
+    of curWait: XC_watch
+    of curCrosshair: XC_crosshair
+    of curHand: XC_hand2
+    of curSizeNS: XC_sb_v_double_arrow
+    of curSizeWE: XC_sb_h_double_arrow
+  let cur = XCreateFontCursor(gDisplay, shape)
+  discard XDefineCursor(gDisplay, gWindow, cur)
+
+proc x11SetWindowTitle(title: string) =
+  var t = title
+  discard XStoreName(gDisplay, gWindow, cstr(t))
+
+# ---- Input hook implementations ----
+
+proc x11PollEvent(e: var input.Event; flags: set[InputFlag]): bool =
+  drainXEvents()
+  if eventQueue.len > 0:
+    e = eventQueue[0]
+    eventQueue.delete(0)
+    return true
+  return false
+
+proc x11WaitEvent(e: var input.Event; timeoutMs: int;
+                  flags: set[InputFlag]): bool =
+  if eventQueue.len > 0:
+    e = eventQueue[0]
+    eventQueue.delete(0)
+    return true
+  if x11PollEvent(e, flags): return true
+
+  # Block on the X11 connection fd using select() with timeout.
+  let xfd = ConnectionNumber(gDisplay)
+  var fds {.noinit.}: XFdSet
+  xFdZero(addr fds)
+  xFdSet(xfd, addr fds)
+
+  if timeoutMs < 0:
+    discard xSelect(xfd + 1, addr fds, nil, nil, nil)
+  else:
+    var tv = XTimeval(tv_sec: (timeoutMs div 1000).clong,
+                      tv_usec: ((timeoutMs mod 1000) * 1000).clong)
+    discard xSelect(xfd + 1, addr fds, nil, nil, addr tv)
+
+  # select() returned -- drain whatever arrived
+  drainXEvents()
+  if eventQueue.len > 0:
+    e = eventQueue[0]
+    eventQueue.delete(0)
+    return true
+  return false
+
+proc x11GetClipboardText(): string =
+  result = ""
+  discard XConvertSelection(gDisplay, gClipboard, gUtf8String,
+    gClipProperty, gWindow, CurrentTime)
+  discard XFlush(gDisplay)
+  # Wait for SelectionNotify (with timeout)
+  let deadline = getTicks() + 500  # 500ms timeout
+  while getTicks() < deadline:
+    if XPending(gDisplay) > 0:
+      var xev {.noinit.}: XEvent
+      discard XNextEvent(gDisplay, addr xev)
+      if xev.theType == SelectionNotify:
+        if xev.xselection.property != None:
+          var actualType {.noinit.}: Atom
+          var actualFormat {.noinit.}: cint
+          var nitems {.noinit.}: culong
+          var bytesAfter {.noinit.}: culong
+          var data {.noinit.}: pointer
+          discard XGetWindowProperty(gDisplay, gWindow, gClipProperty,
+            0, 1024*1024, 1, 0, # delete=True, AnyPropertyType
+            addr actualType, addr actualFormat,
+            addr nitems, addr bytesAfter, addr data)
+          if data != nil:
+            result = $cast[cstring](data)
+            discard XFree(data)
+        return
+      else:
+        processXEvent(xev)
+    else:
+      sleepMs(5)
+
+proc x11PutClipboardText(text: string) =
+  gClipboardText = text
+  discard XSetSelectionOwner(gDisplay, gClipboard, gWindow, CurrentTime)
+
+proc x11GetTicks(): int =
+  # Use POSIX clock
+  var ts {.noinit.}: Timespec
+  discard clock_gettime(0.ClockId, ts)  # CLOCK_REALTIME = 0
+  result = int(ts.tv_sec.int64 * 1000 + ts.tv_nsec.int64 div 1_000_000)
+
+proc x11Delay(ms: int) =
+  # Drain events during delay to stay responsive
+  let deadline = x11GetTicks() + ms
+  while true:
+    let now = x11GetTicks()
+    if now >= deadline: break
+    drainXEvents()
+    sleepMs(min(deadline - now, 10))
+
+proc x11QuitRequest() =
+  if gDisplay != nil:
+    discard XDestroyWindow(gDisplay, gWindow)
+    discard XCloseDisplay(gDisplay)
+
+
+# ---- Init ----
+
+proc initX11Driver*() =
+  windowRelays = WindowRelays(
+    createWindow: x11CreateWindow, getWindowLayout: x11GetWindowLayout,
+    refresh: x11Refresh,
+    saveState: x11SaveState, restoreState: x11RestoreState,
+    setClipRect: x11SetClipRect, setCursor: x11SetCursor,
+    setWindowTitle: x11SetWindowTitle)
+  fontRelays = FontRelays(
+    openFont: x11OpenFont, closeFont: x11CloseFont,
+    getFontMetrics: x11GetFontMetrics, measureText: x11MeasureText,
+    drawText: x11DrawText)
+  drawRelays = DrawRelays(
+    fillRect: x11FillRect, drawLine: x11DrawLine, drawPoint: x11DrawPoint,
+    loadImage: x11LoadImage, freeImage: x11FreeImage, drawImage: x11DrawImage,
+    imageSize: x11ImageSize)
+  inputRelays = InputRelays(
+    pollEvent: x11PollEvent, waitEvent: x11WaitEvent,
+    getTicks: x11GetTicks, sleep: x11Delay,
+    shutdown: x11QuitRequest)
+  clipboardRelays = ClipboardRelays(
+    getText: x11GetClipboardText, putText: x11PutClipboardText)

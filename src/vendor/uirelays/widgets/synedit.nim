@@ -44,6 +44,7 @@
 import uirelays/[coords, screen, input]
 import widgets/theme
 import std/strutils
+import std/os
 export theme
 
 const
@@ -60,7 +61,8 @@ type
     langR, langOrg          ## added for wkbenchless (nimacs)
 
   RenderFlag* = enum
-    rfMarkdownImages,   ## Render Markdown image lines: ![alt](path)
+    rfInlineImages,     ## Render whole-line image links inline: Markdown
+                        ## ![alt](path) and org [[file:path]] / [[path]]
     rfColorLiterals     ## Draw color chips for #RGB/#RRGGBB/#RRGGBBAA
 
 const
@@ -234,8 +236,13 @@ type
     # Close buttons -- see setCloseButtons()
     closeLines*: int                ## first line with an (x) button; -1 = none
     closeHover: int                 ## line whose (x) the mouse is over; -1 = none
-    # Cached images for rich markdown rendering
+    # Cached images for inline rendering (Markdown ![]() and org [[file:...]])
     imageCache: seq[ImageCacheEntry]
+    imageBaseDir*: string           ## dir relative image paths resolve against
+                                    ## (the open file's directory); "" = cwd
+    imageDefaultWidth*: int         ## default inline image width in px, applied
+                                    ## when no #+ATTR_* :width is given; 0 = use
+                                    ## the image's own (native) dimensions
     # Cache
     offsetToLineCache: array[20, tuple[version, offset, line: int]]
 
@@ -2338,46 +2345,119 @@ proc getCachedImage(s: var SynEdit; path: string): Image =
   for e in s.imageCache:
     if e.path == path:
       return e.img
-  let img = loadImage(path)
+  # Resolve ~ and, for relative paths, the open file's directory (not cwd).
+  var resolved = path
+  if resolved.len > 0 and resolved[0] == '~': resolved = expandTilde(resolved)
+  elif not isAbsolute(resolved) and s.imageBaseDir.len > 0:
+    resolved = s.imageBaseDir / resolved
+  let img = loadImage(resolved)
   s.imageCache.add ImageCacheEntry(path: path, img: img)
   result = img
 
-proc parseMarkdownImagePath(line: string; path: var string): bool =
-  ## Parse a full-line markdown image: ![alt](path)
+proc isImagePath(path: string): bool =
+  ## Path with a recognised raster/vector image extension. (Only BMP renders
+  ## today; others still reserve space and show a labelled placeholder.)
+  const exts = [".bmp", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+                ".tif", ".tiff", ".ppm"]
+  let low = path.toLowerAscii
+  for e in exts:
+    if low.endsWith(e): return true
+
+proc parseImageLinkPath(line: string; path: var string): bool =
+  ## A whole line that is just an image link, in either syntax:
+  ##   Markdown  ![alt](path)
+  ##   Org       [[path]]  /  [[file:path]]  /  [[file:path][desc]]
+  ## Returns the (extension-checked) path with any `file:` prefix stripped.
   var i = 0
   while i < line.len and line[i] in {' ', '\t'}: inc i
-  if i + 1 >= line.len or line[i] != '!' or line[i + 1] != '[':
-    return
-  var closeBracket = -1
-  var k = i + 2
-  while k < line.len:
-    if line[k] == ']':
-      closeBracket = k
-      break
-    inc k
-  if closeBracket < 0 or closeBracket + 1 >= line.len or line[closeBracket + 1] != '(':
-    return
-  var closeParen = -1
-  k = closeBracket + 2
-  while k < line.len:
-    if line[k] == ')':
-      closeParen = k
-      break
-    inc k
-  if closeParen < 0:
-    return
-  var tail = closeParen + 1
-  while tail < line.len and line[tail] in {' ', '\t'}: inc tail
-  if tail != line.len:
-    return
-  path = line[(closeBracket + 2) ..< closeParen]
-  result = path.len > 0
+
+  if i < line.len and line[i] == '!':                 # ---- Markdown ![alt](p)
+    if i + 1 >= line.len or line[i + 1] != '[': return
+    var closeBracket = -1
+    var k = i + 2
+    while k < line.len:
+      if line[k] == ']': closeBracket = k; break
+      inc k
+    if closeBracket < 0 or closeBracket + 1 >= line.len or
+       line[closeBracket + 1] != '(': return
+    var closeParen = -1
+    k = closeBracket + 2
+    while k < line.len:
+      if line[k] == ')': closeParen = k; break
+      inc k
+    if closeParen < 0: return
+    var tail = closeParen + 1
+    while tail < line.len and line[tail] in {' ', '\t'}: inc tail
+    if tail != line.len: return
+    path = line[(closeBracket + 2) ..< closeParen]
+    return path.len > 0
+
+  if i + 1 < line.len and line[i] == '[' and line[i + 1] == '[':  # ---- Org [[..]]
+    let close = line.find("]]", i + 2)
+    if close < 0: return
+    var tail = close + 2
+    while tail < line.len and line[tail] in {' ', '\t'}: inc tail
+    if tail != line.len: return                       # must be the whole line
+    var inner = line[(i + 2) ..< close]
+    let desc = inner.find("][")                       # [[PATH][DESC]] -> PATH
+    if desc >= 0: inner = inner[0 ..< desc]
+    if inner.startsWith("file:"): inner = inner[5 .. ^1]
+    path = inner
+    return path.len > 0 and isImagePath(path)
+
+proc attrDim(line, key: string): int =
+  ## Leading integer after `:key` in an org attribute line (units ignored), or 0.
+  ## e.g. `:width 300` -> 300, `:width 0.8\textwidth` -> 0 (no leading int px).
+  let k = line.find(key)
+  if k < 0: return
+  var p = k + key.len
+  while p < line.len and line[p] in {' ', '\t'}: inc p
+  var n = 0
+  var any = false
+  while p < line.len and line[p] in {'0'..'9'}:
+    n = n * 10 + (ord(line[p]) - ord('0')); inc p; any = true
+  if any: n else: 0
+
+proc scanImageAttrs(s: SynEdit; lineStart: int; w, h: var int) =
+  ## Walk the affiliated-keyword lines directly above the image link, reading
+  ## the nearest `#+ATTR_ORG:` / `#+ATTR_HTML:` / `#+ATTR_LATEX:` `:width` /
+  ## `:height` (Emacs org-mode style). Nearest line wins; stops at a blank or
+  ## non-`#+` line. ATTR_ORG is preferred over the others when both are present.
+  if lineStart <= 0: return
+  var lineEnd = lineStart - 1            # the '\L' ending the previous line
+  var orgW, orgH = 0
+  while lineEnd > 0:
+    var ls = lineEnd - 1
+    while ls >= 0 and s[ls] != '\L': dec ls
+    let prevStart = ls + 1
+    var t = ""
+    for p in prevStart ..< lineEnd: t.add s[p]
+    let ts = t.strip
+    if not ts.startsWith("#+"): break
+    let low = ts.toLowerAscii
+    if low.startsWith("#+attr_"):
+      let isOrg = low.startsWith("#+attr_org")
+      let aw = attrDim(low, ":width")
+      let ah = attrDim(low, ":height")
+      if isOrg:
+        if orgW == 0 and aw > 0: orgW = aw
+        if orgH == 0 and ah > 0: orgH = ah
+      else:
+        if w == 0 and aw > 0: w = aw
+        if h == 0 and ah > 0: h = ah
+    if prevStart == 0: break
+    lineEnd = prevStart - 1
+  if orgW > 0: w = orgW                  # ATTR_ORG overrides other backends
+  if orgH > 0: h = orgH
 
 proc renderMarkdownImageLine(
     s: var SynEdit; lineStart: int; dim: var Rect;
     endX, endY, lineH: int; showCursor: bool;
     nextIndex, consumedRows: var int): bool =
-  ## Render markdown image block for a single source line.
+  ## Render a whole-line image link inline, sized like Emacs org-mode: the
+  ## image's native dimensions by default, overridable per-image with a
+  ## preceding `#+ATTR_ORG: :width N [:height M]` (or the editor's
+  ## `imageDefaultWidth`); aspect ratio is always preserved.
   var j = lineStart
   while j < s.len and s[j] != '\L': inc j
 
@@ -2386,7 +2466,7 @@ proc renderMarkdownImageLine(
     line.add s[p]
 
   var imgPath = ""
-  if not parseMarkdownImagePath(line, imgPath):
+  if not parseImageLinkPath(line, imgPath):
     return
 
   # Keep source visible while actively editing this line.
@@ -2398,21 +2478,43 @@ proc renderMarkdownImageLine(
   if maxW <= 16 or maxH < lineH:
     return
 
-  let imgH = min(max(lineH * 6, lineH * 2), maxH)
-  let dst = rect(dim.x, dim.y + 1, maxW, imgH)
   let img = s.getCachedImage(imgPath)
-  if img != Image(0):
-    drawImage(img, rect(0, 0, dst.w, dst.h), dst)
+  let (iw, ih) = imageSize(img)                     # native px, (0,0) if unloaded
+
+  # Requested size: per-image #+ATTR_* :width/:height, else the editor default.
+  var wantW, wantH = 0
+  scanImageAttrs(s, lineStart, wantW, wantH)
+  if wantW == 0 and wantH == 0 and s.imageDefaultWidth > 0:
+    wantW = s.imageDefaultWidth
+
+  var tw, th: int
+  if img != Image(0) and iw > 0 and ih > 0:
+    # Derive from the native aspect ratio -- never stretch.
+    if wantW > 0 and wantH > 0: (tw, th) = (wantW, wantH)
+    elif wantW > 0: tw = wantW; th = max(1, wantW * ih div iw)
+    elif wantH > 0: th = wantH; tw = max(1, wantH * iw div ih)
+    else: (tw, th) = (iw, ih)                        # default: native size
+    if tw > maxW: th = max(1, th * maxW div tw); tw = maxW   # fit width, keep aspect
+    if th > maxH: tw = max(1, tw * maxH div th); th = maxH   # fit height, keep aspect
   else:
-    # Backends without image relays still show a useful placeholder.
+    # Placeholder box (backend without image relays, or a not-yet-decodable
+    # format like PNG): no native aspect to honour.
+    tw = if wantW > 0: min(wantW, maxW) else: min(maxW, max(240, maxW div 2))
+    th = min(maxH, if wantH > 0: wantH else: lineH * 6)
+
+  let dst = rect(dim.x, dim.y + 1, tw, th)
+  if img != Image(0):
+    let src = rect(0, 0, iw, ih)
+    drawImage(img, src, dst)
+  else:
     fillRect(dst, color(52, 56, 64))
     drawLine(dst.x, dst.y, dst.x + dst.w - 1, dst.y + dst.h - 1, color(140, 146, 172))
     drawLine(dst.x + dst.w - 1, dst.y, dst.x, dst.y + dst.h - 1, color(140, 146, 172))
     discard drawText(s.font, dst.x + 6, dst.y + 4, imgPath, color(220, 220, 220), color(52, 56, 64))
 
-  dim.y += imgH + 2
+  dim.y += th + 2
   nextIndex = j + 1
-  consumedRows = max(1, (imgH + lineH - 1) div lineH)
+  consumedRows = max(1, (th + lineH - 1) div lineH)
   result = true
 
 proc spaceForLines(s: SynEdit): int =
@@ -2887,7 +2989,7 @@ proc render*(s: var SynEdit; area: Rect; showCursor: bool) =
 
     var nextI = i
     var consumedRows = 1
-    if rfMarkdownImages in s.flags:
+    if rfInlineImages in s.flags:
       if s.renderMarkdownImageLine(i, dim, endX, endY, lineH, showCursor, nextI, consumedRows):
         i = nextI
         inc s.span, consumedRows

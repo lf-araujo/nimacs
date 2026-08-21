@@ -109,10 +109,12 @@ proc configure*(app: var App) =
   addExecPath("~/bin")
   # gLoadLoginPath = false
 
-  # The `claude` action (C-c a) runs this. Default resumes the last conversation
-  # in the project; set to "claude" for a fresh chat, or add your own flags.
-  gClaudeCmd = "claude --continue"
-  # gClaudeCmd = "claude"                # start fresh instead of continuing
+  # The `claude` action (C-c a) runs this. It's a real shell command (see
+  # startPty), so `||` works: try to resume the last conversation in the
+  # project, and if `--continue` finds none ("No conversation found to
+  # continue", exit 1) fall through to a fresh chat instead of exiting.
+  gClaudeCmd = "claude --continue || claude"
+  # gClaudeCmd = "claude"                # always start fresh instead
 
   # CriticMarkup (tracked changes) is fontified in org buffers automatically:
   # {++ins++} green, {--del--} red, {~~old~>new~~} red->green, {>>comment<<}

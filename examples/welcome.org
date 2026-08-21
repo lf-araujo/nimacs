@@ -48,6 +48,20 @@ Python blocks in order; the second sees =xs= from the first:
   print("max:", max(xs))   # xs persists from the previous block
 #+end_src
 
+* Figures inline
+
+Whole-line image links render inline, right in the buffer -- Emacs org-mode
+style. Use a bracket link (=[[file:figure.bmp]]=) or the Markdown form
+(=![](figure.bmp)=). By default the image shows at its own dimensions; size it
+with a preceding =#+ATTR_ORG: :width N= (aspect ratio is always preserved):
+
+#+CAPTION: A figure rendered inline, sized to 460 px wide.
+#+ATTR_ORG: :width 460
+[[file:figure.bmp]]
+
+Toggle inline rendering any time with =M-x toggle-inline-images=. (Decoding is
+BMP for now; other formats show a labelled placeholder -- more coming.)
+
 * Editing code with LSP
 
 Press =C-c e= inside a block to zoom into it as a real code file: full LSP

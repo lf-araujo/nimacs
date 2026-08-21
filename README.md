@@ -1,9 +1,18 @@
 # wkbenchless
 
-A native, deeply Nim-configurable **literate editor** — org-babel execution,
-LSP completion, interactive REPL sessions, a real embedded terminal, and native
-org src-block highlighting — in a single binary. A *workbench-less* alternative
-to heavier IDEs: no language-server manager, no background service, no Electron.
+A native **scientific workbench** in a single binary — a deeply Nim-configurable
+literate editor with org-babel execution, LSP completion, interactive REPL
+sessions, a real embedded terminal, and native org src-block highlighting. A
+*workbench-less* alternative to heavier IDEs: no language-server manager, no
+background service, no Electron.
+
+> **Work in progress.** wkbenchless aims to reproduce, as one native binary, the
+> literate scientific-workbench workflow the author built in Emacs (the
+> [workbenchless](https://github.com/lf-araujo/workbenchless) config) — org-mode
+> notebooks, remote REPLs, inline figures, and manuscript round-tripping —
+> without Emacs. Expect rough edges; features are still landing.
+
+![An org notebook in wkbenchless with a figure rendered inline](docs/screenshot.png)
 
 Written in Nim on [uirelays](https://github.com/nim-lang/uirelays) (custom
 rendering, no GTK/Qt), so it targets Linux/macOS/Windows. Your configuration is
@@ -35,6 +44,16 @@ languages, and themes are data, and `C-c r` recompiles and restarts *in place*,
   faces, `#+caption` a touch larger, and `[[target][label]]` links show just the
   label. Click (or `C-c C-o`) follows a link — **`[[file:…]]` to a text/source
   file opens it in the editor**, URLs and other files hand off to the system.
+- **Inline figures**: whole-line image links render right in the buffer, Emacs
+  org-mode style — `[[file:fig.bmp]]` or `![](fig.bmp)`. Shown at the image's
+  own dimensions by default; size a figure with a preceding `#+ATTR_ORG: :width
+  N` (aspect ratio preserved) or set a default with `gInlineImageWidth`. Toggle
+  with `M-x toggle-inline-images`. (BMP decodes today; other formats show a
+  labelled placeholder — more to come.)
+- **Remote sessions over SSH**: a `:session name@host` header — or a
+  document-level `#+PROPERTY: header-args LANG :session … :ssh host` — runs
+  blocks on a remote interpreter over a multiplexed SSH connection and captures
+  the results locally, password hosts included.
 - **CriticMarkup** (tracked changes): org buffers colour `{++insertions++}`
   (green), `{--deletions--}` (red), `{~~old~>new~~}`, `{>>comments<<}` (grey),
   and `{==highlights==}` (yellow). Resolve with `M-x criticmarkup-accept-all` /
@@ -53,6 +72,12 @@ languages, and themes are data, and `C-c r` recompiles and restarts *in place*,
 - **Org navigator**: `C-j` — a palette of headings, named/captioned blocks, and
   figure/table captions; pick one to jump.
 - **Command palette**: `M-x` (or `C-p`); `C-x C-r` opens a recent file.
+
+Src-edit (`C-c e`) zooms a block into an isolated code file with LSP, alongside
+the objects/environment and help panes — then splices it back into the org
+document:
+
+![A src block opened as an isolated R file, with the objects and help panes](docs/screenshot-srcedit.png)
 
 ## Build & run
 
@@ -108,9 +133,14 @@ echo TEXT | wkbctl set-buffer          # replace the buffer
 echo TEXT | wkbctl insert 12           # insert before line 12
 echo TEXT | wkbctl replace 3 5         # replace lines 3..5
 wkbctl goto 40                         # move the cursor
+wkbctl run-block 16                    # run the src block at line 16 (writes #+RESULTS)
 wkbctl diff old.txt new.txt "changes"  # show a side-by-side diff
-wkbctl command <name>                  # run any M-x command
+wkbctl command <name>                  # run any M-x command (echoes its status line)
 ```
+
+When driving an org file, prefer `wkbctl run-block <line>` over piping code to
+`eval`: it runs through the editor's own babel, so the block executes in its
+`:session`, in its language, and writes `#+RESULTS:` back into the buffer.
 
 ## Releases
 
@@ -119,8 +149,8 @@ Linux/macOS/Windows and attaches them to a GitHub release. Trigger it by pushing
 a version tag:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 or run it manually from the repo's **Actions** tab (“Build and release

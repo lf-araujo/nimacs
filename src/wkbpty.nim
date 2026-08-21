@@ -173,34 +173,102 @@ else:
     var ws = WinSz(ws_row: cushort(max(1, rows)), ws_col: cushort(max(1, cols)))
     discard ioctl(master, TIOCSWINSZ.cint, addr ws)
 
-  proc ptSpawn(argv: openArray[string]; dir: string;
-               env: openArray[(string, string)]; rows, cols: int): Pty =
-    result.master = -1
-    if argv.len == 0: return
-    let exe = findExe(argv[0])
-    if exe.len == 0: return
-    let master = posix_openpt(O_RDWR or O_NOCTTY)
-    if master < 0: return
-    discard grantpt(master); discard unlockpt(master)
-    let sname = $ptsname(master)
-    let cargv = allocCStringArray(@argv)
-    let pid = fork()
-    if pid == 0:
-      discard setsid()
-      for (k, v) in env: putEnv(k, v)
-      let slave = posix.open(sname.cstring, O_RDWR)
-      discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
-      if slave > 2: discard close(slave)
-      discard close(master)
-      if dir.len > 0: discard chdir(dir.cstring)
-      putEnv("TERM", "xterm-256color")
-      discard execv(exe.cstring, cargv)
-      quit(127)
-    discard fcntl(master, F_SETFL, O_NONBLOCK)
-    discard fcntl(master, F_SETFD, FD_CLOEXEC)   # don't leak into later forks
-    setSizeFd(master, rows, cols)
-    result.master = master
-    result.pid = pid
+  when defined(macosx):
+    ## fork() is unsafe here: this is a Cocoa/AppKit process, and code between
+    ## fork() and execv() can deadlock on an Objective-C runtime / malloc lock
+    ## held by a thread that doesn't exist in the child -- observed as
+    ## multi-second to indefinite hangs spawning R/python/bash sessions, with
+    ## the eventual output sometimes scrambled. posix_spawn is Apple's
+    ## documented fork-safe alternative for GUI apps (also why CPython's
+    ## `subprocess` prefers it on Darwin). std/posix has the portable spawn.h
+    ## bindings already; only SETSID and the chdir file-action are Darwin
+    ## extensions std/posix doesn't expose, so those two are declared here.
+    proc posix_spawn_file_actions_addchdir_np(a1: var Tposix_spawn_file_actions,
+      a2: cstring): cint {.importc, header: "<spawn.h>".}
+    var POSIX_SPAWN_SETSID {.importc: "POSIX_SPAWN_SETSID", header: "<spawn.h>".}: cint
+
+    proc buildEnvp(extra: openArray[(string, string)]): seq[string] =
+      ## Parent's environment plus `extra` and TERM, with those two winning
+      ## (drop any parent var they'll replace, then append them).
+      var overridden: seq[string]
+      for (k, v) in extra: overridden.add k
+      overridden.add "TERM"
+      for k, v in envPairs():
+        if k notin overridden: result.add(k & "=" & v)
+      for (k, v) in extra: result.add(k & "=" & v)
+      result.add "TERM=xterm-256color"
+
+    proc ptSpawn(argv: openArray[string]; dir: string;
+                 env: openArray[(string, string)]; rows, cols: int): Pty =
+      result.master = -1
+      if argv.len == 0: return
+      let exe = findExe(argv[0])
+      if exe.len == 0: return
+      let master = posix_openpt(O_RDWR or O_NOCTTY)
+      if master < 0: return
+      discard grantpt(master); discard unlockpt(master)
+      discard fcntl(master, F_SETFD, FD_CLOEXEC)   # never inherited by the spawned child
+      let sname = $ptsname(master)
+      let cargv = allocCStringArray(@argv)
+      let cenvp = allocCStringArray(buildEnvp(env))
+
+      var attr: Tposix_spawnattr
+      discard posix_spawnattr_init(attr)
+      discard posix_spawnattr_setflags(attr, POSIX_SPAWN_SETSID)
+      var acts: Tposix_spawn_file_actions
+      discard posix_spawn_file_actions_init(acts)
+      # slave becomes fd 0/1/2; SETSID (applied before file actions run) makes
+      # it this child's controlling terminal, same as the open-after-setsid
+      # trick the fork()-based path below uses on other platforms.
+      discard posix_spawn_file_actions_addopen(acts, 0, sname.cstring, O_RDWR, Mode(0))
+      discard posix_spawn_file_actions_adddup2(acts, 0, 1)
+      discard posix_spawn_file_actions_adddup2(acts, 0, 2)
+      if dir.len > 0:
+        discard posix_spawn_file_actions_addchdir_np(acts, dir.cstring)
+
+      var pid: Pid
+      let rc = posix_spawn(pid, exe.cstring, acts, attr, cargv, cenvp)
+      discard posix_spawnattr_destroy(attr)
+      discard posix_spawn_file_actions_destroy(acts)
+      deallocCStringArray(cargv)
+      deallocCStringArray(cenvp)
+      if rc != 0:
+        discard close(master)
+        return
+      discard fcntl(master, F_SETFL, O_NONBLOCK)
+      setSizeFd(master, rows, cols)
+      result.master = master
+      result.pid = pid
+
+  else:
+    proc ptSpawn(argv: openArray[string]; dir: string;
+                 env: openArray[(string, string)]; rows, cols: int): Pty =
+      result.master = -1
+      if argv.len == 0: return
+      let exe = findExe(argv[0])
+      if exe.len == 0: return
+      let master = posix_openpt(O_RDWR or O_NOCTTY)
+      if master < 0: return
+      discard grantpt(master); discard unlockpt(master)
+      let sname = $ptsname(master)
+      let cargv = allocCStringArray(@argv)
+      let pid = fork()
+      if pid == 0:
+        discard setsid()
+        for (k, v) in env: putEnv(k, v)
+        let slave = posix.open(sname.cstring, O_RDWR)
+        discard dup2(slave, 0); discard dup2(slave, 1); discard dup2(slave, 2)
+        if slave > 2: discard close(slave)
+        discard close(master)
+        if dir.len > 0: discard chdir(dir.cstring)
+        putEnv("TERM", "xterm-256color")
+        discard execv(exe.cstring, cargv)
+        quit(127)
+      discard fcntl(master, F_SETFL, O_NONBLOCK)
+      discard fcntl(master, F_SETFD, FD_CLOEXEC)   # don't leak into later forks
+      setSizeFd(master, rows, cols)
+      result.master = master
+      result.pid = pid
 
   proc ptAlive(t: Pty): bool = t.master >= 0
   proc ptSetSize(t: var Pty; rows, cols: int) = setSizeFd(t.master, rows, cols)
@@ -299,8 +367,10 @@ proc closePty*(t: var Pty; quit = "") =
   ptClose(t)
 
 proc startPty*(cmd, dir: string; fg, bg: Color): Pty =
-  ## Split a shell-style command line and spawn it, backed by a screen grid.
-  result = spawnPty(cmd.splitWhitespace(), dir)
+  ## Run `cmd` through a real shell (so `||`, pipes, quoting work -- e.g. the
+  ## `claude` action's fallback to a fresh chat when `--continue` finds none),
+  ## backed by a screen grid.
+  result = spawnPty(["/bin/sh", "-c", cmd], dir)
   if result.alive: result.vt = newVTerm(24, 80, fg, bg)
 
 proc nudgeRepaint*(t: Pty) =

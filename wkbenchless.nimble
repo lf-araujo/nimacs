@@ -1,6 +1,6 @@
 # wkbenchless.nimble
 
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "Luis F. Araujo"
 description   = "A native, deeply Nim-configurable literate editor: org-babel, LSP, interactive REPL sessions, org-src fontification -- a workbench-less alternative to heavier IDEs."
 license       = "MIT"
@@ -8,7 +8,8 @@ srcDir        = "src"
 bin           = @["wkbenchless", "wkbctl"]   # wkbctl: drive a running editor
 
 requires "nim >= 2.0.0"
-requires "https://github.com/nim-lang/uirelays"
+# uirelays is vendored in src/vendor/uirelays (patched for inline images), so
+# there is no external UI dependency to fetch -- config.nims puts it on the path.
 
 task run, "Build and run wkbenchless":
   exec "nim c -r -o:wkbenchless src/wkbenchless.nim"
