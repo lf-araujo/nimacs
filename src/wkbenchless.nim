@@ -338,7 +338,6 @@ proc main() =
     app.ed.imageDefaultWidth = gInlineImageWidth
     const exDir = currentSourcePath().parentDir.parentDir / "examples"
     if dirExists(exDir): app.ed.imageBaseDir = exDir   # so [[file:figure.bmp]] resolves
-    app.applyOrgStartup()                  # welcome's #+STARTUP: inlineimages / latexpreview
     app.ed.foldAllPending = true
   app.buffers = @[BufferState(ed: app.ed, filePath: app.filePath, docLang: app.docLang)]
   app.curBuf = 0
@@ -353,6 +352,8 @@ proc main() =
   configure(app)            # user config (wkbconfig.nim) -- full-typed, no ABI
   loadExtensions(app)       # extensions/*.nim, each with proc extend*(app)
   setupExecPath()           # seed PATH from the login shell (+ config paths)
+  app.applyOrgStartup()     # #+STARTUP: latexpreview/inlineimages -- AFTER PATH
+                            # is seeded, so latex/dvipng are found
   # Themes come from the config; guarantee one so the chrome is never unstyled,
   # and honor a default the config may already have applied.
   if gThemes.len == 0: registerTheme("default", defaultBase16())
