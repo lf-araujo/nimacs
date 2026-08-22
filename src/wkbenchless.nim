@@ -148,6 +148,7 @@ proc paletteAccept(app: var App) =
   case app.paletteMode
   of pmCommands:
     app.paletteActive = false
+    gLastCommand = id                       # so M-x reopens preselecting it
     gCommands[id].run(app)
   of pmBuffers:
     app.paletteActive = false
@@ -384,6 +385,8 @@ proc main() =
     layPlain = parseLayout(layoutPlainStr(paneSessionH))
     laySrc   = parseLayout(layoutSrcStr(paneSessionH, paneRightW, paneObjectsH))
   var lastMouse = (x: 0, y: 0)
+  var toolbarMenuOpen = false             # the header [☰] menu is showing
+  var toolbarMenuX = 0                    # its right edge (menu grows left from here)
   var pty = notRunningPty()               # thread-free in-pane terminal
   var ctrl = startControl()              # control socket for wkbctl / agents
   let termGridPath = getTempDir() / "wkbenchless-termgrid"
@@ -517,14 +520,63 @@ proc main() =
     let lay = if app.srcEdit: laySrc
               elif (app.sessions.len > 0 or app.hasTerminal) and not app.sessionHidden: layPlain
               else: layBare
-    let cells = resolve(lay, screen.width, screen.height, lineH)
+    let toolbarH = lineH + 8
+    var cells = resolve(lay, screen.width, screen.height - toolbarH, lineH)
+    for _, c in cells.mpairs: c.y += toolbarH   # push panes below the header toolbar
+
+    # --- header toolbar: chips that run commands, plus a [☰] menu -----------
+    const tbBtns = [("Open", "open-file"), ("Save", "save"),
+                    ("Export", "otd-export"), ("Find", "find"),
+                    ("▲", "prev-chunk"), ("▼", "next-chunk"),
+                    ("Edit", "src-edit-block")]
+    const tbMenu = [("Increase font", "zoom-in"), ("Decrease font", "zoom-out")]
+    var toolbarRects: seq[tuple[r: Rect; cmd, label: string]]
+    block:
+      var x = 6
+      for (label, cmd) in tbBtns:
+        let w = measureText(app.font, label).w + 16
+        toolbarRects.add (rect(x, 4, w, toolbarH - 8), cmd, label)
+        x += w + 4
+      const mw = 30      # the [☰] button (drawn as three bars, not a glyph)
+      toolbarRects.add (rect(screen.width - mw - 6, 4, mw, toolbarH - 8), "__menu__", "")
+    var menuRects: seq[tuple[r: Rect; cmd, label: string]]
+    if toolbarMenuOpen:
+      var mw = 24
+      for (label, _) in tbMenu: mw = max(mw, measureText(app.font, label).w + 24)
+      var my = toolbarH
+      for (label, cmd) in tbMenu:
+        menuRects.add (rect(toolbarMenuX - mw, my, mw, lineH + 6), cmd, label)
+        my += lineH + 6
+
+    # Toolbar / menu clicks -- run a command, toggle the menu, or dismiss it.
+    if e.kind == MouseDownEvent and e.button == LeftButton:
+      var chromeHit = false
+      if toolbarMenuOpen:
+        chromeHit = true                    # any click resolves the open menu
+        for it in menuRects:
+          if e.x >= it.r.x and e.x < it.r.x + it.r.w and
+             e.y >= it.r.y and e.y < it.r.y + it.r.h:
+            if gCommands.hasKey(it.cmd): gCommands[it.cmd].run(app)
+            break
+        toolbarMenuOpen = false
+      elif e.y < toolbarH:
+        for it in toolbarRects:
+          if e.x >= it.r.x and e.x < it.r.x + it.r.w:
+            chromeHit = true
+            if it.cmd == "__menu__":
+              toolbarMenuOpen = true; toolbarMenuX = it.r.x + it.r.w
+            elif gCommands.hasKey(it.cmd): gCommands[it.cmd].run(app)
+            else: app.msg = it.cmd & " unavailable"
+            break
+      if chromeHit: consumed = true
 
     # --- Draggable panel dividers -------------------------------------------
     # Grab a divider (with a few px of tolerance around the 2px hairline), drag
     # to resize the fixed pane, and persist the sizes on release. `cells` still
     # holds this frame's geometry, so a move computes the new pixel size from
     # the pane edge that stays put; the rebuilt layout tracks the pointer.
-    if e.kind == MouseDownEvent and e.button == LeftButton and dragDiv.len == 0:
+    if e.kind == MouseDownEvent and e.button == LeftButton and dragDiv.len == 0 and
+       not consumed:
       for dn in ["divH1", "divH2", "divV"]:
         if cells.hasKey(dn):
           let r = cells[dn]
@@ -552,7 +604,7 @@ proc main() =
       rebuildLayouts()
       consumed = true
 
-    if e.kind == MouseDownEvent and dragDiv.len == 0:  # click a pane to focus it
+    if e.kind == MouseDownEvent and dragDiv.len == 0 and not consumed:  # click a pane to focus it
       for nm in ["editor", "session", "objects", "help"]:
         if cells.hasKey(nm):
           let r = cells[nm]
@@ -833,6 +885,36 @@ proc main() =
       drawCompletion(app, editorRect, lineH)
     if app.paletteActive:
       drawPalette(app, editorRect, lineH)
+
+    # --- header toolbar (drawn above the panes) + its [☰] menu ---------------
+    block:
+      fillRect(rect(0, 0, screen.width, toolbarH), app.theme.tabBarBg)
+      fillRect(rect(0, toolbarH - 1, screen.width, 1), app.theme.dividerColor)
+      for it in toolbarRects:
+        let hover = lastMouse.y < toolbarH and
+                    lastMouse.x >= it.r.x and lastMouse.x < it.r.x + it.r.w
+        let cbg = if hover: app.theme.chipActiveBg else: app.theme.chipBg
+        let cfg = if hover: app.theme.chipActiveFg else: app.theme.chipFg
+        fillRect(it.r, cbg)
+        if it.cmd == "__menu__":                 # hamburger icon: three bars
+          let bx = it.r.x + it.r.w div 2 - 7
+          let by = it.r.y + it.r.h div 2 - 5
+          for k in 0 .. 2: fillRect(rect(bx, by + k * 5, 14, 2), cfg)
+        else:
+          let tw = measureText(app.font, it.label).w
+          discard drawText(app.font, it.r.x + (it.r.w - tw) div 2, it.r.y,
+                           it.label, cfg, cbg)
+      if toolbarMenuOpen and menuRects.len > 0:
+        let m0 = menuRects[0].r
+        let bh = (menuRects[^1].r.y + menuRects[^1].r.h) - m0.y
+        fillRect(rect(m0.x - 2, m0.y, m0.w + 4, bh + 2), app.theme.boxBg)
+        for it in menuRects:
+          let hover = lastMouse.x >= it.r.x and lastMouse.x < it.r.x + it.r.w and
+                      lastMouse.y >= it.r.y and lastMouse.y < it.r.y + it.r.h
+          let rbg = if hover: app.theme.chipActiveBg else: app.theme.boxBg
+          let rfg = if hover: app.theme.chipActiveFg else: app.theme.boxFg
+          fillRect(it.r, rbg)
+          discard drawText(app.font, it.r.x + 8, it.r.y + 3, it.label, rfg, rbg)
 
     refresh()
 

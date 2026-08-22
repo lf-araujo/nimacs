@@ -107,6 +107,8 @@ type
 
 var
   gCommands*: OrderedTable[string, Command]
+  gLastCommand*: string                   ## last command run from the palette
+                                          ## (M-x reopens preselecting it)
   gKeymap*: Table[string, string]         ## chord (or "C-c C-c") -> command name
   gRepls*: Table[string, ReplSpec]        ## langId -> interpreter spec
   gHooks*: Table[string, seq[Hook]]       ## event name -> hooks
@@ -716,6 +718,10 @@ proc openPalette(app: var App; mode: PaletteMode) =
   app.paletteActive = true
   app.paletteQuery = ""
   app.paletteSel = 0
+  if mode == pmCommands and gLastCommand.len > 0:   # reopen on the last-used item
+    let entries = paletteEntries(app)
+    for i, e in entries:
+      if e.id == gLastCommand: app.paletteSel = i; break
 
 proc paletteCmd*(app: var App) = openPalette(app, pmCommands)
 
@@ -1041,6 +1047,25 @@ proc applyOrgStartup*(app: var App) =
   if "noinlineimages" in toks: app.ed.setRenderFlag(rfInlineImages, false)
   elif "inlineimages" in toks: app.ed.setRenderFlag(rfInlineImages, true)
   if "latexpreview" in toks: discard enableLatexPreview(app)
+
+proc nextChunk*(app: var App) =
+  ## Jump to the next org src block (#+begin_src) after the cursor.
+  let n = app.ed.getLineCount()
+  var i = app.ed.currentLine + 1
+  while i < n:
+    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+      app.ed.gotoLine(i + 1, 0); app.msg = "next src block"; return   # gotoLine is 1-based
+    inc i
+  app.msg = "no next src block"
+
+proc prevChunk*(app: var App) =
+  ## Jump to the previous org src block (#+begin_src) before the cursor.
+  var i = app.ed.currentLine - 1
+  while i >= 0:
+    if strutils.strip(app.ed.getLineText(i)).toLowerAscii.startsWith("#+begin_src"):
+      app.ed.gotoLine(i + 1, 0); app.msg = "previous src block"; return   # gotoLine is 1-based
+    dec i
+  app.msg = "no previous src block"
 
 proc cancelOverlays*(app: var App) =
   ## Keyboard-quit (C-g): dismiss the command palette / find minibuffer overlays.
@@ -1829,6 +1854,8 @@ proc registerBuiltins*() =
   defcommand("toggle-inline-images", "Images: toggle inline [[file:x.png]] rendering", toggleInlineImages)
   defcommand("latex-preview", "LaTeX: toggle inline previews of display math", latexPreview)
   defcommand("cancel", "Cancel / dismiss the palette or find overlay (C-g)", cancelOverlays)
+  defcommand("next-chunk", "Go to the next src block", nextChunk)
+  defcommand("prev-chunk", "Go to the previous src block", prevChunk)
   defcommand("criticmarkup-accept-all", "CriticMarkup: accept all tracked changes", criticAcceptAll)
   defcommand("criticmarkup-reject-all", "CriticMarkup: reject all tracked changes", criticRejectAll)
   defcommand("diff-buffer", "Diff: buffer vs saved file (two panes)", diffBuffer)
