@@ -492,6 +492,7 @@ var
   gDepth: cint
   gWindow: XID
   gGC: pointer         # Xlib GC for primitives
+  gImgGC: pointer      # clip-less GC for building offscreen image pixmaps
   gBackPixmap: XID     # double buffer
   gXftDraw: pointer    # Xft draw context on back pixmap
   gWidth, gHeight: cint
@@ -1026,6 +1027,10 @@ proc x11FreeImage(img: screen.Image) =
 
 proc buildScaledPixmap(s: ptr ImageSlot; dw, dh: int) =
   ## (Re)build the cached Pixmap at dw x dh via nearest-neighbour scaling.
+  # Use a dedicated clip-less GC: gGC carries the editor pane's clip rect
+  # (setClipRect), which would clip XPutImage into this offscreen pixmap and
+  # leave the top rows unwritten (a black bar). The pixmap is our own drawable.
+  if gImgGC == nil: gImgGC = XCreateGC(gDisplay, gWindow, 0, nil)
   if s.pixmap != None: discard XFreePixmap(gDisplay, s.pixmap)
   s.pixmap = XCreatePixmap(gDisplay, gWindow, dw.cuint, dh.cuint, gDepth.cuint)
   s.pw = dw; s.ph = dh
@@ -1040,7 +1045,7 @@ proc buildScaledPixmap(s: ptr ImageSlot; dw, dh: int) =
     byteOrder: LSBFirst, bitmapUnit: 32, bitmapBitOrder: LSBFirst,
     bitmapPad: 32, depth: gDepth, bytesPerLine: (dw * 4).cint, bitsPerPixel: 32,
     redMask: 0xFF0000, greenMask: 0x00FF00, blueMask: 0x0000FF)
-  discard XPutImage(gDisplay, s.pixmap, gGC, addr ximg, 0, 0, 0, 0,
+  discard XPutImage(gDisplay, s.pixmap, gImgGC, addr ximg, 0, 0, 0, 0,
     dw.cuint, dh.cuint)
 
 proc x11DrawImage(img: screen.Image; src, dst: coords.Rect) =
