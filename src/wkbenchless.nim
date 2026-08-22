@@ -13,6 +13,7 @@ import wkbconfig
 import wkbextensions
 import wkbpty
 import wkbctrl
+import wkbctlclient       # so `wkbenchless ctl <verb>` == the wkbctl client
 import std/[os, tables, strutils]
 
 const fontPath =
@@ -297,6 +298,26 @@ proc termLines(outbuf: string): seq[string] =
     result.add ln
 
 proc main() =
+  # Multi-call binary: `wkbenchless ctl <verb...>` -- or the binary invoked as
+  # `wkbctl` (e.g. via a symlink) -- runs the control client and exits, so
+  # shipping just `wkbenchless` is enough. Checked before any GUI init.
+  block ctlDispatch:
+    let params = commandLineParams()
+    let asCtl = params.len > 0 and params[0] == "ctl"
+    let invoked = extractFilename(paramStr(0)).changeFileExt("")
+    if asCtl or invoked == "wkbctl":
+      when defined(windows):
+        # A GUI-subsystem exe has no console; attach the parent terminal's so
+        # `ctl` output (blocks / buffer / …) is visible when run from a shell.
+        proc attachConsole(pid: uint32): int32
+          {.importc: "AttachConsole", stdcall, dynlib: "kernel32.dll".}
+        proc freopen(path, mode: cstring; stream: File): File
+          {.importc, header: "<stdio.h>".}
+        if attachConsole(0xFFFFFFFF'u32) != 0:      # ATTACH_PARENT_PROCESS
+          discard freopen("CONOUT$", "w", stdout)
+          discard freopen("CONOUT$", "w", stderr)
+      quit(ctlClient(if asCtl: params[1 .. ^1] else: params))
+
   var screen = createWindow(960, 700)
   setWindowTitle("wkbenchless")
   var metrics, bigMetrics: FontMetrics

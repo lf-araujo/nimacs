@@ -68,33 +68,25 @@ jobs:
       - name: Install Nimble packages
         run: nimble install -d -y
 
-      # ── Build the binaries ─────────────────────────────────────────────────
-      - name: Build wkbenchless + wkbctl
+      # ── Build the single binary ────────────────────────────────────────────
+      - name: Build wkbenchless
         shell: bash
         run: |
-          # On Windows the editor is a GUI-subsystem app (no console window);
-          # wkbctl stays a console tool.
+          # One binary per platform: `wkbenchless ctl <verb>` (or a `wkbctl`
+          # symlink) is the control client, so no separate wkbctl is shipped.
+          # On Windows the editor is a GUI-subsystem app (no console window).
           GUI=""
           if [ -n "${{ matrix.config.exe }}" ]; then GUI="--app:gui"; fi
           nim c -d:release -d:danger --opt:size $GUI \
             -o:wkbenchless${{ matrix.config.exe }} src/wkbenchless.nim
-          nim c -d:release -d:danger --opt:size \
-            -o:wkbctl${{ matrix.config.exe }} src/wkbctl.nim
 
-      # ── Package the two binaries into one per-platform archive ─────────────
-      - name: Package artifact
+      # ── Name the binary by platform (shipped as-is, no archive) ────────────
+      - name: Name the artifact
         shell: bash
         run: |
-          DIST="wkbenchless_${{ matrix.config.label }}"
-          mkdir -p "$DIST"
-          cp "wkbenchless${{ matrix.config.exe }}" "wkbctl${{ matrix.config.exe }}" "$DIST/"
-          if [ -n "${{ matrix.config.exe }}" ]; then
-            7z a "$DIST.zip" "$DIST"
-            echo "ASSET=$DIST.zip" >> $GITHUB_ENV
-          else
-            tar czf "$DIST.tar.gz" "$DIST"
-            echo "ASSET=$DIST.tar.gz" >> $GITHUB_ENV
-          fi
+          ASSET="wkbenchless_${{ matrix.config.label }}${{ matrix.config.exe }}"
+          cp "wkbenchless${{ matrix.config.exe }}" "$ASSET"
+          echo "ASSET=$ASSET" >> $GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

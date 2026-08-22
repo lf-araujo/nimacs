@@ -122,10 +122,15 @@ add more with `addExecPath`.
 next to the binary: `nimble bundle -- /path/to/zig` (see
 `scripts/bundle-toolchain.sh`); Nim uses `zig cc` as a hermetic C backend.
 
-## Agent control (`wkbctl`)
+## Agent control (`ctl`)
 
-`wkbctl` is a tiny CLI that drives a running editor over a Unix-domain control
-socket — handy for scripts and for agents running in the embedded terminal:
+The editor exposes a loopback control socket (127.0.0.1, token-authenticated)
+that drives a running instance — handy for scripts and for agents in the
+embedded terminal. It's built into the binary, so **`wkbenchless ctl <verb>`**
+is all you need; the shipped release is a single binary. (`wkbctl` is an
+optional convenience — build it with `nimble build`, or symlink it to
+`wkbenchless`; the examples below work with either name.) Works on
+Linux/macOS/Windows.
 
 ```sh
 wkbctl buffer                          # print the current buffer
@@ -146,21 +151,22 @@ When driving an org file, prefer `wkbctl run-block <line>` over piping code to
 
 ## Releases
 
-`.github/workflows/release.yml` builds `wkbenchless` + `wkbctl` for
-Linux/macOS/Windows and attaches them to a GitHub release. Trigger it by pushing
-a version tag:
+`.github/workflows/release.yml` builds a **single `wkbenchless` binary** per
+platform (Linux/macOS/Windows) and attaches them to a GitHub release. Trigger it
+by pushing a version tag:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.2
+git push origin v0.2.2
 ```
 
 or run it manually from the repo's **Actions** tab (“Build and release
 binaries” → *Run workflow*), giving the release tag as input. All three
 platforms build: Linux (X11) and macOS (Cocoa) with a POSIX PTY, and Windows
-with a ConPTY terminal and the winapi UI driver. On Windows the AF_UNIX control
-socket / `wkbctl` and the fd-handoff hot reload are stubbed for now (the editor,
-sessions, and terminal work; the control socket needs a named-pipe port).
+with a ConPTY terminal and the winapi UI driver. The control socket is loopback
+TCP and works on **all three** (`wkbenchless ctl …`). The fd-handoff hot reload
+(`C-c r` preserving sessions) is still POSIX-only; on Windows `C-c r` rebuilds
+and restarts without the live-session handoff.
 
 ## License
 

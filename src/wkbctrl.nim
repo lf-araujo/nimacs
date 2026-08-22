@@ -1,7 +1,7 @@
-## Control server: a Unix-domain socket the editor polls (non-blocking, from the
-## main loop -- NO thread) so external tools (e.g. Claude running in the terminal
-## via `wkbctl`) can drive the editor: run code in a live session, read the
-## buffer, show a diff, or run a named command.
+## Control server: a loopback-TCP socket (127.0.0.1, ephemeral port) the editor
+## polls (non-blocking, from the main loop -- NO thread) so external tools --
+## `wkbctl`, `wkbenchless ctl <verb>`, or Claude in the terminal -- can drive the
+## editor: run code in a live session, read the buffer, show a diff, run a command.
 ##
 ## Protocol (one request per connection; client half-closes after sending):
 ##   "buffer"                      -> the current buffer text
@@ -10,17 +10,21 @@
 ##   "diff\t<title>\n<OLD>\x1e<NEW>" -> open the side-by-side diff view
 ##   "blocks"                      -> list #+begin_src blocks
 ##
-## The transport is POSIX-only for now (AF_UNIX); on Windows it's a no-op stub
-## (a named-pipe/AF_UNIX port is future work). The request `handle` itself is
-## portable.
+## Cross-platform via std/net (works on Windows too, unlike the old AF_UNIX
+## transport). The chosen port + a random token are written to a user-private
+## file (<cache>/wkbenchless/control.port -- "port\ntoken"); a client connects to
+## 127.0.0.1:<port> and sends "token\n<request>". The token keeps another local
+## user from port-scanning the socket (parity with the old unix-socket perms).
 
-import std/[strutils, tables]
+import std/[strutils, tables, net, nativesockets, os, random]
+when defined(posix): import std/posix
 import wkbcore
 
 type ControlServer* = object
-  when defined(posix):
-    listenFd*, clientFd*: cint
-    inbuf*: string
+  listener*: Socket        ## nil when not started
+  client*: Socket          ## the in-flight client, or nil
+  inbuf*: string
+  token*: string
 
 proc handle(app: var App; req: string): string =
   let nl = req.find('\n')
@@ -102,54 +106,63 @@ proc handle(app: var App; req: string): string =
   else:
     result = "unknown verb: " & parts[0]
 
-when defined(posix):
-  import std/[posix, os]
+proc portPath*(): string = getCacheDir() / "wkbenchless" / "control.port"
 
-  type Sockaddr_un {.importc: "struct sockaddr_un", header: "<sys/un.h>", pure, final.} = object
-    sun_family: cushort
-    sun_path: array[108, char]
+proc genToken(): string =
+  var r = initRand()
+  const hex = "0123456789abcdef"
+  for _ in 0 ..< 32: result.add hex[r.rand(15)]
 
-  proc controlPath*(): string = getCacheDir() / "wkbenchless" / "control.sock"
+proc startControl*(): ControlServer =
+  ## Bind a loopback listener on an ephemeral port; record port+token so clients
+  ## can find and authenticate to it. On failure the listener stays nil and
+  ## `poll` is a no-op.
+  try:
+    let s = newSocket()
+    s.setSockOpt(OptReuseAddr, true)
+    s.bindAddr(Port(0), "127.0.0.1")
+    s.listen()
+    let (_, port) = s.getLocalAddr()
+    s.getFd.setBlocking(false)
+    when defined(posix):
+      discard fcntl(s.getFd.cint, F_SETFD, FD_CLOEXEC)   # don't leak into forked sessions
+    result.listener = s
+    result.token = genToken()
+    try: createDir(portPath().parentDir) except CatchableError: discard
+    writeFile(portPath(), $port.int & "\n" & result.token & "\n")
+    when defined(posix):
+      try: setFilePermissions(portPath(), {fpUserRead, fpUserWrite})
+      except CatchableError: discard
+  except CatchableError:
+    result = ControlServer()
 
-  proc startControl*(): ControlServer =
-    result = ControlServer(listenFd: -1, clientFd: -1)
-    let path = controlPath()
-    try: createDir(path.parentDir) except CatchableError: discard
-    removeFile(path)
-    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-    if fd.cint < 0: return
-    var sa: Sockaddr_un
-    sa.sun_family = AF_UNIX.cushort
-    if path.len >= sa.sun_path.len: return
-    copyMem(addr sa.sun_path[0], unsafeAddr path[0], path.len)
-    if bindSocket(fd, cast[ptr SockAddr](addr sa), sizeof(sa).SockLen) != 0: return
-    if listen(fd, 4) != 0: return
-    discard fcntl(fd.cint, F_SETFL, O_NONBLOCK)
-    discard fcntl(fd.cint, F_SETFD, FD_CLOEXEC)   # don't leak into forked sessions
-    result.listenFd = fd.cint
-
-  proc poll*(cs: var ControlServer; app: var App) =
-    if cs.listenFd < 0: return
-    if cs.clientFd < 0:
-      let c = accept(cs.listenFd.SocketHandle, nil, nil)
-      if c.cint >= 0:
-        discard fcntl(c.cint, F_SETFL, O_NONBLOCK)
-        discard fcntl(c.cint, F_SETFD, FD_CLOEXEC)   # so a forked session can't hold it open
-        cs.clientFd = c.cint; cs.inbuf = ""
-    if cs.clientFd >= 0:
-      var b {.noinit.}: array[4096, char]
-      while true:
-        let n = read(cs.clientFd, addr b[0], b.len)
-        if n > 0:
-          for i in 0 ..< n: cs.inbuf.add b[i]
-        elif n == 0:                       # client half-closed: request complete
-          let resp = handle(app, cs.inbuf)
-          if resp.len > 0: discard write(cs.clientFd, unsafeAddr resp[0], resp.len)
-          discard close(cs.clientFd); cs.clientFd = -1
-          break
-        else:
-          break                            # EAGAIN: nothing more yet
-
-else:                                      # Windows: no control transport yet
-  proc startControl*(): ControlServer = ControlServer()
-  proc poll*(cs: var ControlServer; app: var App) = discard
+proc poll*(cs: var ControlServer; app: var App) =
+  if cs.listener == nil: return
+  if cs.client == nil:                  # accept a pending connection (non-blocking)
+    var lfds = @[cs.listener.getFd]
+    if selectRead(lfds, 0) > 0:
+      try:
+        var c: Socket
+        cs.listener.accept(c)
+        c.getFd.setBlocking(false)
+        when defined(posix):
+          discard fcntl(c.getFd.cint, F_SETFD, FD_CLOEXEC)
+        cs.client = c; cs.inbuf = ""
+      except CatchableError: discard
+  if cs.client != nil:
+    var cfds = @[cs.client.getFd]
+    while selectRead(cfds, 0) > 0:
+      var chunk = ""
+      try: chunk = cs.client.recv(4096)
+      except CatchableError: chunk = ""
+      if chunk.len == 0:                # client half-closed: request complete
+        let nl = cs.inbuf.find('\n')    # first line is the auth token
+        let tok = if nl >= 0: cs.inbuf[0 ..< nl] else: ""
+        let body = if nl >= 0: cs.inbuf[nl + 1 .. ^1] else: ""
+        let resp = if tok == cs.token: handle(app, body) else: "unauthorized"
+        try: cs.client.send(resp) except CatchableError: discard
+        try: cs.client.close() except CatchableError: discard
+        cs.client = nil
+        break
+      cs.inbuf.add chunk
+      cfds = @[cs.client.getFd]

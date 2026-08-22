@@ -10,7 +10,8 @@ The socket is live when this responds:
 wkbctl blocks    # lists #+begin_src blocks as "  <line>: <header>"
 ```
 If `wkbctl` isn't found or errors, wkbenchless isn't running here — work with
-files normally.
+files normally. (`wkbctl <verb>` is just `wkbenchless ctl <verb>` — the editor
+binary embeds the same client; either works, on Linux/macOS/Windows.)
 
 ## Read the live buffer
 - `wkbctl buffer` — the current buffer's full text (use this, not the file on
